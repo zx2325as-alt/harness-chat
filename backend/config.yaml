@@ -7,78 +7,67 @@ server:
 
 harness:
   # default: auto | fast | refine
-  default_mode: "auto"
+  default_mode: "refine"
 
   complexity:
-    # if uncertain, default to fast track
-    default_to_fast_when_uncertain: true
-    min_length_for_refine: 220
-    keyword_triggers:
-      - "分析"
-      - "对比"
-      - "论证"
-      - "评估"
-      - "推理"
-      - "为什么"
-      - "how"
-      - "compare"
-      - "evaluate"
+    # 启用大模型进行预判
+    use_llm_analyzer: true
+    analyzer_model: "gpt-5.5" # 预判使用的模型，需在 models 下注册，要求速度快且能输出 JSON
+    analyzer_prompt: |
+      你是一个高级的大模型路由调度中枢。请分析以下用户输入的复杂度和意图，并从可用模型池中为用户自主选择最合适的大模型。
+      
+      【可用模型池及其特长】
+      - claude-sonnet-4-6: 极其擅长代码编写、架构设计、逻辑分析。
+      - claude-sonnet-4-6-thinking: 擅长深度数学证明、复杂逻辑推导。
+      - claude-opus-4-7: 擅长长文写作、极致的语言润色、高难度综合任务。
+      - gpt-5.5 / gpt-5.4-high: 速度极快，综合能力极强，适合日常通用问答、联网搜索总结。
+      - gpt-5.5-pro: 适合高难度专业领域的复杂任务。
+      - grok-4-20-reasoning / grok-4.2: 擅长数理逻辑、硬核推理。
+      - deepseek-v4-pro / deepseek-v4-flash: flash速度快适合通用与代码，pro适合深度专业问题。
+      - gemini-3.1-pro-preview: 适合长上下文、多模态或泛用型搜索。
+      - ollama-llama3: 本地模型，必须用于处理包含隐私、密码、内部数据的极度敏感请求。
+      
+      请返回一段合法的 JSON，格式如下：
+      {
+        "complexity": "high" 或 "low",
+        "selected_model": "你选出的最合适的主力模型名称(用于 low 复杂度)",
+        "fallback_models": ["备选模型1", "备选模型2"],
+        "refine_models": {
+          "draft": ["为初稿层分配的模型池(要求速度快、覆盖广)"],
+          "review": ["为审查层分配的模型池(要求批判推理能力极强)"],
+          "polish": ["为润色层分配的模型池(要求文笔好、综合能力强)"]
+        },
+        "reason": "简短的判定与选型理由"
+      }
+      
+      判断标准：
+      - complexity: 若问题需要多步推理、深入分析论证、字数较长或任务繁重，填 "high"；若为简单的问答、翻译、信息检索或日常对话，填 "low"。
+      - 隐私绝对优先：只要涉及隐私敏感数据，所有选用的模型都必须是 ollama-llama3。
+      
+      用户输入如下：
+      
+    # 强制进入 refine 轨的指令（仍然保留作为快捷入口）
     manual_triggers:
       - "/refine"
       - "强制精化"
       - "精化轨"
 
   routing:
-    # 无规则命中时按顺序尝试，直到某一模型调用成功（需对应环境变量或本地 Ollama）
-    default_model: "openai-gpt-4o-mini"
+    # LLM 预判失败或无可用选择时按顺序尝试，优先使用兼顾速度与质量的模型
+    default_model: "gpt-5.5"
     default_models:
-      - "openai-gpt-4o-mini"
-      - "anthropic-claude-sonnet"
-      - "gemini-flash"
-      - "ollama-llama3"
-    rules:
-      - name: "code"
-        when:
-          any_keywords: ["代码", "bug", "报错", "traceback", "python", "js", "vue", "fastapi", "sql"]
-        prefer_models:
-          - "openai-gpt-4o-mini"
-          - "anthropic-claude-sonnet"
-          - "gemini-flash"
-          - "ollama-llama3"
+      - "gpt-5.5"
+      - "claude-sonnet-4-6"
+      - "deepseek-v4-flash"
+      - "gemini-3.1-pro-preview"
+      - "grok-4.2"
 
-      - name: "math"
-        when:
-          any_keywords: ["数学", "证明", "概率", "方程", "积分", "导数"]
-        prefer_models:
-          - "openai-o1-mini"
-          - "openai-gpt-4o-mini"
-          - "anthropic-claude-sonnet"
-
-      - name: "web_search"
-        when:
-          any_keywords: ["最新", "新闻", "今天", "2026", "官网", "文档", "搜索"]
-        prefer_models:
-          - "openai-gpt-4o-mini"
-          - "gemini-flash"
-          - "anthropic-claude-sonnet"
-
-      - name: "privacy"
-        when:
-          any_keywords: ["隐私", "敏感", "身份证", "密码", "token", "密钥", "银行卡"]
-        prefer_models:
-          - "ollama-llama3"
-          - "openai-gpt-4o-mini"
 
   refine_chain:
     enabled: true
     # Layer 1: broad draft (cheap, wide coverage)
     layer1:
       name: "draft"
-      prefer_models:
-        - "openai-gpt-4o-mini"
-        - "anthropic-claude-haiku"
-        - "gemini-flash"
-        - "ollama-llama3"
       instruction: |
         你是“初稿层”。目标：覆盖全面，不求极致精确。请输出：
         1) 关键点列表
@@ -87,10 +76,6 @@ harness:
     # Layer 2: critical review (find mistakes, add depth)
     layer2:
       name: "review"
-      prefer_models:
-        - "openai-o1-mini"
-        - "anthropic-claude-sonnet"
-        - "openai-gpt-4o-mini"
       instruction: |
         你是“审查层”。输入包含：原始问题 + 初稿答案。
         目标：找错误、补漏洞、加深度；指出不确定之处并给出修正建议。
@@ -101,65 +86,12 @@ harness:
     # Layer 3: polish (format, coherence)
     layer3:
       name: "polish"
-      prefer_models:
-        - "openai-gpt-4o"
-        - "anthropic-claude-sonnet"
-        - "gemini-flash"
       instruction: |
         你是“润色层”。输入包含：原始问题 + 审查层答案。
         目标：输出最终答案，结构清晰、语言流畅、逻辑自洽。
         请避免夸大不确定内容；如有前提条件请明确写出。
 
-# 所有模型统一为 OpenAI Chat Completions：POST {base_url}/v1/chat/completions
-# 环境变量（按需）：
-#   OPENAI_API_KEY       — 官方 OpenAI 或兼容站点的 Bearer
-#   OPENROUTER_API_KEY   — 下文 OpenRouter 示例（Claude / Gemini 等非 OpenAI 厂商常通过此类网关暴露 OpenAI 协议）
-# Ollama：本机 OpenAI 兼容端点，通常无需密钥（api_key_optional: true）
 models:
-  openai-gpt-4o-mini:
-    provider: "openai_compat"
-    base_url: "https://api.openai.com/v1"
-    api_key_env: "OPENAI_API_KEY"
-    model: "gpt-4o-mini"
-    timeout_s: 120
-
-  openai-gpt-4o:
-    provider: "openai_compat"
-    base_url: "https://api.openai.com/v1"
-    api_key_env: "OPENAI_API_KEY"
-    model: "gpt-4o"
-    timeout_s: 180
-
-  openai-o1-mini:
-    provider: "openai_compat"
-    base_url: "https://api.openai.com/v1"
-    api_key_env: "OPENAI_API_KEY"
-    model: "o1-mini"
-    timeout_s: 300
-
-  # Claude：通过 OpenAI 兼容网关（示例 OpenRouter；可改为自建 OneAPI / LiteLLM 等）
-  anthropic-claude-sonnet:
-    provider: "openai_compat"
-    base_url: "https://openrouter.ai/api/v1"
-    api_key_env: "OPENROUTER_API_KEY"
-    model: "anthropic/claude-3.5-sonnet"
-    timeout_s: 180
-
-  anthropic-claude-haiku:
-    provider: "openai_compat"
-    base_url: "https://openrouter.ai/api/v1"
-    api_key_env: "OPENROUTER_API_KEY"
-    model: "anthropic/claude-3.5-haiku"
-    timeout_s: 120
-
-  # Gemini：同上，走 OpenAI 兼容路由与模型名（以 OpenRouter 为例，可按供应商文档修改 model）
-  gemini-flash:
-    provider: "openai_compat"
-    base_url: "https://openrouter.ai/api/v1"
-    api_key_env: "OPENROUTER_API_KEY"
-    model: "google/gemini-2.0-flash-001"
-    timeout_s: 120
-
   # Ollama 内置 OpenAI 兼容：http://localhost:11434/v1/chat/completions
   ollama-llama3:
     provider: "openai_compat"
@@ -168,3 +100,80 @@ models:
     api_key_env: "OLLAMA_API_KEY"
     model: "llama3"
     timeout_s: 300
+
+  claude-opus-4-7:
+    provider: "openai_compat"
+    base_url: "https://api.n1n.ai/v1"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "claude-opus-4-7"
+    timeout_s: 180
+
+  claude-sonnet-4-6:
+    provider: "openai_compat"
+    base_url: "https://api.n1n.ai/v1"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "claude-sonnet-4-6"
+    timeout_s: 180
+
+  claude-sonnet-4-6-thinking:
+    provider: "openai_compat"
+    base_url: "https://api.n1n.ai/v1"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "claude-sonnet-4-6-thinking"
+    timeout_s: 300
+
+  gpt-5.4-high:
+    provider: "openai_compat"
+    base_url: "https://api.n1n.ai/v1"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "gpt-5.4-high"
+    timeout_s: 180
+
+  gpt-5.5-pro:
+    provider: "openai_compat"
+    base_url: "https://api.n1n.ai/v1"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "gpt-5.5-pro"
+    timeout_s: 180
+
+  gpt-5.5:
+    provider: "openai_compat"
+    base_url: "https://api.n1n.ai/v1"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "gpt-5.5"
+    timeout_s: 180
+
+  grok-4-20-reasoning:
+    provider: "openai_compat"
+    base_url: "https://api.n1n.ai/v1"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "grok-4-20-reasoning"
+    timeout_s: 300
+
+  grok-4.2:
+    provider: "openai_compat"
+    base_url: "https://api.n1n.ai/v1"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "grok-4.2"
+    timeout_s: 180
+
+  deepseek-v4-pro:
+    provider: "openai_compat"
+    base_url: "https://api.n1n.ai/v1"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "deepseek-v4-pro"
+    timeout_s: 180
+
+  deepseek-v4-flash:
+    provider: "openai_compat"
+    base_url: "https://api.n1n.ai/v1"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "deepseek-v4-flash"
+    timeout_s: 120
+
+  gemini-3.1-pro-preview:
+    provider: "openai_compat"
+    base_url: "https://api.n1n.ai/v1"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "gemini-3.1-pro-preview"
+    timeout_s: 180

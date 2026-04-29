@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import httpx
+import asyncio
 
 from utils import Timer, env_get
 
@@ -64,9 +65,23 @@ class OpenAICompatAdapter(BaseAdapter):
         base_url = self.cfg.get("base_url", "https://api.openai.com/v1")
         url = _openai_chat_completions_url(str(base_url))
         model = self.cfg.get("model", self.model_name)
-        api_key_env = self.cfg.get("api_key_env", "OPENAI_API_KEY")
+        # 先看是否显式配置了 api_key（推荐方式）
+        api_key = self.cfg.get("api_key")
+        
+        if not api_key:
+            api_key_env = self.cfg.get("api_key_env", "OPENAI_API_KEY")
+            
+            # If the user put the actual api key in api_key_env, just use it directly.
+            # Note: the key could also start with 'sk-' or just be a direct token string.
+            # But we don't want to accidentally expose system env vars. 
+            # For our specific proxy `https://api.n1n.ai/v1`, keys might not start with `sk-` strictly.
+            if api_key_env and (api_key_env.startswith("sk-") or len(api_key_env) > 30):
+                api_key = api_key_env
+            else:
+                api_key = env_get(api_key_env)
+
         api_key_optional = bool(self.cfg.get("api_key_optional", False))
-        api_key = env_get(api_key_env)
+        
         if not api_key and not api_key_optional:
             return AskResult(
                 success=False,
@@ -79,7 +94,10 @@ class OpenAICompatAdapter(BaseAdapter):
 
         timeout_s = float(self.cfg.get("timeout_s", 60))
         t = Timer.start()
-        headers: Dict[str, str] = {"content-type": "application/json"}
+        headers: Dict[str, str] = {
+            "Content-Type": "application/json",
+            "User-Agent": "HarnessChat/1.0"
+        }
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         extra = self.cfg.get("extra_headers") or {}
@@ -88,52 +106,68 @@ class OpenAICompatAdapter(BaseAdapter):
                 if k and v is not None:
                     headers[str(k)] = str(v)
 
-        try:
-            async with httpx.AsyncClient(timeout=timeout_s) as client:
-                body: Dict[str, Any] = {
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                }
-                mlow = str(model).lower()
-                if not (mlow.startswith("o1") or mlow.startswith("o3")):
-                    body["temperature"] = float(options.get("temperature", 0.2))
-                r = await client.post(url, headers=headers, json=body)
-                r.raise_for_status()
-                data = r.json()
-                content = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    or ""
-                )
-                if isinstance(content, list):
-                    # 少数兼容实现返回多段 content
-                    parts: list[str] = []
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            parts.append(str(block.get("text", "")))
-                    content = "\n".join(parts)
-                content = str(content).strip()
-                usage = data.get("usage") or {}
-                return AskResult(
-                    success=True,
-                    content=content,
-                    provider="openai_compat",
-                    model=str(model),
-                    latency_ms=t.elapsed_ms(),
-                    tokens_in=int(usage.get("prompt_tokens") or 0),
-                    tokens_out=int(usage.get("completion_tokens") or 0),
-                    raw={"id": data.get("id")},
-                )
-        except Exception as e:
-            return AskResult(
-                success=False,
-                content="",
-                provider="openai_compat",
-                model=str(model),
-                latency_ms=t.elapsed_ms(),
-                error=str(e),
-            )
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=timeout_s) as client:
+                    body: Dict[str, Any] = {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": "请始终使用中文进行回答。"},
+                            {"role": "user", "content": prompt}
+                        ],
+                    }
+                    mlow = str(model).lower()
+                    if not (mlow.startswith("o1") or mlow.startswith("o3")):
+                        body["temperature"] = float(options.get("temperature", 0.2))
+                    r = await client.post(url, headers=headers, json=body)
+                    r.raise_for_status()
+                    data = r.json()
+                    content = (
+                        data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                        or ""
+                    )
+                    if isinstance(content, list):
+                        # 少数兼容实现返回多段 content
+                        parts: list[str] = []
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                parts.append(str(block.get("text", "")))
+                        content = "\n".join(parts)
+                    content = str(content).strip()
+                    usage = data.get("usage") or {}
+                    return AskResult(
+                        success=True,
+                        content=content,
+                        provider="openai_compat",
+                        model=str(model),
+                        latency_ms=t.elapsed_ms(),
+                        tokens_in=int(usage.get("prompt_tokens") or 0),
+                        tokens_out=int(usage.get("completion_tokens") or 0),
+                        raw={"id": data.get("id")},
+                    )
+            except Exception as e:
+                last_error = str(e)
+                # Retry on connection errors or server errors, but not on auth errors (except occasionally some proxies flake with 401)
+                # We will log the error but still try to fail fast on 401 unless it's a known flaky API. 
+                # To be safe, we will just break on 401/403/404 as before, but ensure the error message is clear.
+                if "401" in last_error or "403" in last_error or "404" in last_error:
+                    break
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1 * (attempt + 1))
+                continue
+
+        return AskResult(
+            success=False,
+            content="",
+            provider="openai_compat",
+            model=str(model),
+            latency_ms=t.elapsed_ms(),
+            error=last_error or "Unknown error",
+        )
 
 
 def build_adapter(model_key: str, model_cfg: Dict[str, Any]) -> BaseAdapter:

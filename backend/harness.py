@@ -7,6 +7,9 @@ from model_adapters import AskResult, build_adapter
 from utils import Timer, new_trace_id
 
 
+import json
+import re
+
 @dataclass
 class Step:
     name: str
@@ -63,65 +66,122 @@ class DualTrackHarness:
                 hits.append(k)
         return hits
 
-    def analyze_complexity(self, prompt: str) -> Dict[str, Any]:
+    async def analyze_complexity(self, prompt: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         hcfg = (self.cfg.get("harness") or {}).get("complexity") or {}
-        min_len = int(hcfg.get("min_length_for_refine", 220))
-        kw = hcfg.get("keyword_triggers") or []
         manual = hcfg.get("manual_triggers") or []
 
-        hits = self._keyword_hit(prompt, kw)
         manual_hits = self._keyword_hit(prompt, manual)
-
-        length = len(prompt or "")
-        score = 0.0
-        reasons = []
-
-        if length >= min_len:
-            score += 0.6
-            reasons.append(f"length>={min_len}")
-        if hits:
-            score += min(0.6, 0.15 * len(hits))
-            reasons.append("keyword:" + ",".join(hits[:5]))
         if manual_hits:
-            score = 1.0
-            reasons.append("manual:" + ",".join(manual_hits[:3]))
+            return {
+                "decision": "refine",
+                "reasons": ["manual:" + ",".join(manual_hits[:3])],
+                "manual_hits": manual_hits,
+                "complexity": "high",
+                "type": "general",
+            }
 
-        score = min(score, 1.0)
-        decision = "refine" if score >= 0.8 else "fast"
+        use_llm = bool(hcfg.get("use_llm_analyzer", False))
+        if not use_llm:
+            # fallback rule if llm disabled
+            length = len(prompt or "")
+            return {
+                "decision": "refine" if length > 200 else "fast",
+                "reasons": [f"length={length}"],
+                "complexity": "high" if length > 200 else "low",
+                "type": "general",
+            }
 
+        analyzer_model = hcfg.get("analyzer_model", "gpt-5.5")
+        base_prompt = hcfg.get("analyzer_prompt", "")
+        
+        full_prompt = f"{base_prompt}\n\n{prompt}"
+        
+        # force JSON output where possible (some models support response_format)
+        llm_opts = dict(options or {})
+        llm_opts["temperature"] = 0.0
+
+        try:
+            adapter = self.registry.get(analyzer_model)
+            res = await adapter.ask(full_prompt, llm_opts)
+            if res.success:
+                # Try to parse JSON from the response
+                content = res.content.strip()
+                # Often models wrap json in ```json ... ```
+                json_match = re.search(r"```(?:json)?(.*?)```", content, re.DOTALL)
+                if json_match:
+                    content = json_match.group(1).strip()
+                
+                try:
+                    data = json.loads(content)
+                    complexity = data.get("complexity", "low").lower()
+                    selected_model = data.get("selected_model", "")
+                    fallback_models = data.get("fallback_models", [])
+                    refine_models = data.get("refine_models", {})
+                    reason = data.get("reason", "")
+                    
+                    return {
+                        "decision": "refine" if complexity == "high" else "fast",
+                        "reasons": [f"llm_reason: {reason}"],
+                        "complexity": complexity,
+                        "selected_model": selected_model,
+                        "fallback_models": fallback_models,
+                        "refine_models": refine_models,
+                        "reason": reason,
+                        "raw_llm_response": res.content,
+                    }
+                except json.JSONDecodeError:
+                    return {
+                        "decision": "fast",
+                        "reasons": ["json_parse_error"],
+                        "complexity": "low",
+                        "type": "general",
+                        "raw_llm_response": res.content,
+                    }
+        except Exception as e:
+            return {
+                "decision": "fast",
+                "reasons": [f"llm_analyzer_error: {str(e)}"],
+                "complexity": "low",
+                "type": "general",
+            }
+            
         return {
-            "score": score,
-            "decision": decision,
-            "reasons": reasons,
-            "hits": hits,
-            "manual_hits": manual_hits,
-            "length": length,
+            "decision": "fast",
+            "reasons": ["analyzer_failed"],
+            "complexity": "low",
+            "type": "general",
         }
 
-    def route_fast_model(self, prompt: str) -> Dict[str, Any]:
+    def route_fast_model(self, prompt: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
         routing = (self.cfg.get("harness") or {}).get("routing") or {}
-        default_model = routing.get("default_model", "openai-gpt-4o-mini")
+        default_model = routing.get("default_model", "gpt-5.5")
         default_models = routing.get("default_models") or [default_model]
-        rules = routing.get("rules") or []
 
-        for rule in rules:
-            when = (rule.get("when") or {})
-            any_keywords = when.get("any_keywords") or []
-            hits = self._keyword_hit(prompt, any_keywords)
-            if hits:
-                prefer = rule.get("prefer_models") or []
-                return {
-                    "rule": rule.get("name", "unnamed"),
-                    "hits": hits,
-                    "candidates": prefer,
-                    "selected": prefer[0] if prefer else default_models[0],
-                }
+        selected = analysis.get("selected_model")
+        fallbacks = analysis.get("fallback_models") or []
+        
+        candidates = []
+        if selected:
+            candidates.append(selected)
+        if isinstance(fallbacks, list):
+            candidates.extend(fallbacks)
+            
+        # Deduplicate while preserving order
+        seen = set()
+        unique_candidates = []
+        for c in candidates:
+            if c and c not in seen:
+                seen.add(c)
+                unique_candidates.append(c)
+
+        if not unique_candidates:
+            unique_candidates = default_models
 
         return {
-            "rule": "default",
-            "hits": [],
-            "candidates": default_models,
-            "selected": default_models[0],
+            "rule": "llm_autonomous_choice",
+            "hits": [f"reason:{analysis.get('reason', 'none')}"],
+            "candidates": unique_candidates,
+            "selected": unique_candidates[0],
         }
 
     async def _ask_with_fallback(self, model_keys: List[str], prompt: str, options: Dict[str, Any]) -> Tuple[AskResult, List[Dict[str, Any]]]:
@@ -161,7 +221,7 @@ class DualTrackHarness:
         if mode not in ("auto", "fast", "refine"):
             mode = "auto"
 
-        analysis = self.analyze_complexity(prompt)
+        analysis = await self.analyze_complexity(prompt, options)
         steps.append(
             Step(
                 name="complexity_analyze",
@@ -183,7 +243,7 @@ class DualTrackHarness:
         steps.append(Step(name="track_select", status="ok", meta={"mode": mode, "track": chosen_track}))
 
         if chosen_track == "fast":
-            route = self.route_fast_model(prompt)
+            route = self.route_fast_model(prompt, analysis)
             steps.append(Step(name="fast_route", status="ok", meta=route))
             candidates = route.get("candidates") or [route.get("selected")]
             res, attempts = await self._ask_with_fallback(candidates, prompt, options)
@@ -210,7 +270,7 @@ class DualTrackHarness:
         chain = hcfg.get("refine_chain") or {}
         if not chain.get("enabled", True):
             # fallback to fast if disabled
-            route = self.route_fast_model(prompt)
+            route = self.route_fast_model(prompt, analysis)
             steps.append(Step(name="refine_disabled_fallback_fast", status="ok", meta=route))
             candidates = route.get("candidates") or [route.get("selected")]
             res, attempts = await self._ask_with_fallback(candidates, prompt, options)
@@ -236,10 +296,16 @@ class DualTrackHarness:
         l1 = chain.get("layer1") or {}
         l2 = chain.get("layer2") or {}
         l3 = chain.get("layer3") or {}
+        
+        # fallback default
+        routing = hcfg.get("routing") or {}
+        default_model = routing.get("default_model", "gpt-5.5")
+
+        refine_models = analysis.get("refine_models") or {}
 
         # Layer 1
         l1_prompt = f"{l1.get('instruction','').strip()}\n\n【原始问题】\n{prompt.strip()}\n"
-        l1_candidates = l1.get("prefer_models") or []
+        l1_candidates = refine_models.get("draft") or [default_model]
         r1, a1 = await self._ask_with_fallback(l1_candidates, l1_prompt, options)
         steps.append(
             Step(
@@ -251,7 +317,7 @@ class DualTrackHarness:
                 input_preview=l1_prompt[:240] + ("…" if len(l1_prompt) > 240 else ""),
                 output=r1.content if r1.success else None,
                 error=r1.error if not r1.success else None,
-                meta={"attempts": a1},
+                meta={"attempts": a1, "candidates": l1_candidates},
             )
         )
         if not r1.success:
@@ -269,7 +335,7 @@ class DualTrackHarness:
             f"【原始问题】\n{prompt.strip()}\n\n"
             f"【初稿答案】\n{r1.content.strip()}\n"
         )
-        l2_candidates = l2.get("prefer_models") or []
+        l2_candidates = refine_models.get("review") or [default_model]
         r2, a2 = await self._ask_with_fallback(l2_candidates, l2_prompt, options)
         steps.append(
             Step(
@@ -281,7 +347,7 @@ class DualTrackHarness:
                 input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
                 output=r2.content if r2.success else None,
                 error=r2.error if not r2.success else None,
-                meta={"attempts": a2},
+                meta={"attempts": a2, "candidates": l2_candidates},
             )
         )
         if not r2.success:
@@ -307,7 +373,7 @@ class DualTrackHarness:
             f"【原始问题】\n{prompt.strip()}\n\n"
             f"【审查层答案】\n{r2.content.strip()}\n"
         )
-        l3_candidates = l3.get("prefer_models") or []
+        l3_candidates = refine_models.get("polish") or [default_model]
         r3, a3 = await self._ask_with_fallback(l3_candidates, l3_prompt, options)
         steps.append(
             Step(
@@ -319,7 +385,7 @@ class DualTrackHarness:
                 input_preview=l3_prompt[:240] + ("…" if len(l3_prompt) > 240 else ""),
                 output=r3.content if r3.success else None,
                 error=r3.error if not r3.success else None,
-                meta={"attempts": a3},
+                meta={"attempts": a3, "candidates": l3_candidates},
             )
         )
 
