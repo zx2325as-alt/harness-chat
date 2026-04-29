@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, AsyncGenerator
 
 import httpx
 import asyncio
 
 from utils import Timer, env_get
 
+
+import json
 
 @dataclass
 class AskResult:
@@ -42,7 +44,11 @@ class BaseAdapter:
         self.model_name = model_name
         self.cfg = cfg
 
-    async def ask(self, prompt: str, options: Dict[str, Any]) -> AskResult:
+    async def ask(self, prompt: str, options: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None) -> AskResult:
+        raise NotImplementedError
+
+    async def stream(self, prompt: str, options: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None) -> AsyncGenerator[Dict[str, Any], None]:
+        """流式输出接口。"""
         raise NotImplementedError
 
 
@@ -61,7 +67,7 @@ class OpenAICompatAdapter(BaseAdapter):
 
     provider = "openai_compat"
 
-    async def ask(self, prompt: str, options: Dict[str, Any]) -> AskResult:
+    async def ask(self, prompt: str, options: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None) -> AskResult:
         base_url = self.cfg.get("base_url", "https://api.openai.com/v1")
         url = _openai_chat_completions_url(str(base_url))
         model = self.cfg.get("model", self.model_name)
@@ -111,12 +117,19 @@ class OpenAICompatAdapter(BaseAdapter):
         for attempt in range(max_retries):
             try:
                 async with httpx.AsyncClient(timeout=timeout_s) as client:
+                    req_messages = [{"role": "system", "content": "请始终使用中文进行回答。"}]
+                    
+                    if messages:
+                        # Append the historical messages directly
+                        req_messages.extend(messages)
+                        
+                    # Always append the current prompt as the latest user message
+                    if prompt:
+                        req_messages.append({"role": "user", "content": prompt})
+                        
                     body: Dict[str, Any] = {
                         "model": model,
-                        "messages": [
-                            {"role": "system", "content": "请始终使用中文进行回答。"},
-                            {"role": "user", "content": prompt}
-                        ],
+                        "messages": req_messages,
                     }
                     mlow = str(model).lower()
                     if not (mlow.startswith("o1") or mlow.startswith("o3")):
@@ -168,6 +181,95 @@ class OpenAICompatAdapter(BaseAdapter):
             latency_ms=t.elapsed_ms(),
             error=last_error or "Unknown error",
         )
+
+    async def stream(self, prompt: str, options: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None) -> AsyncGenerator[Dict[str, Any], None]:
+        base_url = self.cfg.get("base_url", "https://api.openai.com/v1")
+        url = _openai_chat_completions_url(str(base_url))
+        model = self.cfg.get("model", self.model_name)
+        api_key = self.cfg.get("api_key")
+        
+        if not api_key:
+            api_key_env = self.cfg.get("api_key_env", "OPENAI_API_KEY")
+            if api_key_env and (api_key_env.startswith("sk-") or len(api_key_env) > 30):
+                api_key = api_key_env
+            else:
+                api_key = env_get(api_key_env)
+
+        headers: Dict[str, str] = {
+            "Content-Type": "application/json",
+            "User-Agent": "HarnessChat/1.0"
+        }
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        extra = self.cfg.get("extra_headers") or {}
+        if isinstance(extra, dict):
+            for k, v in extra.items():
+                if k and v is not None:
+                    headers[str(k)] = str(v)
+
+        req_messages = [{"role": "system", "content": "请始终使用中文进行回答。"}]
+        if messages:
+            req_messages.extend(messages)
+            
+        if prompt:
+            req_messages.append({"role": "user", "content": prompt})
+            
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": req_messages,
+            "stream": True
+        }
+        mlow = str(model).lower()
+        if not (mlow.startswith("o1") or mlow.startswith("o3")):
+            body["temperature"] = float(options.get("temperature", 0.2))
+            
+        timeout_s = float(self.cfg.get("timeout_s", 60))
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                # We don't retry extensively on stream, just let it fail if it fails immediately
+                async with httpx.AsyncClient(timeout=timeout_s) as client:
+                    async with client.stream("POST", url, headers=headers, json=body) as response:
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            line = line.strip()
+                            if not line:
+                                continue
+                            if line.startswith("data: "):
+                                data_str = line[6:]
+                                if data_str == "[DONE]":
+                                    break
+                                try:
+                                    data = json.loads(data_str)
+                                    delta = data.get("choices", [{}])[0].get("delta", {})
+                                    
+                                    # Standard text delta
+                                    content = delta.get("content", "")
+                                    
+                                    # Handle Reasoning/Think models (like DeepSeek) that might return reasoning_content
+                                    reasoning_content = delta.get("reasoning_content", "")
+                                    
+                                    if content or reasoning_content:
+                                        yield {
+                                            "content": content,
+                                            "reasoning_content": reasoning_content
+                                        }
+                                except json.JSONDecodeError:
+                                    pass
+                # 如果成功执行完流，跳出重试循环
+                break
+            except Exception as e:
+                last_error = str(e)
+                if "401" in last_error or "403" in last_error or "404" in last_error:
+                    # 对于明确的鉴权或路径错误，不重试，直接抛出
+                    raise Exception(f"请求失败: {last_error}")
+                
+                # 针对 502/503/504 以及网络断开等临时错误，进行重试退避
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 * (attempt + 1))
+                else:
+                    raise Exception(f"服务暂时不可用或网络异常，已重试 {max_retries} 次: {last_error}")
 
 
 def build_adapter(model_key: str, model_cfg: Dict[str, Any]) -> BaseAdapter:

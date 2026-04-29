@@ -53,8 +53,8 @@ harness:
       - "精化轨"
 
   routing:
-    # LLM 预判失败或无可用选择时按顺序尝试，优先使用兼顾速度与质量的模型
-    default_model: "gpt-5.5"
+    # 无规则命中时按顺序尝试，优先使用兼顾速度与质量的模型，失败则自动向后降级
+    default_model: "gpt-5.5-pro"
     default_models:
       - "gpt-5.5"
       - "claude-sonnet-4-6"
