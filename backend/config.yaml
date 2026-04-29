@@ -1,0 +1,170 @@
+server:
+  cors_allow_origins:
+    - "http://localhost:5173"
+    - "http://127.0.0.1:5173"
+    - "http://localhost:8080"
+    - "http://127.0.0.1:8080"
+
+harness:
+  # default: auto | fast | refine
+  default_mode: "auto"
+
+  complexity:
+    # if uncertain, default to fast track
+    default_to_fast_when_uncertain: true
+    min_length_for_refine: 220
+    keyword_triggers:
+      - "分析"
+      - "对比"
+      - "论证"
+      - "评估"
+      - "推理"
+      - "为什么"
+      - "how"
+      - "compare"
+      - "evaluate"
+    manual_triggers:
+      - "/refine"
+      - "强制精化"
+      - "精化轨"
+
+  routing:
+    # 无规则命中时按顺序尝试，直到某一模型调用成功（需对应环境变量或本地 Ollama）
+    default_model: "openai-gpt-4o-mini"
+    default_models:
+      - "openai-gpt-4o-mini"
+      - "anthropic-claude-sonnet"
+      - "gemini-flash"
+      - "ollama-llama3"
+    rules:
+      - name: "code"
+        when:
+          any_keywords: ["代码", "bug", "报错", "traceback", "python", "js", "vue", "fastapi", "sql"]
+        prefer_models:
+          - "openai-gpt-4o-mini"
+          - "anthropic-claude-sonnet"
+          - "gemini-flash"
+          - "ollama-llama3"
+
+      - name: "math"
+        when:
+          any_keywords: ["数学", "证明", "概率", "方程", "积分", "导数"]
+        prefer_models:
+          - "openai-o1-mini"
+          - "openai-gpt-4o-mini"
+          - "anthropic-claude-sonnet"
+
+      - name: "web_search"
+        when:
+          any_keywords: ["最新", "新闻", "今天", "2026", "官网", "文档", "搜索"]
+        prefer_models:
+          - "openai-gpt-4o-mini"
+          - "gemini-flash"
+          - "anthropic-claude-sonnet"
+
+      - name: "privacy"
+        when:
+          any_keywords: ["隐私", "敏感", "身份证", "密码", "token", "密钥", "银行卡"]
+        prefer_models:
+          - "ollama-llama3"
+          - "openai-gpt-4o-mini"
+
+  refine_chain:
+    enabled: true
+    # Layer 1: broad draft (cheap, wide coverage)
+    layer1:
+      name: "draft"
+      prefer_models:
+        - "openai-gpt-4o-mini"
+        - "anthropic-claude-haiku"
+        - "gemini-flash"
+        - "ollama-llama3"
+      instruction: |
+        你是“初稿层”。目标：覆盖全面，不求极致精确。请输出：
+        1) 关键点列表
+        2) 初步答案（可包含不确定性提示）
+        3) 你认为需要进一步核查的点（如果有）
+    # Layer 2: critical review (find mistakes, add depth)
+    layer2:
+      name: "review"
+      prefer_models:
+        - "openai-o1-mini"
+        - "anthropic-claude-sonnet"
+        - "openai-gpt-4o-mini"
+      instruction: |
+        你是“审查层”。输入包含：原始问题 + 初稿答案。
+        目标：找错误、补漏洞、加深度；指出不确定之处并给出修正建议。
+        请输出：
+        1) 初稿问题清单（要点化）
+        2) 修正版答案（尽量严谨）
+        3) 仍不确定处与需要补充信息
+    # Layer 3: polish (format, coherence)
+    layer3:
+      name: "polish"
+      prefer_models:
+        - "openai-gpt-4o"
+        - "anthropic-claude-sonnet"
+        - "gemini-flash"
+      instruction: |
+        你是“润色层”。输入包含：原始问题 + 审查层答案。
+        目标：输出最终答案，结构清晰、语言流畅、逻辑自洽。
+        请避免夸大不确定内容；如有前提条件请明确写出。
+
+# 所有模型统一为 OpenAI Chat Completions：POST {base_url}/v1/chat/completions
+# 环境变量（按需）：
+#   OPENAI_API_KEY       — 官方 OpenAI 或兼容站点的 Bearer
+#   OPENROUTER_API_KEY   — 下文 OpenRouter 示例（Claude / Gemini 等非 OpenAI 厂商常通过此类网关暴露 OpenAI 协议）
+# Ollama：本机 OpenAI 兼容端点，通常无需密钥（api_key_optional: true）
+models:
+  openai-gpt-4o-mini:
+    provider: "openai_compat"
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "OPENAI_API_KEY"
+    model: "gpt-4o-mini"
+    timeout_s: 120
+
+  openai-gpt-4o:
+    provider: "openai_compat"
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "OPENAI_API_KEY"
+    model: "gpt-4o"
+    timeout_s: 180
+
+  openai-o1-mini:
+    provider: "openai_compat"
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "OPENAI_API_KEY"
+    model: "o1-mini"
+    timeout_s: 300
+
+  # Claude：通过 OpenAI 兼容网关（示例 OpenRouter；可改为自建 OneAPI / LiteLLM 等）
+  anthropic-claude-sonnet:
+    provider: "openai_compat"
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+    model: "anthropic/claude-3.5-sonnet"
+    timeout_s: 180
+
+  anthropic-claude-haiku:
+    provider: "openai_compat"
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+    model: "anthropic/claude-3.5-haiku"
+    timeout_s: 120
+
+  # Gemini：同上，走 OpenAI 兼容路由与模型名（以 OpenRouter 为例，可按供应商文档修改 model）
+  gemini-flash:
+    provider: "openai_compat"
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+    model: "google/gemini-2.0-flash-001"
+    timeout_s: 120
+
+  # Ollama 内置 OpenAI 兼容：http://localhost:11434/v1/chat/completions
+  ollama-llama3:
+    provider: "openai_compat"
+    base_url: "http://localhost:11434/v1"
+    api_key_optional: true
+    api_key_env: "OLLAMA_API_KEY"
+    model: "llama3"
+    timeout_s: 300
