@@ -9,7 +9,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 BACKEND_PORT="${BACKEND_PORT:-8000}"
-FRONTEND_PORT="${FRONTEND_PORT:-8080}"
+FRONTEND_PORT="${FRONTEND_PORT:-6008}"
 LOG_DIR="$ROOT/logs"
 mkdir -p "$LOG_DIR"
 
@@ -72,7 +72,7 @@ if stop_if_pid_file "$FRONTEND_PID_FILE" "前端"; then
 else
   echo "正在启动前端 (Vue CLI serve，端口 ${FRONTEND_PORT})..."
   cd "$ROOT/frontend"
-  # Vue CLI 默认 8080；若需改端口: FRONTEND_PORT=3000 ./start_all.sh 并在下方传入 --port
+  # 与 frontend/vue.config.js 默认一致；若需改端口: FRONTEND_PORT=3000 ./start_all.sh
   nohup npm run serve -- --port "$FRONTEND_PORT" >>"$FRONTEND_LOG" 2>&1 &
   echo $! >"$FRONTEND_PID_FILE"
   cd "$ROOT"
