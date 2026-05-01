@@ -18,29 +18,69 @@
         @keydown.enter.exact.prevent="send"
       />
 
-      <div class="composer-bar">
+      <div class="composer-bar" ref="dropRoot">
         <div class="bar-left">
-          <label class="pill">
-            <span class="pill-label">轨道</span>
-            <select
-              class="pill-select"
+          <div class="dd" :class="{ open: openMenu === 'mode' }">
+            <button
+              type="button"
+              class="dd-trigger"
               :disabled="busy"
-              :value="mode"
-              @change="$emit('update:mode', $event.target.value)"
+              aria-haspopup="listbox"
+              :aria-expanded="openMenu === 'mode'"
+              @click.stop="toggleMenu('mode')"
             >
-              <option value="refine">精化轨</option>
-              <option value="auto">自动</option>
-              <option value="fast">快速轨</option>
-            </select>
-          </label>
-          <label class="pill">
-            <span class="pill-label">搜索</span>
-            <select class="pill-select narrow" :disabled="busy" v-model="searchMode">
-              <option value="auto">自动</option>
-              <option value="on">开启</option>
-              <option value="off">关闭</option>
-            </select>
-          </label>
+              <span class="dd-prefix">轨道</span>
+              <span class="dd-value">{{ modeLabel }}</span>
+              <svg class="dd-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M6 9l6 6 6-6" />
+              </svg>
+            </button>
+            <transition name="dd-pop">
+              <ul v-show="openMenu === 'mode'" class="dd-list" role="listbox">
+                <li
+                  v-for="o in modeOptions"
+                  :key="o.value"
+                  class="dd-item"
+                  :class="{ active: mode === o.value }"
+                  role="option"
+                  @click.stop="pickMode(o.value)"
+                >
+                  {{ o.label }}
+                </li>
+              </ul>
+            </transition>
+          </div>
+
+          <div class="dd dd-search" :class="{ open: openMenu === 'search' }">
+            <button
+              type="button"
+              class="dd-trigger"
+              :disabled="busy"
+              aria-haspopup="listbox"
+              :aria-expanded="openMenu === 'search'"
+              @click.stop="toggleMenu('search')"
+            >
+              <span class="dd-prefix">搜索</span>
+              <span class="dd-value">{{ searchLabel }}</span>
+              <svg class="dd-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M6 9l6 6 6-6" />
+              </svg>
+            </button>
+            <transition name="dd-pop">
+              <ul v-show="openMenu === 'search'" class="dd-list" role="listbox">
+                <li
+                  v-for="o in searchOptions"
+                  :key="o.value"
+                  class="dd-item"
+                  :class="{ active: searchMode === o.value }"
+                  role="option"
+                  @click.stop="pickSearch(o.value)"
+                >
+                  {{ o.label }}
+                </li>
+              </ul>
+            </transition>
+          </div>
         </div>
         <div class="bar-fill" aria-hidden="true" />
         <div class="bar-right">
@@ -81,6 +121,18 @@
 <script>
 import { API_BASE } from "../apiBase.js";
 
+const MODE_OPTIONS = [
+  { value: "auto", label: "自动" },
+  { value: "refine", label: "精化轨" },
+  { value: "fast", label: "快速轨" },
+];
+
+const SEARCH_OPTIONS = [
+  { value: "auto", label: "自动" },
+  { value: "on", label: "开启" },
+  { value: "off", label: "关闭" },
+];
+
 export default {
   name: "ChatInput",
   props: {
@@ -93,9 +145,48 @@ export default {
       draft: "",
       attachments: [],
       searchMode: "auto",
+      openMenu: null,
+      modeOptions: MODE_OPTIONS,
+      searchOptions: SEARCH_OPTIONS,
     };
   },
+  computed: {
+    modeLabel() {
+      return MODE_OPTIONS.find((o) => o.value === this.mode)?.label ?? this.mode;
+    },
+    searchLabel() {
+      return SEARCH_OPTIONS.find((o) => o.value === this.searchMode)?.label ?? this.searchMode;
+    },
+  },
+  watch: {
+    busy(v) {
+      if (v) this.openMenu = null;
+    },
+  },
+  mounted() {
+    this._onDocDown = (e) => {
+      const root = this.$refs.dropRoot;
+      if (!root || root.contains(e.target)) return;
+      this.openMenu = null;
+    };
+    document.addEventListener("pointerdown", this._onDocDown, true);
+  },
+  beforeUnmount() {
+    document.removeEventListener("pointerdown", this._onDocDown, true);
+  },
   methods: {
+    toggleMenu(which) {
+      if (this.busy) return;
+      this.openMenu = this.openMenu === which ? null : which;
+    },
+    pickMode(value) {
+      this.$emit("update:mode", value);
+      this.openMenu = null;
+    },
+    pickSearch(value) {
+      this.searchMode = value;
+      this.openMenu = null;
+    },
     statusLabel(s) {
       if (s === "ok") return "已解析";
       if (s === "error") return "失败";
@@ -305,44 +396,99 @@ export default {
   background: rgba(0, 0, 0, 0.12);
   border: 1px solid #2f3545;
 }
-.pill {
+
+/* 自定义下拉（替代原生 select，避免系统白底菜单） */
+.dd {
+  position: relative;
+  z-index: 1;
+}
+.dd.open {
+  z-index: 40;
+}
+.dd-trigger {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 4px 4px 9px;
+  padding: 5px 10px 5px 11px;
   border-radius: 999px;
-  background: #1e2433;
   border: 1px solid #353f52;
-  cursor: pointer;
-}
-.pill-label {
+  background: #1e2433;
+  color: #e2e8f0;
   font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1.25;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.dd-trigger:hover:not(:disabled) {
+  border-color: #4b5c78;
+  background: #252d3d;
+}
+.dd-trigger:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.dd-prefix {
   color: #94a3b8;
   font-weight: 500;
 }
-.pill-select {
-  appearance: none;
-  border: none;
-  background: transparent;
-  color: #e2e8f0;
-  font-size: 12px;
+.dd-value {
   font-weight: 600;
-  padding: 4px 22px 4px 0;
+  min-width: 3em;
+  text-align: left;
+}
+.dd-chev {
+  flex-shrink: 0;
+  color: #64748b;
+  transition: transform 0.18s ease;
+}
+.dd.open .dd-chev {
+  transform: rotate(180deg);
+  color: #94a3b8;
+}
+.dd-list {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  margin: 0;
+  padding: 6px;
+  min-width: 128px;
+  list-style: none;
+  border-radius: 10px;
+  border: 1px solid #3d4d64;
+  background: #1e2433;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+.dd-search .dd-list {
+  min-width: 100px;
+}
+.dd-item {
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #cbd5e1;
   cursor: pointer;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 4px center;
+  transition: background 0.12s ease, color 0.12s ease;
 }
-.pill-select:focus {
-  outline: none;
+.dd-item:hover {
+  background: #2f3a4d;
+  color: #f1f5f9;
 }
-.pill-select:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
+.dd-item.active {
+  background: rgba(99, 102, 241, 0.2);
+  color: #c7d2fe;
 }
-.pill-select.narrow {
-  min-width: 72px;
+
+.dd-pop-enter-active,
+.dd-pop-leave-active {
+  transition: opacity 0.14s ease, transform 0.14s ease;
 }
+.dd-pop-enter-from,
+.dd-pop-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
+}
+
 .bar-right {
   display: flex;
   align-items: center;

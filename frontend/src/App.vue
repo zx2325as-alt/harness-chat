@@ -93,7 +93,7 @@ export default {
   data() {
     return {
       view: "chat",
-      mode: "refine",
+      mode: "auto",
       busy: false,
       sessions: [],
       currentSessionId: null,
