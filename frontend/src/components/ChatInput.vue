@@ -79,7 +79,7 @@
 </template>
 
 <script>
-const API_BASE = "http://localhost:8000";
+import { API_BASE } from "../apiBase.js";
 
 export default {
   name: "ChatInput",

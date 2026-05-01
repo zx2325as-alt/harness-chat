@@ -85,8 +85,7 @@ import ChatInput from "./components/ChatInput.vue";
 import ChatMessage from "./components/ChatMessage.vue";
 import StepDisplay from "./components/StepDisplay.vue";
 import ConfigView from "./components/ConfigView.vue";
-
-const API_BASE = "http://localhost:8000";
+import { API_BASE } from "./apiBase.js";
 
 export default {
   name: "App",
