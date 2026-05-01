@@ -10,7 +10,10 @@ from utils import Timer, new_trace_id
 import json
 import re
 import asyncio
-from duckduckgo_search import DDGS
+import time
+from datetime import datetime, timedelta
+
+from search_service import SearchService
 
 @dataclass
 class Step:
@@ -59,6 +62,7 @@ class DualTrackHarness:
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
         self.registry = ModelRegistry(cfg.get("models", {}))
+        self.search = SearchService(cfg)
 
     def _keyword_hit(self, text: str, keywords: List[str]) -> List[str]:
         t = (text or "").lower()
@@ -120,11 +124,17 @@ class DualTrackHarness:
                     fallback_models = data.get("fallback_models", [])
                     refine_models = data.get("refine_models", {})
                     reason = data.get("reason", "")
-                    
+                    decision = str(data.get("decision", "") or "").strip().lower()
+                    if decision not in ("fast", "refine"):
+                        decision = "refine" if complexity == "high" else "fast"
+
                     return {
-                        "decision": "refine" if complexity == "high" else "fast",
+                        "decision": decision,
                         "reasons": [f"llm_reason: {reason}"],
                         "complexity": complexity,
+                        "type": data.get("type", "general"),
+                        "search_required": bool(data.get("search_required", False)),
+                        "search_query": str(data.get("search_query") or ""),
                         "selected_model": selected_model,
                         "fallback_models": fallback_models,
                         "refine_models": refine_models,
@@ -186,6 +196,105 @@ class DualTrackHarness:
             "selected": unique_candidates[0],
         }
 
+    def should_search(self, prompt: str, analysis: Dict[str, Any], options: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+        opts = options or {}
+        mode = str(opts.get("search_mode") or opts.get("search") or "auto").lower()
+        if mode in ("off", "false", "0", "disabled"):
+            return False, "手动关闭联网搜索"
+        if mode in ("on", "true", "1", "force"):
+            return True, "用户手动开启联网搜索"
+        if analysis.get("search_required") or analysis.get("type") == "web_search":
+            return True, analysis.get("reason") or "调度模型判断需要实时信息"
+        user_face = str(opts.get("search_prompt_base") or prompt or "").strip()
+        prompt_lower = user_face.lower()
+        manual_markers = ["/search", "联网搜索", "上网查", "实时搜索", "最新", "今天", "最近"]
+        hits = [m for m in manual_markers if m.lower() in prompt_lower]
+        if hits:
+            return True, "命中联网搜索提示：" + ",".join(hits[:3])
+        return False, "无需联网搜索"
+
+    def _query_is_related(self, prompt: str, query: str) -> bool:
+        prompt_tokens = set(re.findall(r"[\w\u4e00-\u9fff]{2,}", (prompt or "").lower()))
+        query_tokens = set(re.findall(r"[\w\u4e00-\u9fff]{2,}", (query or "").lower()))
+        if not prompt_tokens or not query_tokens:
+            return True
+        return bool(prompt_tokens & query_tokens)
+
+    def build_search_query(self, prompt: str, analysis: Dict[str, Any], options: Optional[Dict[str, Any]] = None) -> str:
+        opts = options or {}
+        user_q = str(opts.get("search_prompt_base") or prompt or "").strip()
+        raw_query = str(analysis.get("search_query") or "").strip()
+
+        if raw_query and self._query_is_related(user_q, raw_query):
+            base = raw_query
+        else:
+            base = user_q
+
+        base = re.sub(r"\s+", " ", base).strip()
+        if not base:
+            base = user_q
+
+        hcfg = self.cfg.get("harness") or {}
+        scfg = hcfg.get("search") or {}
+        if not bool(scfg.get("query_enrich", True)):
+            return base
+
+        today = datetime.now().date()
+        tomorrow = today + timedelta(days=1)
+        combined = f"{user_q} {base}"
+        cl = combined.lower()
+
+        extras: List[str] = []
+
+        def add_token(tok: str) -> None:
+            t = tok.strip()
+            if not t:
+                return
+            if t.lower() not in cl and t not in base:
+                extras.append(t)
+
+        if any(x in combined for x in ("明天", "翌日", "明早", "明晚", "次日")) or any(
+            x in cl for x in ("tomorrow", "next day")
+        ):
+            add_token(str(tomorrow))
+        elif any(x in combined for x in ("今天", "今日", "现在", "此刻", "最新", "实时")) or any(
+            x in cl for x in ("today", "now", "current", "latest")
+        ):
+            add_token(str(today))
+
+        if any(x in combined for x in ("东京", "新宿", "涩谷", "大阪", "京都", "日本")):
+            if "tokyo" not in cl and "japan" not in cl:
+                add_token("Tokyo Japan")
+
+        if any(k in combined for k in ("天气", "气温", "降雨", "下雨", "台风", "暴雨")) or any(
+            k in cl for k in ("weather", "forecast", "temperature", "rain")
+        ):
+            if "weather" not in cl:
+                add_token("weather")
+
+        if extras:
+            base = f"{base} " + " ".join(extras)
+        return base.strip()
+
+    def _merge_search_into_prompt(self, prompt: str, search_context: str, options: Optional[Dict[str, Any]]) -> str:
+        """合并联网摘要时强约束地点/主题与用户原话一致，减少『张冠李戴』式回答。"""
+        opts = options or {}
+        user_anchor = str(opts.get("search_prompt_base") or "").strip()
+        anchor_block = (
+            f"【用户原话】（回答中的城市/区县、日期、『明天』等时间含义必须与此一致，禁止擅自替换为其他城市）\n{user_anchor}\n\n"
+            if user_anchor
+            else ""
+        )
+        return (
+            f"{search_context}\n"
+            "【约束】只采纳与「用户原话」中地点、时间范围直接相关的检索内容；"
+            "若摘要中的城市/站点与用户原话不符，不得将其当作用户所问地点的事实；"
+            "此时应明确说明当前结果无法支持该地逐日预报，并建议用户核对检索词或使用当地气象台/中国天气网等权威来源。\n\n"
+            f"{anchor_block}"
+            "请在回答中用 [来源序号] 标注使用到的联网信息，并在末尾列出引用链接。\n\n"
+            f"【用户问题】\n{prompt}"
+        )
+
     async def _ask_with_fallback(self, model_keys: List[str], prompt: str, options: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None) -> Tuple[AskResult, List[Dict[str, Any]]]:
         attempts = []
         last: Optional[AskResult] = None
@@ -220,37 +329,31 @@ class DualTrackHarness:
                 continue
             try:
                 adapter = self.registry.get(mk)
-                # Yield a meta event so frontend knows which model is streaming
                 yield {"event": "model_start", "model": mk, "provider": adapter.provider}
-                
+                started_at = time.perf_counter()
+
                 async for chunk in adapter.stream(prompt, options, messages=messages):
-                    yield {"event": "chunk", "data": chunk}
-                    
-                # If we finish successfully without exception, we break (don't fallback)
-                yield {"event": "model_end", "model": mk}
+                    content = chunk.get("content") or ""
+                    if content:
+                        step = int(options.get("stream_slice_chars") or 8)
+                        for idx in range(0, len(content), step):
+                            yield {"event": "chunk", "data": {"content": content[idx : idx + step]}}
+                            await asyncio.sleep(0)
+
+                yield {
+                    "event": "model_end",
+                    "model": mk,
+                    "latency_ms": int((time.perf_counter() - started_at) * 1000),
+                }
                 return
             except Exception as e:
-                # On error, we yield an error event and try the next candidate
                 yield {"event": "model_error", "model": mk, "error": str(e)}
                 continue
-                
+
         yield {"event": "error", "error": "All fallback models failed in stream."}
 
-    async def perform_web_search(self, query: str) -> str:
-        try:
-            def search_sync():
-                with DDGS() as ddgs:
-                    return list(ddgs.text(query, max_results=3))
-            
-            results = await asyncio.to_thread(search_sync)
-            if not results:
-                return "无搜索结果。"
-            context = "【联网搜索结果】\n"
-            for i, r in enumerate(results):
-                context += f"{i+1}. {r.get('title')}\n{r.get('body')}\n链接: {r.get('href')}\n\n"
-            return context
-        except Exception as e:
-            return f"联网搜索失败: {e}"
+    async def perform_web_search(self, query: str) -> Dict[str, Any]:
+        return await self.search.search(query)
 
     async def run_stream(self, prompt: str, mode: str = "auto", options: Optional[Dict[str, Any]] = None, messages: Optional[List[Dict[str, Any]]] = None) -> AsyncGenerator[Dict[str, Any], None]:
         options = options or {}
@@ -262,6 +365,8 @@ class DualTrackHarness:
         mode = (mode or default_mode).lower()
         if mode not in ("auto", "fast", "refine"):
             mode = "auto"
+
+        yield {"event": "trace", "trace_id": trace_id}
 
         yield {"event": "step", "step": {"name": "complexity_analyze", "status": "running"}}
         analysis = await self.analyze_complexity(prompt, options)
@@ -285,15 +390,44 @@ class DualTrackHarness:
         step_track = Step(name="track_select", status="ok", meta={"mode": mode, "track": chosen_track})
         steps.append(step_track)
         yield {"event": "step", "step": step_track.to_dict()}
+        yield {"event": "trace", "trace_id": trace_id, "track": chosen_track}
 
-        if analysis.get("type") == "web_search":
+        should_search, search_reason = self.should_search(prompt, analysis, options)
+        if should_search:
             yield {"event": "step", "step": {"name": "web_search", "status": "running"}}
-            search_context = await self.perform_web_search(prompt)
-            step_ws = Step(name="web_search", status="ok", meta={"query": prompt, "results": search_context[:200] + "..."})
+            search_query = self.build_search_query(prompt, analysis, options)
+            search_result = await self.perform_web_search(search_query)
+            search_context = search_result.get("context", "")
+            sources = search_result.get("sources", [])
+            hard_err = search_result.get("error")
+            step_ws = Step(
+                name="web_search",
+                status="error" if hard_err else "ok",
+                provider=search_result.get("provider_used"),
+                latency_ms=search_result.get("latency_ms"),
+                meta={
+                    "query": search_query,
+                    "query_effective": search_query,
+                    "reason": search_reason,
+                    "sources": sources,
+                    "result_count": len(sources),
+                    "failure_code": search_result.get("failure_code"),
+                    "degraded": bool(search_result.get("degraded")),
+                    "attempts": search_result.get("attempts") or [],
+                    "fallback_from": search_result.get("fallback_from"),
+                    "results_preview": search_context[:500] + ("..." if len(search_context) > 500 else ""),
+                },
+                error=hard_err,
+            )
             steps.append(step_ws)
             yield {"event": "step", "step": step_ws.to_dict()}
-            
-            prompt = f"{search_context}\n【用户问题】\n{prompt}"
+
+            if step_ws.status == "error" or hard_err:
+                yield {"event": "error", "error": step_ws.error or hard_err or "联网搜索失败"}
+                return
+
+            if search_context:
+                prompt = self._merge_search_into_prompt(prompt, search_context, options)
 
         if chosen_track == "fast":
             route = self.route_fast_model(prompt, analysis)
@@ -446,6 +580,50 @@ class DualTrackHarness:
             chosen_track = analysis.get("decision", "fast")
 
         steps.append(Step(name="track_select", status="ok", meta={"mode": mode, "track": chosen_track}))
+
+        should_search, search_reason = self.should_search(prompt, analysis, options)
+        if should_search:
+            search_query = self.build_search_query(prompt, analysis, options)
+            search_result = await self.perform_web_search(search_query)
+            search_context = search_result.get("context", "")
+            hard_err = search_result.get("error")
+            ws_step = Step(
+                name="web_search",
+                status="error" if hard_err else "ok",
+                provider=search_result.get("provider_used"),
+                latency_ms=search_result.get("latency_ms"),
+                meta={
+                    "query": search_query,
+                    "query_effective": search_query,
+                    "reason": search_reason,
+                    "sources": search_result.get("sources", []),
+                    "result_count": len(search_result.get("sources") or []),
+                    "failure_code": search_result.get("failure_code"),
+                    "degraded": bool(search_result.get("degraded")),
+                    "attempts": search_result.get("attempts") or [],
+                    "fallback_from": search_result.get("fallback_from"),
+                    "results_preview": search_context[:500] + ("..." if len(search_context) > 500 else ""),
+                },
+                error=hard_err,
+            )
+            steps.append(ws_step)
+            if ws_step.status == "error" or hard_err:
+                fail = AskResult(
+                    success=False,
+                    content="",
+                    provider=search_result.get("provider_used") or "web_search",
+                    model="search",
+                    latency_ms=int(search_result.get("latency_ms") or 0),
+                    error=ws_step.error or str(hard_err or "联网搜索失败"),
+                )
+                return {
+                    "trace_id": trace_id,
+                    "track": chosen_track,
+                    "final": fail.to_dict(),
+                    "steps": [s.to_dict() for s in steps],
+                }
+            if search_context:
+                prompt = self._merge_search_into_prompt(prompt, search_context, options)
 
         if chosen_track == "fast":
             route = self.route_fast_model(prompt, analysis)

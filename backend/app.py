@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Request, BackgroundTasks, Depends
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import json
@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 import redis
 
 from harness import DualTrackHarness
+from document_extract import extract_document
 from utils import load_yaml, new_trace_id
 
 
@@ -72,6 +73,56 @@ class ChatResponse(BaseModel):
     steps: List[StepOut]
 
 
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def _documents_context(documents: Any, max_total_chars: int = 60_000) -> str:
+    if not isinstance(documents, list) or not documents:
+        return ""
+    pieces = ["【已上传文档内容】"]
+    used = 0
+    for idx, doc in enumerate(documents, start=1):
+        if not isinstance(doc, dict):
+            continue
+        name = doc.get("name") or f"文档{idx}"
+        content = str(doc.get("content") or "")
+        if not content:
+            chunks = doc.get("chunks") or []
+            if isinstance(chunks, list):
+                content = "\n\n".join(str(c.get("content", "")) for c in chunks if isinstance(c, dict))
+        if not content:
+            continue
+        remain = max_total_chars - used
+        if remain <= 0:
+            break
+        clipped = content[:remain]
+        used += len(clipped)
+        pieces.append(f"\n【文档 {idx}: {name}】\n{clipped}")
+    if len(pieces) == 1:
+        return ""
+    return "\n".join(pieces)
+
+
+def _augment_prompt(prompt: str, options: Dict[str, Any]) -> str:
+    docs_context = _documents_context(options.get("documents"))
+    if not docs_context:
+        return prompt
+    return (
+        f"{docs_context}\n\n"
+        "请优先基于上述文档回答；涉及文档信息时，尽量标注来自哪份文档或哪段内容。\n\n"
+        f"【用户问题】\n{prompt}"
+    )
+
+
 def create_app() -> FastAPI:
     cfg = load_yaml(CONFIG_PATH)
     app = FastAPI(title="Harness Chat (Dual-Track)", version="0.1.0")
@@ -86,6 +137,14 @@ def create_app() -> FastAPI:
     )
 
     harness = DualTrackHarness(cfg)
+
+    @app.post("/api/documents/parse")
+    async def parse_documents(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
+        documents = []
+        for f in files:
+            data = await f.read()
+            documents.append(extract_document(f.filename or "未命名文件", data).to_dict())
+        return {"documents": documents}
 
     @app.get("/api/health")
     async def health() -> Dict[str, Any]:
@@ -117,11 +176,13 @@ def create_app() -> FastAPI:
         if not messages:
             return {"error": "No prompt or messages provided"}
             
-        last_prompt = messages[-1]["content"] if messages else ""
-        if isinstance(last_prompt, list):
-            last_prompt = "\n".join(c["text"] for c in last_prompt if c.get("type") == "text")
-        
-        result = await harness.run(str(last_prompt), messages=messages, mode=req.mode, options=options)
+        last_prompt = _content_to_text(messages[-1]["content"] if messages else "")
+        if not str(last_prompt).strip() and isinstance(options.get("documents"), list) and options.get("documents"):
+            last_prompt = "请根据上传的文档回答问题。"
+        options["search_prompt_base"] = str(last_prompt)
+        augmented = _augment_prompt(str(last_prompt), options)
+
+        result = await harness.run(augmented, messages=messages, mode=req.mode, options=options)
         return result
 
     @app.post("/api/chat/stream")
@@ -154,20 +215,22 @@ def create_app() -> FastAPI:
             
         current_user_msg = {"role": "user", "content": current_prompt_content}
         
-        # Determine the string representation of the prompt for routing/analysis
-        last_prompt_str = current_prompt_content
-        if isinstance(last_prompt_str, list):
-            last_prompt_str = "\n".join(c.get("text", "") for c in last_prompt_str if c.get("type") == "text")
-            
-        if not last_prompt_str:
+        last_prompt_str = _content_to_text(current_prompt_content)
+        if not str(last_prompt_str).strip() and isinstance(options.get("documents"), list) and options.get("documents"):
+            last_prompt_str = "请根据上传的文档回答问题。"
+
+        if not str(last_prompt_str).strip():
             return {"error": "No prompt or messages provided"}
+
+        options["search_prompt_base"] = str(last_prompt_str)
+        augmented_prompt = _augment_prompt(str(last_prompt_str), options)
 
         async def event_generator():
             final_answer = ""
             try:
-                # This will run the harness in streaming mode. 
-                # We need harness to yield events as it progresses.
-                async for event in harness.run_stream(str(last_prompt_str), messages=historical_messages, mode=req.mode, options=options):
+                async for event in harness.run_stream(
+                    augmented_prompt, messages=historical_messages, mode=req.mode, options=options
+                ):
                     if await request.is_disconnected():
                         break
                         

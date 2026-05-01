@@ -9,6 +9,17 @@ harness:
   # default: auto | fast | refine
   default_mode: "refine"
 
+  search:
+    tavily_api_key: "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"
+    provider: tavily
+    fallback: duckduckgo
+    query_enrich: true
+    search_depth: basic
+    max_results: 8
+    topic: general
+    timeout_s: 15
+    include_answer: false
+
   complexity:
     # 启用大模型进行预判
     use_llm_analyzer: true
@@ -21,7 +32,6 @@ harness:
       - claude-sonnet-4-6-thinking: 擅长深度数学证明、复杂逻辑推导。
       - claude-opus-4-7: 擅长长文写作、极致的语言润色、高难度综合任务。
       - gpt-5.5 / gpt-5.4-high: 速度极快，综合能力极强，适合日常通用问答、联网搜索总结。
-      - gpt-5.5-pro: 适合高难度专业领域的复杂任务。
       - grok-4-20-reasoning / grok-4.2: 擅长数理逻辑、硬核推理。
       - deepseek-v4-pro / deepseek-v4-flash: flash速度快适合通用与代码，pro适合深度专业问题。
       - gemini-3.1-pro-preview: 适合长上下文、多模态或泛用型搜索。
@@ -29,19 +39,26 @@ harness:
       
       请返回一段合法的 JSON，格式如下：
       {
-        "complexity": "high" 或 "low",
-        "selected_model": "你选出的最合适的主力模型名称(用于 low 复杂度)",
-        "fallback_models": ["备选模型1", "备选模型2"],
+        "complexity": "high 或 low",
+        "decision": "fast 或 refine",
+        "type": "general | web_search | document_qa | code | math_logic | writing | privacy_local",
+        "search_required": true 或 false,
+        "search_query": "若需要联网搜索，给出最适合搜索引擎的短查询词；否则为空字符串",
+        "selected_model": "低复杂度时主力模型名称",
+        "fallback_models": ["备选1", "备选2"],
         "refine_models": {
-          "draft": ["为初稿层分配的模型池(要求速度快、覆盖广)"],
-          "review": ["为审查层分配的模型池(要求批判推理能力极强)"],
-          "polish": ["为润色层分配的模型池(要求文笔好、综合能力强)"]
+          "draft": ["初稿层模型池"],
+          "review": ["审查层模型池"],
+          "polish": ["润色层模型池"]
         },
-        "reason": "简短的判定与选型理由"
+        "reason": "简短判定理由"
       }
       
       判断标准：
       - complexity: 若问题需要多步推理、深入分析论证、字数较长或任务繁重，填 "high"；若为简单的问答、翻译、信息检索或日常对话，填 "low"。
+      - decision: 与 complexity 一致导向 — high 倾向 refine，low 倾向 fast（可被用户模式覆盖）。
+      - search_required: 涉及实时信息、新闻、股价、天气、版本更新等填 true。
+      - type: 需要实时外部信息填 web_search。
       - 隐私绝对优先：只要涉及隐私敏感数据，所有选用的模型都必须是 ollama-llama3。
       
       用户输入如下：
@@ -54,7 +71,7 @@ harness:
 
   routing:
     # 无规则命中时按顺序尝试，优先使用兼顾速度与质量的模型，失败则自动向后降级
-    default_model: "gpt-5.5-pro"
+    default_model: "gpt-5.5"
     default_models:
       - "gpt-5.5"
       - "claude-sonnet-4-6"
@@ -129,12 +146,12 @@ models:
     model: "gpt-5.4-high"
     timeout_s: 180
 
-  gpt-5.5-pro:
-    provider: "openai_compat"
-    base_url: "https://api.n1n.ai/v1"
-    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
-    model: "gpt-5.5-pro"
-    timeout_s: 180
+  # gpt-5.5-pro:
+  #   provider: "openai_compat"
+  #   base_url: "https://api.n1n.ai/v1"
+  #   api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+  #   model: "gpt-5.5-pro"
+  #   timeout_s: 180
 
   gpt-5.5:
     provider: "openai_compat"

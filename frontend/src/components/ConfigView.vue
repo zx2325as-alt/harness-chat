@@ -66,27 +66,37 @@ export default {
 }
 .title {
   font-weight: 800;
+  color: #f1f5f9;
 }
 .spacer {
   flex: 1;
 }
 .btn {
-  padding: 8px 12px;
+  padding: 8px 14px;
   border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(255, 255, 255, 0.06);
-  color: #e6e9f2;
+  border: 1px solid #3d4d64;
+  background: #232a38;
+  color: #cbd5e1;
   cursor: pointer;
+  font-weight: 500;
+}
+.btn:hover:not(:disabled) {
+  border-color: #4b5c78;
+  background: #2a3344;
+}
+.btn:disabled {
+  opacity: 0.5;
 }
 .hint {
-  opacity: 0.7;
+  color: #94a3b8;
   font-size: 13px;
 }
 .error {
   padding: 12px;
   border-radius: 12px;
-  border: 1px solid rgba(255, 77, 109, 0.55);
-  background: rgba(255, 77, 109, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  background: rgba(248, 113, 113, 0.1);
+  color: #fca5a5;
   line-height: 1.5;
 }
 .grid {
@@ -95,18 +105,20 @@ export default {
   gap: 10px;
 }
 .card {
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid #2f3a4d;
+  background: #232a38;
   border-radius: 12px;
-  padding: 12px;
+  padding: 14px;
 }
 .cardTitle {
   font-weight: 700;
   margin-bottom: 8px;
+  color: #94a3b8;
+  font-size: 13px;
 }
 .cardValue {
   font-weight: 700;
-  opacity: 0.9;
+  color: #f1f5f9;
 }
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
@@ -115,7 +127,7 @@ export default {
   word-break: break-word;
   font-size: 12px;
   line-height: 1.5;
-  opacity: 0.92;
+  color: #94a3b8;
 }
 </style>
 

@@ -63,9 +63,8 @@
         <aside class="right">
           <div class="panelHeader">
             <div class="panelTitle">执行过程</div>
-            <div class="panelHint">每一步都会显示：轨道/路由/模型/耗时/降级</div>
           </div>
-          <StepDisplay :traceId="latestTraceId" :track="latestTrack" :steps="latestSteps" />
+          <StepDisplay class="steps-panel-inner" :runs="currentStepRuns" :render-tick="stepUiTick" />
         </aside>
       </main>
     </div>
@@ -90,13 +89,12 @@ export default {
       busy: false,
       sessions: [],
       currentSessionId: null,
-      latestSteps: [],
-      latestTraceId: "",
-      latestTrack: "",
+      activeRunId: null,
       config: null,
       configLoading: false,
       configError: "",
       abortController: null,
+      stepUiTick: 0,
     };
   },
   computed: {
@@ -105,7 +103,12 @@ export default {
     },
     currentMessages() {
       return this.currentSession ? this.currentSession.messages : [];
-    }
+    },
+    currentStepRuns() {
+      void this.stepUiTick;
+      if (!this.currentSession || !this.currentSession.stepRuns) return [];
+      return this.currentSession.stepRuns;
+    },
   },
   mounted() {
     this.loadConfig();
@@ -126,6 +129,9 @@ export default {
       } else {
         this.currentSessionId = this.sessions[0].id;
       }
+      this.sessions.forEach((s) => {
+        if (!s.stepRuns) s.stepRuns = [];
+      });
     },
     saveSessions() {
       try {
@@ -137,21 +143,16 @@ export default {
     createNewSession() {
       const newSession = {
         id: `session-${Date.now()}`,
-        messages: []
+        messages: [],
+        stepRuns: [],
       };
       this.sessions.unshift(newSession);
       this.currentSessionId = newSession.id;
       this.saveSessions();
-      this.latestSteps = [];
-      this.latestTraceId = "";
-      this.latestTrack = "";
     },
     selectSession(id) {
       if (this.busy) return;
       this.currentSessionId = id;
-      this.latestSteps = [];
-      this.latestTraceId = "";
-      this.latestTrack = "";
       this.scrollToBottom();
     },
     deleteSession(id) {
@@ -200,56 +201,109 @@ export default {
         if (el) el.scrollTop = el.scrollHeight;
       });
     },
+    normalizePayload(payload) {
+      if (payload && typeof payload === "object" && !Array.isArray(payload) && Object.prototype.hasOwnProperty.call(payload, "content")) {
+        return payload;
+      }
+      return { content: payload, documents: [], searchMode: "auto" };
+    },
+    getRunTitle(content) {
+      if (typeof content === "string") return content.substring(0, 28) || "新请求";
+      if (Array.isArray(content)) {
+        const text = content.find((p) => p.type === "text")?.text || "";
+        return text.substring(0, 28) || "多模态请求";
+      }
+      return "新请求";
+    },
+    createStepRun(userMsg, documents = [], searchMode = "auto") {
+      if (!this.currentSession.stepRuns) this.currentSession.stepRuns = [];
+      const run = {
+        id: `run-${Date.now()}`,
+        title: this.getRunTitle(userMsg.content),
+        createdAt: new Date().toISOString(),
+        traceId: "",
+        track: "",
+        status: "running",
+        steps: [],
+        documents: documents.map((d) => ({ name: d.name, status: d.status, meta: d.meta })),
+        searchMode,
+      };
+      this.currentSession.stepRuns.push(run);
+      this.activeRunId = run.id;
+      this.saveSessions();
+      return run;
+    },
+    upsertStep(run, step) {
+      const idx = run.steps.findIndex((s) => s.name === step.name);
+      if (idx >= 0) run.steps.splice(idx, 1, step);
+      else run.steps.push(step);
+      this.stepUiTick += 1;
+      this.saveSessions();
+    },
+    bumpStepUi() {
+      this.stepUiTick += 1;
+    },
     async onSend(payload) {
       if (!payload || this.busy) return;
-      
-      // Ensure we have a valid current session before sending
-      if (!this.currentSession) {
-        this.createNewSession();
-      }
-      
-      if (!this.currentSession.messages) {
-        this.currentSession.messages = [];
-      }
+      if (!this.currentSession) this.createNewSession();
+      if (!this.currentSession.messages) this.currentSession.messages = [];
 
-      const userMsg = { id: `u-${Date.now()}`, role: "user", content: payload };
+      const normalized = this.normalizePayload(payload);
+      const userMsg = {
+        id: `u-${Date.now()}`,
+        role: "user",
+        content: normalized.content,
+        meta: {
+          documents: normalized.documents || [],
+          searchMode: normalized.searchMode || "auto",
+        },
+      };
       this.currentSession.messages.push(userMsg);
       this.scrollToBottom();
       this.saveSessions();
 
-      await this._triggerStream();
+      await this._triggerStream({
+        documents: userMsg.meta.documents,
+        searchMode: userMsg.meta.searchMode,
+        userMsg,
+      });
     },
-    async _triggerStream() {
+    async _triggerStream(context = null) {
       this.busy = true;
-      this.latestSteps = [];
-      this.latestTraceId = "";
-      this.latestTrack = "";
       this.abortController = new AbortController();
+
+      const lastUser = context?.userMsg || [...this.currentSession.messages].reverse().find((m) => m.role === "user");
+      const documents = context?.documents || lastUser?.meta?.documents || [];
+      const searchMode = context?.searchMode || lastUser?.meta?.searchMode || "auto";
+      const run = this.createStepRun(lastUser || { content: "" }, documents, searchMode);
 
       const pending = {
         id: `a-pending-${Date.now()}`,
         role: "assistant",
         content: "处理中…",
-        meta: { pending: true },
+        meta: { pending: true, runId: run.id },
       };
       this.currentSession.messages.push(pending);
       this.scrollToBottom();
 
       try {
-        // Build the messages history to send (excluding the pending one we just added)
         const history = this.currentSession.messages
-          .filter((m) => (m.role === "user" || m.role === "assistant") && !m.meta?.pending && !m.meta?.error && m.id !== "sys-1" && m.id !== pending.id)
+          .filter((m) => (m.role === "user" || m.role === "assistant") && !m.meta?.pending && !m.meta?.error && m.id !== pending.id)
           .map((m) => ({ role: m.role, content: m.content }));
-          
+
         const r = await fetch(`${API_BASE}/api/chat/stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ 
+          body: JSON.stringify({
             session_id: this.currentSession.id,
-            prompt: "", 
-            messages: history, 
-            mode: this.mode, 
-            options: {} 
+            prompt: "",
+            messages: history,
+            mode: this.mode,
+            options: {
+              documents,
+              search_mode: searchMode,
+              stream_slice_chars: 6,
+            },
           }),
           signal: this.abortController.signal,
         });
@@ -257,91 +311,110 @@ export default {
           const t = await r.text();
           throw new Error(`HTTP ${r.status}: ${t}`);
         }
-        
+
         const reader = r.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
         let finalContent = "";
-        let finalReasoning = "";
         let finalMeta = { track: "", provider: "", model: "", success: true, latency_ms: 0 };
-        
-        // Remove "处理中…" and set empty content
+        let streamFailed = false;
+        let receivedDone = false;
+
         pending.content = "";
         pending.meta = { ...pending.meta, streaming: true, track: "" };
 
-        while (true) {
+        while (!receivedDone) {
           const { done, value } = await reader.read();
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
-          
+
           const lines = buffer.split("\n");
-          buffer = lines.pop(); // keep the incomplete line in buffer
-          
+          buffer = lines.pop();
+
           for (let line of lines) {
             line = line.trim();
             if (!line) continue;
-            if (line.startsWith("data: ")) {
-              const dataStr = line.substring(6);
-              if (dataStr === "[DONE]") break;
-              
-              try {
-                const event = JSON.parse(dataStr);
-                
-                if (event.event === "step") {
-                  const step = event.step;
-                  const existingIdx = this.latestSteps.findIndex(s => s.name === step.name);
-                  if (existingIdx >= 0) {
-                    this.latestSteps.splice(existingIdx, 1, step);
-                  } else {
-                    this.latestSteps.push(step);
-                  }
-                } else if (event.event === "stream_start") {
-                  this.latestTrack = event.track;
-                  this.latestTraceId = event.trace_id;
-                  pending.meta.track = event.track;
-                } else if (event.event === "model_start") {
-                  finalMeta.model = event.model;
-                  finalMeta.provider = event.provider;
-                } else if (event.event === "chunk") {
-                  const data = event.data;
-                  if (data.content) {
-                    finalContent += data.content;
-                    pending.content = finalContent;
-                    this.scrollToBottom();
-                  }
-                  if (data.reasoning_content) {
-                    finalReasoning += data.reasoning_content;
-                    pending.meta.reasoning_content = finalReasoning;
-                    this.scrollToBottom();
-                  }
-                } else if (event.event === "error") {
-                  throw new Error(event.error);
-                }
-              } catch (e) {
-                console.error("SSE parse error", e, dataStr);
+            if (!line.startsWith("data: ")) continue;
+            const dataStr = line.substring(6);
+            if (dataStr === "[DONE]") {
+              receivedDone = true;
+              break;
+            }
+
+            let event;
+            try {
+              event = JSON.parse(dataStr);
+            } catch (e) {
+              console.error("SSE parse error", e);
+              continue;
+            }
+
+            if (event.event === "trace") {
+              run.traceId = event.trace_id;
+              if (event.track) {
+                run.track = event.track;
+                pending.meta.track = event.track;
               }
+              this.bumpStepUi();
+              this.saveSessions();
+            } else if (event.event === "step") {
+              this.upsertStep(run, event.step);
+              this.scrollToBottom();
+            } else if (event.event === "stream_start") {
+              run.track = event.track;
+              run.traceId = event.trace_id;
+              pending.meta.track = event.track;
+              this.bumpStepUi();
+              this.saveSessions();
+            } else if (event.event === "model_start") {
+              finalMeta.model = event.model;
+              finalMeta.provider = event.provider;
+            } else if (event.event === "model_end") {
+              finalMeta.latency_ms = event.latency_ms || 0;
+            } else if (event.event === "chunk") {
+              const data = event.data || {};
+              if (data.content) {
+                finalContent += data.content;
+                pending.content = finalContent;
+                this.scrollToBottom();
+              }
+            } else if (event.event === "error") {
+              streamFailed = true;
+              run.status = "error";
+              this.bumpStepUi();
+              this.saveSessions();
+              throw new Error(event.error);
             }
           }
         }
-        
-        // Done streaming
+
         pending.meta.streaming = false;
         pending.meta = { ...pending.meta, ...finalMeta };
-
+        if (!streamFailed && run.status !== "error" && run.status !== "stopped") {
+          run.status = "ok";
+        }
+        this.bumpStepUi();
+        this.saveSessions();
       } catch (e) {
-        if (e.name === 'AbortError') {
+        if (e.name === "AbortError") {
           pending.meta.streaming = false;
           pending.content += "\n\n[用户已中断响应]";
-          pending.meta.error = false;
+          run.status = "stopped";
+          this.bumpStepUi();
+          this.saveSessions();
         } else {
           const errText = String(e && e.message ? e.message : e);
           const idx = this.currentSession.messages.findIndex((m) => m.id === pending.id);
           const msg = { id: `a-err-${Date.now()}`, role: "assistant", content: `请求失败：${errText}`, meta: { error: true } };
           if (idx >= 0) this.currentSession.messages.splice(idx, 1, msg);
           else this.currentSession.messages.push(msg);
+          run.status = "error";
+          this.bumpStepUi();
+          this.saveSessions();
         }
       } finally {
         this.busy = false;
+        this.bumpStepUi();
         this.saveSessions();
         this.scrollToBottom();
       }
@@ -370,9 +443,14 @@ export default {
       if (this.busy || !this.currentSession) return;
       const idx = this.currentSession.messages.findIndex((m) => m.id === msg.id);
       if (idx >= 0) {
+        const lastUser = this.currentSession.messages.slice(0, idx).reverse().find((m) => m.role === "user");
         this.currentSession.messages.splice(idx);
         this.saveSessions();
-        this._triggerStream();
+        this._triggerStream({
+          userMsg: lastUser,
+          documents: lastUser?.meta?.documents || [],
+          searchMode: lastUser?.meta?.searchMode || "auto",
+        });
       }
     },
   },
@@ -384,17 +462,19 @@ export default {
   height: 100%;
   display: flex;
   flex-direction: column;
+  background: #161b26;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "PingFang SC",
     "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
 }
 .topbar {
-  height: 56px;
+  height: 52px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 16px;
-  background: linear-gradient(180deg, #121a2b, #0b0f17);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 0 18px;
+  background: #1e2433;
+  border-bottom: 1px solid #2f3a4d;
+  flex-shrink: 0;
 }
 .brand {
   display: flex;
@@ -402,35 +482,44 @@ export default {
   gap: 10px;
 }
 .dot {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
   border-radius: 999px;
-  background: #7c5cff;
-  box-shadow: 0 0 18px rgba(124, 92, 255, 0.8);
+  background: #818cf8;
+  box-shadow: 0 0 12px rgba(129, 140, 248, 0.45);
 }
 .title {
   font-weight: 700;
+  font-size: 15px;
+  color: #f1f5f9;
   letter-spacing: 0.2px;
 }
 .subtitle {
-  opacity: 0.7;
+  color: #64748b;
   font-size: 12px;
 }
 .actions {
   display: flex;
-  gap: 8px;
+  gap: 6px;
 }
 .tab {
-  padding: 8px 12px;
-  border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.06);
-  color: #e6e9f2;
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid #3d4d64;
+  background: #252d3d;
+  color: #94a3b8;
   cursor: pointer;
+  font-size: 13px;
+}
+.tab:hover {
+  border-color: #4b5c78;
+  color: #e2e8f0;
 }
 .tab.active {
-  background: rgba(124, 92, 255, 0.18);
-  border-color: rgba(124, 92, 255, 0.5);
+  background: rgba(99, 102, 241, 0.2);
+  border-color: rgba(129, 140, 248, 0.45);
+  color: #c7d2fe;
+  font-weight: 600;
 }
 .app-body {
   flex: 1;
@@ -438,51 +527,57 @@ export default {
   min-height: 0;
 }
 .sidebar {
-  width: 240px;
-  background: rgba(255, 255, 255, 0.02);
-  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  width: 236px;
+  background: #1e2433;
+  border-right: 1px solid #2f3a4d;
   display: flex;
   flex-direction: column;
 }
 .new-chat-btn {
-  margin: 16px;
-  padding: 10px;
-  background: rgba(124, 92, 255, 0.15);
-  border: 1px solid rgba(124, 92, 255, 0.4);
-  border-radius: 8px;
+  margin: 14px;
+  padding: 10px 14px;
+  background: linear-gradient(135deg, #4f46e5, #6366f1);
+  border: none;
+  border-radius: 10px;
   color: #fff;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  transition: all 0.2s;
+  font-size: 13px;
+  font-weight: 600;
+  transition: filter 0.15s;
 }
 .new-chat-btn:hover {
-  background: rgba(124, 92, 255, 0.25);
+  filter: brightness(1.06);
+}
+.new-chat-btn .icon {
+  font-size: 16px;
+  line-height: 1;
 }
 .session-list {
   flex: 1;
   overflow-y: auto;
-  padding: 0 8px;
+  padding: 0 10px 12px;
 }
 .session-item {
-  padding: 12px 16px;
+  padding: 10px 12px;
   margin-bottom: 4px;
-  border-radius: 8px;
+  border-radius: 10px;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  color: #a1a1aa;
-  transition: all 0.2s;
+  color: #94a3b8;
+  transition: background 0.15s;
 }
 .session-item:hover {
   background: rgba(255, 255, 255, 0.05);
 }
 .session-item.active {
-  background: rgba(255, 255, 255, 0.1);
-  color: #fff;
+  background: rgba(99, 102, 241, 0.18);
+  color: #e0e7ff;
 }
 .session-title {
   font-size: 13px;
@@ -493,11 +588,15 @@ export default {
 .delete-btn {
   background: none;
   border: none;
-  color: #ef4444;
+  color: #64748b;
   cursor: pointer;
   opacity: 0;
   font-size: 16px;
   padding: 0 4px;
+  line-height: 1;
+}
+.delete-btn:hover {
+  color: #f87171;
 }
 .session-item:hover .delete-btn {
   opacity: 1;
@@ -506,62 +605,68 @@ export default {
 .main {
   flex: 1;
   display: grid;
-  grid-template-columns: 1fr 420px;
-  gap: 12px;
-  padding: 12px;
+  grid-template-columns: minmax(0, 1fr) 392px;
+  gap: 0;
+  min-height: 0;
 }
 .left,
 .right {
   min-height: 0;
 }
 .left {
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 14px;
+  background: #1a1f2b;
+  border-right: 1px solid #2f3a4d;
   overflow: hidden;
 }
 .right {
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 14px;
+  background: #1c2230;
   overflow: hidden;
   display: flex;
   flex-direction: column;
 }
 .panelHeader {
-  padding: 12px 12px 10px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 12px 14px;
+  border-bottom: 1px solid #2f3a4d;
+  background: #232a38;
+  flex-shrink: 0;
 }
 .panelTitle {
   font-weight: 700;
+  font-size: 14px;
+  color: #f1f5f9;
 }
-.panelHint {
-  margin-top: 6px;
-  opacity: 0.7;
-  font-size: 12px;
-  line-height: 1.4;
+.steps-panel-inner {
+  flex: 1;
+  min-height: 0;
 }
 .chat {
   height: 100%;
   display: flex;
   flex-direction: column;
+  min-height: 0;
 }
 .messages {
   flex: 1;
   overflow: auto;
-  padding: 14px;
+  padding: 20px 24px;
+  background: linear-gradient(180deg, #161b26 0%, #1a1f2b 160px);
 }
 .config {
   height: 100%;
   overflow: auto;
-  padding: 14px;
+  padding: 18px;
+  background: #1a1f2b;
 }
 @media (max-width: 980px) {
   .main {
     grid-template-columns: 1fr;
   }
+  .left {
+    border-right: none;
+  }
   .right {
-    height: 360px;
+    max-height: 380px;
+    border-top: 1px solid #2f3a4d;
   }
 }
 </style>
