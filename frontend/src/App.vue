@@ -9,6 +9,15 @@
       <div class="actions">
         <button class="tab" :class="{ active: view === 'chat' }" @click="view = 'chat'">聊天</button>
         <button class="tab" :class="{ active: view === 'config' }" @click="view = 'config'">配置</button>
+        <button
+          v-if="view === 'chat'"
+          type="button"
+          class="tab panel-toggle"
+          :class="{ active: showStepsPanel }"
+          @click="showStepsPanel = !showStepsPanel"
+        >
+          {{ showStepsPanel ? "隐藏执行过程" : "显示执行过程" }}
+        </button>
       </div>
     </header>
 
@@ -31,7 +40,7 @@
         </div>
       </aside>
 
-      <main class="main">
+      <main class="main" :class="{ 'no-right': hideRightPanel }">
         <section class="left">
           <div v-if="view === 'chat'" class="chat">
             <div class="messages" ref="msgRef">
@@ -60,7 +69,7 @@
           </div>
         </section>
 
-        <aside class="right">
+        <aside v-if="view === 'chat' && showStepsPanel" class="right">
           <div class="panelHeader">
             <div class="panelTitle">执行过程</div>
           </div>
@@ -95,9 +104,13 @@ export default {
       configError: "",
       abortController: null,
       stepUiTick: 0,
+      showStepsPanel: true,
     };
   },
   computed: {
+    hideRightPanel() {
+      return this.view !== "chat" || !this.showStepsPanel;
+    },
     currentSession() {
       return this.sessions.find(s => s.id === this.currentSessionId) || null;
     },
@@ -113,6 +126,21 @@ export default {
   mounted() {
     this.loadConfig();
     this.loadSessions();
+    try {
+      const v = localStorage.getItem("harness_show_steps");
+      if (v === "0") this.showStepsPanel = false;
+    } catch (_) {
+      /* ignore */
+    }
+  },
+  watch: {
+    showStepsPanel(val) {
+      try {
+        localStorage.setItem("harness_show_steps", val ? "1" : "0");
+      } catch (_) {
+        /* ignore */
+      }
+    },
   },
   methods: {
     loadSessions() {
@@ -500,7 +528,13 @@ export default {
 }
 .actions {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
+  justify-content: flex-end;
+}
+.tab.panel-toggle:not(.active) {
+  opacity: 0.9;
 }
 .tab {
   padding: 7px 14px;
@@ -609,6 +643,9 @@ export default {
   gap: 0;
   min-height: 0;
 }
+.main.no-right {
+  grid-template-columns: 1fr;
+}
 .left,
 .right {
   min-height: 0;
@@ -617,6 +654,9 @@ export default {
   background: #1a1f2b;
   border-right: 1px solid #2f3a4d;
   overflow: hidden;
+}
+.main.no-right .left {
+  border-right: none;
 }
 .right {
   background: #1c2230;

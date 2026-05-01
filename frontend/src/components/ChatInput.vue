@@ -14,7 +14,7 @@
         :disabled="busy"
         v-model="draft"
         placeholder="输入问题…（Enter 发送，Shift+Enter 换行）"
-        rows="3"
+        rows="2"
         @keydown.enter.exact.prevent="send"
       />
 
@@ -42,6 +42,7 @@
             </select>
           </label>
         </div>
+        <div class="bar-fill" aria-hidden="true" />
         <div class="bar-right">
           <input ref="fileInput" type="file" multiple class="hidden-file" @change="onFileChange" />
           <button type="button" class="ico" :disabled="busy" title="附件" @click="$refs.fileInput.click()">
@@ -200,25 +201,26 @@ export default {
   display: none;
 }
 .wrap {
-  padding: 12px 20px 20px;
+  padding: 6px 16px 14px;
   background: #1a1f2b;
   border-top: 1px solid #2f3a4d;
   flex-shrink: 0;
 }
 .composer {
-  max-width: 880px;
+  width: 100%;
+  max-width: min(100%, 980px);
   margin: 0 auto;
   border: 1px solid #3d4d64;
-  border-radius: 16px;
-  background: #232a38;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.25);
-  padding: 12px 14px 10px;
+  border-radius: 14px;
+  background: #252d3d;
+  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.22);
+  padding: 8px 12px 7px;
 }
 .att-row {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 .att-item {
   display: inline-flex;
@@ -261,15 +263,15 @@ export default {
 }
 .textarea {
   width: 100%;
-  min-height: 84px;
+  min-height: 52px;
   max-height: 220px;
   resize: vertical;
-  padding: 6px 4px;
+  padding: 4px 2px;
   border: none;
   background: transparent;
   color: #f1f5f9;
   outline: none;
-  line-height: 1.55;
+  line-height: 1.5;
   font-size: 15px;
   font-family: inherit;
 }
@@ -282,27 +284,35 @@ export default {
 .composer-bar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  padding-top: 10px;
-  border-top: 1px solid #2f3a4d;
-  margin-top: 4px;
+  gap: 10px;
+  flex-wrap: nowrap;
+  padding-top: 8px;
+  border-top: 1px solid #2f3545;
+  margin-top: 2px;
 }
 .bar-left {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
   flex-wrap: wrap;
+}
+.bar-fill {
+  flex: 1;
+  min-width: 24px;
+  min-height: 34px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.12);
+  border: 1px solid #2f3545;
 }
 .pill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 4px 5px 10px;
+  padding: 4px 4px 4px 9px;
   border-radius: 999px;
   background: #1e2433;
-  border: 1px solid #3d4d64;
+  border: 1px solid #353f52;
   cursor: pointer;
 }
 .pill-label {
@@ -337,12 +347,13 @@ export default {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-shrink: 0;
 }
 .ico {
-  width: 38px;
-  height: 38px;
+  width: 36px;
+  height: 36px;
   border-radius: 10px;
-  border: 1px solid #3d4d64;
+  border: 1px solid #353f52;
   background: #1e2433;
   color: #94a3b8;
   display: inline-flex;
@@ -364,8 +375,8 @@ export default {
   background: rgba(248, 113, 113, 0.1);
 }
 .send {
-  width: 40px;
-  height: 40px;
+  width: 36px;
+  height: 36px;
   border-radius: 999px;
   border: none;
   background: linear-gradient(135deg, #4f46e5, #6366f1);
@@ -385,9 +396,17 @@ export default {
   box-shadow: none;
 }
 .foot-hint {
-  margin-top: 8px;
+  margin-top: 5px;
   padding-left: 2px;
   font-size: 11px;
-  color: #64748b;
+  color: #5c6d85;
+}
+@media (max-width: 560px) {
+  .composer-bar {
+    flex-wrap: wrap;
+  }
+  .bar-fill {
+    display: none;
+  }
 }
 </style>

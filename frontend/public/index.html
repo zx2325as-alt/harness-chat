@@ -7,9 +7,34 @@
     <title>Harness Chat</title>
     <style>
       html, body { height: 100%; margin: 0; background: #161b26; color: #e2e8f0; }
+      html { color-scheme: dark; }
       #app { height: 100%; }
       * { box-sizing: border-box; }
       a { color: inherit; }
+      /* Firefox */
+      * {
+        scrollbar-width: thin;
+        scrollbar-color: #39465c #1a1f2b;
+      }
+      /* Chromium / Safari / Electron */
+      ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #1a1f2b;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #39465c;
+        border-radius: 6px;
+        border: 2px solid #1a1f2b;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #4b5c78;
+      }
+      ::-webkit-scrollbar-corner {
+        background: #1a1f2b;
+      }
     </style>
   </head>
   <body>
