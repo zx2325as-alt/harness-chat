@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import json
+import asyncio
 from pydantic import BaseModel, Field
 
 import redis
@@ -38,7 +39,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None  # Added session_id for Redis tracking
     prompt: Any = Field(default="", description="The new user message")
     messages: List[Message] = Field(default_factory=list, description="Historical conversation messages")
-    mode: str = Field(default="auto", description="auto | fast | refine")
+    mode: str = Field(default="auto", description="auto | fast | refine | agent（agent 仅流式推荐；同步接口会降级为 refine）")
     options: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -154,12 +155,14 @@ def create_app() -> FastAPI:
     async def get_config() -> Dict[str, Any]:
         # expose safe subset for UI
         h = cfg.get("harness") or {}
+        ag = h.get("agent") or {}
         return {
             "harness": {
                 "default_mode": h.get("default_mode", "auto"),
                 "complexity": h.get("complexity", {}),
                 "routing": h.get("routing", {}),
                 "refine_chain": h.get("refine_chain", {}),
+                "agent": {"enabled": bool(ag.get("enabled", True)), "max_iterations": ag.get("max_iterations", 5)},
             },
             "models": list((cfg.get("models") or {}).keys()),
         }
@@ -195,17 +198,17 @@ def create_app() -> FastAPI:
         redis_key = f"chat_session:{session_id}" if session_id else None
         
         # Build context from Redis instead of Frontend (if enabled)
-        historical_messages = []
+        historical_messages = [m.model_dump() for m in req.messages]
         if redis_client and redis_key:
             try:
-                cached_msgs = redis_client.lrange(redis_key, 0, -1)
-                for m in cached_msgs:
-                    historical_messages.append(json.loads(m))
+                # 同步 Redis 会阻塞整个 asyncio 事件循环，导致 SSE 在首包发出前就卡死；放入线程并限时。
+                cached_msgs = await asyncio.wait_for(
+                    asyncio.to_thread(redis_client.lrange, redis_key, 0, -1),
+                    timeout=2.5,
+                )
+                historical_messages = [json.loads(m) for m in cached_msgs]
             except Exception as e:
-                print(f"Failed to load from redis: {e}")
-        else:
-            # Fallback to frontend-provided messages if no Redis
-            historical_messages = [m.model_dump() for m in req.messages]
+                print(f"Redis history skipped (timeout/error): {e}")
             
         # Prepare the current prompt
         # req.prompt 可能是空的，如果前端把问题放在了 req.messages 的最后一条
@@ -255,7 +258,15 @@ def create_app() -> FastAPI:
             except Exception as e:
                 yield f"data: {json.dumps({'event': 'error', 'error': str(e)}, ensure_ascii=False)}\n\n"
 
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     return app
 

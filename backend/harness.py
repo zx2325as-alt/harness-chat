@@ -14,6 +14,25 @@ import time
 from datetime import datetime, timedelta
 
 from search_service import SearchService
+from routing_signals import derive_user_signals, merge_signals_into_analysis
+from search_query_util import soft_degrade_note, validate_search_query
+
+from tools.layer import HarnessTools
+from tools.parsing import RE_AGENT_REFINE, RE_AGENT_WS
+from tools.refine_pipeline import compile_agent_fallback_draft, stream_refine_from_draft
+
+
+def _msg_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "\n".join(parts)
+    return str(content or "")
+
 
 @dataclass
 class Step:
@@ -63,6 +82,7 @@ class DualTrackHarness:
         self.cfg = cfg
         self.registry = ModelRegistry(cfg.get("models", {}))
         self.search = SearchService(cfg)
+        self.tools = HarnessTools(self)
 
     def _keyword_hit(self, text: str, keywords: List[str]) -> List[str]:
         t = (text or "").lower()
@@ -84,6 +104,7 @@ class DualTrackHarness:
                 "manual_hits": manual_hits,
                 "complexity": "high",
                 "type": "general",
+                "task_type": "generation",
             }
 
         use_llm = bool(hcfg.get("use_llm_analyzer", False))
@@ -95,6 +116,7 @@ class DualTrackHarness:
                 "reasons": [f"length={length}"],
                 "complexity": "high" if length > 200 else "low",
                 "type": "general",
+                "task_type": "generation" if length > 200 else "conversation",
             }
 
         analyzer_model = hcfg.get("analyzer_model", "gpt-5.5")
@@ -105,6 +127,8 @@ class DualTrackHarness:
         # force JSON output where possible (some models support response_format)
         llm_opts = dict(options or {})
         llm_opts["temperature"] = 0.0
+        llm_opts["max_retries"] = int(hcfg.get("analyzer_max_retries", 1))
+        llm_opts["request_timeout_s"] = float(hcfg.get("analyzer_request_timeout_s", 25))
 
         try:
             adapter = self.registry.get(analyzer_model)
@@ -127,12 +151,16 @@ class DualTrackHarness:
                     decision = str(data.get("decision", "") or "").strip().lower()
                     if decision not in ("fast", "refine"):
                         decision = "refine" if complexity == "high" else "fast"
+                    task_type = str(data.get("task_type") or "").strip().lower()
+                    if not task_type:
+                        task_type = self._infer_task_type_from_json(data)
 
                     return {
                         "decision": decision,
                         "reasons": [f"llm_reason: {reason}"],
                         "complexity": complexity,
                         "type": data.get("type", "general"),
+                        "task_type": task_type,
                         "search_required": bool(data.get("search_required", False)),
                         "search_query": str(data.get("search_query") or ""),
                         "selected_model": selected_model,
@@ -147,6 +175,7 @@ class DualTrackHarness:
                         "reasons": ["json_parse_error"],
                         "complexity": "low",
                         "type": "general",
+                        "task_type": "conversation",
                         "raw_llm_response": res.content,
                     }
         except Exception as e:
@@ -155,6 +184,7 @@ class DualTrackHarness:
                 "reasons": [f"llm_analyzer_error: {str(e)}"],
                 "complexity": "low",
                 "type": "general",
+                "task_type": "conversation",
             }
             
         return {
@@ -162,6 +192,20 @@ class DualTrackHarness:
             "reasons": ["analyzer_failed"],
             "complexity": "low",
             "type": "general",
+            "task_type": "conversation",
+        }
+
+    def _analyzer_fallback_timeout(self, prompt: str) -> Dict[str, Any]:
+        """LLM 预判整体超时：避免长时间卡住 SSE，按启发规则降级。"""
+        length = len(prompt or "")
+        return {
+            "decision": "refine" if length > 200 else "fast",
+            "reasons": ["analyzer_total_timeout"],
+            "complexity": "high" if length > 200 else "low",
+            "type": "general",
+            "task_type": "generation" if length > 200 else "conversation",
+            "reason": "复杂度预判超时，已按长度规则降级并继续处理",
+            "analyzer_timed_out": True,
         }
 
     def route_fast_model(self, prompt: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
@@ -203,6 +247,9 @@ class DualTrackHarness:
             return False, "手动关闭联网搜索"
         if mode in ("on", "true", "1", "force"):
             return True, "用户手动开启联网搜索"
+        si = str(analysis.get("search_intent") or "none").lower()
+        if si in ("explicit", "required", "freshness_required"):
+            return True, f"search_intent={si}"
         if analysis.get("search_required") or analysis.get("type") == "web_search":
             return True, analysis.get("reason") or "调度模型判断需要实时信息"
         user_face = str(opts.get("search_prompt_base") or prompt or "").strip()
@@ -277,21 +324,16 @@ class DualTrackHarness:
         return base.strip()
 
     def _merge_search_into_prompt(self, prompt: str, search_context: str, options: Optional[Dict[str, Any]]) -> str:
-        """合并联网摘要时强约束地点/主题与用户原话一致，减少『张冠李戴』式回答。"""
+        """合并检索摘要：锚定用户表述，避免检索片段与用户所指实体不一致时被当成事实。"""
         opts = options or {}
         user_anchor = str(opts.get("search_prompt_base") or "").strip()
-        anchor_block = (
-            f"【用户原话】（回答中的城市/区县、日期、『明天』等时间含义必须与此一致，禁止擅自替换为其他城市）\n{user_anchor}\n\n"
-            if user_anchor
-            else ""
-        )
+        anchor_block = f"【用户原话】\n{user_anchor}\n\n" if user_anchor else ""
         return (
             f"{search_context}\n"
-            "【约束】只采纳与「用户原话」中地点、时间范围直接相关的检索内容；"
-            "若摘要中的城市/站点与用户原话不符，不得将其当作用户所问地点的事实；"
-            "此时应明确说明当前结果无法支持该地逐日预报，并建议用户核对检索词或使用当地气象台/中国天气网等权威来源。\n\n"
+            "【约束】优先采用与用户提问中实体（地点、时间范围、主题等）一致的检索片段；"
+            "若摘要明显指向其他实体或不匹配用户所指范围，勿当作对用户问题的直接证据，应在答复中说明不确定性，并可建议用户收窄表述或改用更权威的本地官方发布渠道核实。\n\n"
             f"{anchor_block}"
-            "请在回答中用 [来源序号] 标注使用到的联网信息，并在末尾列出引用链接。\n\n"
+            "请在答复中对采用的检索内容标注来源序号（如 [1]），并在文末列出引用链接。\n\n"
             f"【用户问题】\n{prompt}"
         )
 
@@ -352,8 +394,548 @@ class DualTrackHarness:
 
         yield {"event": "error", "error": "All fallback models failed in stream."}
 
+    def _search_mandatory(self, analysis: Dict[str, Any], options: Dict[str, Any]) -> bool:
+        si = str(analysis.get("search_intent") or "none").lower()
+        if si in ("required", "freshness_required"):
+            return True
+        if bool(analysis.get("search_required")):
+            return True
+        sm = str(options.get("search_mode") or "").lower()
+        if sm in ("on", "true", "1", "force", "always"):
+            return True
+        return False
+
     async def perform_web_search(self, query: str) -> Dict[str, Any]:
-        return await self.search.search(query)
+        vq, fc, reason = validate_search_query((query or "").strip())
+        if fc:
+            return {
+                "context": "",
+                "sources": [],
+                "error": reason or fc,
+                "failure_code": fc,
+                "degraded": False,
+                "provider_used": "none",
+                "latency_ms": 0,
+                "attempts": [],
+            }
+        return await self.search.search(vq)
+
+    async def _fast_entry_search_step(
+        self,
+        prompt: str,
+        analysis: Dict[str, Any],
+        options: Dict[str, Any],
+        search_reason: str,
+        *,
+        search_mandatory: bool,
+    ) -> Tuple[str, Step, Optional[str]]:
+        """
+        Fast 轨入口联网：校验 query、区分强制/可选失败策略。
+        返回 (更新后的 prompt, step, 若需中止整条流则非空 error 文案)。
+        """
+        raw_q = self.build_search_query(prompt, analysis, options)
+        vq, fc, vreason = validate_search_query(raw_q)
+        if fc:
+            meta = {
+                "query": raw_q,
+                "query_effective": None,
+                "reason": search_reason,
+                "failure_code": fc,
+                "skipped": True,
+                "validate_only": True,
+            }
+            if search_mandatory:
+                err = vreason or fc
+                return (
+                    prompt,
+                    Step(
+                        name="web_search",
+                        status="error",
+                        meta=meta,
+                        error=err,
+                    ),
+                    err,
+                )
+            note = soft_degrade_note(fc, vreason)
+            return (
+                prompt + "\n\n" + note,
+                Step(
+                    name="web_search",
+                    status="ok",
+                    meta={**meta, "degraded": True, "note": "校验未通过，已跳过检索调用"},
+                ),
+                None,
+            )
+
+        sr = await self.perform_web_search(vq)
+        search_context = sr.get("context", "")
+        sources = sr.get("sources", [])
+        hard_err = sr.get("error")
+        meta = {
+            "query": raw_q,
+            "query_effective": vq,
+            "reason": search_reason,
+            "sources": sources,
+            "result_count": len(sources),
+            "failure_code": sr.get("failure_code"),
+            "degraded": bool(sr.get("degraded")),
+            "attempts": sr.get("attempts") or [],
+            "fallback_from": sr.get("fallback_from"),
+            "results_preview": search_context[:500] + ("..." if len(search_context) > 500 else ""),
+        }
+        if hard_err and search_mandatory:
+            return (
+                prompt,
+                Step(
+                    name="web_search",
+                    status="error",
+                    provider=sr.get("provider_used"),
+                    latency_ms=sr.get("latency_ms"),
+                    meta=meta,
+                    error=hard_err,
+                ),
+                f"当前无法完成实时联网检索：{hard_err}",
+            )
+        if hard_err:
+            note = soft_degrade_note(sr.get("failure_code"), hard_err)
+            return (
+                prompt + "\n\n" + note,
+                Step(
+                    name="web_search",
+                    status="ok",
+                    provider=sr.get("provider_used"),
+                    latency_ms=sr.get("latency_ms"),
+                    meta={**meta, "degraded": True},
+                ),
+                None,
+            )
+        st = Step(
+            name="web_search",
+            status="ok",
+            provider=sr.get("provider_used"),
+            latency_ms=sr.get("latency_ms"),
+            meta=meta,
+        )
+        if search_context:
+            prompt = self._merge_search_into_prompt(prompt, search_context, options)
+        return prompt, st, None
+
+    async def _refine_entry_light_search(
+        self,
+        prompt: str,
+        analysis: Dict[str, Any],
+        options: Dict[str, Any],
+    ) -> str:
+        """Refine 轨：显式联网意图下 Layer1 前轻量检索，失败仅注入说明、不中止。"""
+        raw_q = self.build_search_query(prompt, analysis, options)
+        vq, fc, vreason = validate_search_query(raw_q)
+        if fc:
+            return f"\n【入口联网】检索词未通过校验（{vreason or fc}），请依赖常识与后续审查层按需检索。\n"
+        sr = await self.perform_web_search(vq)
+        if sr.get("error"):
+            return f"\n【入口联网】检索未成功：{sr.get('error')}。后续审查层仍可输出 <<ACTION: web_search(\"...\")>> 复核。\n"
+        ctx = (sr.get("context") or "").strip()
+        if not ctx:
+            return "\n【入口联网】未获得有效摘要，请后续审查层按需检索。\n"
+        return f"\n【入口联网摘要（供初稿参考）】\n{ctx[:6000]}\n"
+
+    def _infer_task_type_from_json(self, data: Dict[str, Any]) -> str:
+        """当模型未返回 task_type 时，由 complexity/type 推断。"""
+        raw_type = str(data.get("type") or "").lower()
+        if raw_type in ("math_logic", "code"):
+            return "reasoning"
+        if raw_type in ("writing", "web_search", "document_qa"):
+            return "generation"
+        cx = str(data.get("complexity") or "low").lower()
+        if cx == "low":
+            return "conversation"
+        return "generation"
+
+    def _resolve_track(self, mode: str, analysis: Dict[str, Any], options: Optional[Dict[str, Any]] = None) -> str:
+        """auto：三轨分流；手动 mode 优先；Agent 关闭时显式降级并写入 fallback_reason。"""
+        _opts = options or {}
+        mode = (mode or "auto").lower()
+        hcfg = self.cfg.get("harness") or {}
+        ag_enabled = bool((hcfg.get("agent") or {}).get("enabled", True))
+        if mode == "fast":
+            return "fast"
+        if mode == "refine":
+            return "refine"
+        if mode == "agent":
+            if ag_enabled:
+                return "agent"
+            analysis["agent_disabled_fallback"] = True
+            analysis["fallback_reason"] = "agent_disabled_by_config"
+            return "refine"
+
+        tt = str(analysis.get("task_type") or "").strip().lower()
+        if not tt:
+            tt = self._infer_task_type_from_json(analysis)
+        analysis["task_type"] = tt
+        cx = str(analysis.get("complexity") or "low").lower()
+        oi = str(analysis.get("output_intent") or "neutral").lower()
+        si = str(analysis.get("search_intent") or "none").lower()
+
+        if oi == "fast":
+            return "fast"
+        if oi == "deep":
+            if ag_enabled and tt == "reasoning":
+                return "agent"
+            return "refine"
+
+        if si in ("required", "freshness_required"):
+            if ag_enabled and tt == "reasoning":
+                return "agent"
+            if tt == "generation" or cx in ("high", "medium"):
+                return "refine"
+            return "refine"
+
+        if si == "explicit" and tt == "conversation" and cx == "low":
+            dec = str(analysis.get("decision") or "fast").lower()
+            if dec == "fast":
+                return "refine"
+
+        if ag_enabled and tt == "reasoning":
+            return "agent"
+        if tt == "reasoning" and not ag_enabled:
+            analysis["fallback_reason"] = "agent_disabled_by_config"
+            analysis["agent_disabled_fallback"] = True
+            return "refine"
+
+        if cx == "low" and tt == "conversation":
+            return "fast"
+        if tt == "generation":
+            return "refine"
+        dec = str(analysis.get("decision") or "fast").lower()
+        return "refine" if dec == "refine" else "fast"
+
+    async def _emit_text_chunks(self, text: str, options: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
+        step = max(1, int(options.get("stream_slice_chars") or 8))
+        for i in range(0, len(text), step):
+            yield {"event": "chunk", "data": {"content": text[i : i + step]}}
+            await asyncio.sleep(0)
+
+    def _agent_plain_text_should_refine(self, analysis: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        Agent 轨：本轮无 ACTION 的纯文本是否必须改为草稿走 Review→Polish。
+        条件：高复杂度 / 分析器倾向精化 / 强时效或高风险信号。
+        """
+        cx = str(analysis.get("complexity") or "low").lower()
+        dec = str(analysis.get("decision") or "fast").lower()
+        si = str(analysis.get("search_intent") or "none").lower()
+        if cx == "high":
+            return True, "complexity_high"
+        if dec == "refine":
+            return True, "decision_refine"
+        if bool(analysis.get("search_required")):
+            return True, "search_required"
+        if si in ("required", "freshness_required"):
+            return True, f"search_intent_{si}"
+        if analysis.get("manual_hits"):
+            return True, "manual_keyword_trigger"
+        raw_type = str(analysis.get("type") or "").lower()
+        if raw_type == "web_search":
+            return True, "type_web_search"
+        return False, ""
+
+    async def _refine_from_draft_stream(
+        self,
+        question: str,
+        draft_text: str,
+        options: Dict[str, Any],
+        messages: Optional[List[Dict[str, Any]]],
+        trace_id: str,
+        hcfg: Dict[str, Any],
+        analysis: Dict[str, Any],
+        *,
+        meta_extra: Optional[Dict[str, Any]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Agent 的 refine_answer：委托工具层 stream_refine_from_draft。"""
+        async for ev in stream_refine_from_draft(
+            self,
+            question,
+            draft_text,
+            options,
+            messages,
+            trace_id,
+            hcfg,
+            analysis,
+            meta_extra=meta_extra,
+        ):
+            yield ev
+
+    async def _run_agent_stream(
+        self,
+        prompt: str,
+        analysis: Dict[str, Any],
+        options: Dict[str, Any],
+        messages: Optional[List[Dict[str, Any]]],
+        trace_id: str,
+        hcfg: Dict[str, Any],
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        acfg = hcfg.get("agent") or {}
+        routing = hcfg.get("routing") or {}
+        default_model = routing.get("default_model", "gpt-5.5")
+        agent_model = acfg.get("model") or analysis.get("selected_model") or default_model
+        max_iter = max(1, int(acfg.get("max_iterations", 5)))
+        agent_intro = (acfg.get("system_prompt") or "").strip()
+        base_rules = (
+            "你是具备工具调用能力的智能体，按「思考 → 行动 → 观察」循环推理。\n"
+            "需要实时信息时输出单行（仅此一行即可）：<<ACTION: web_search(\"查询词\")>>\n"
+            "推理已完成且需要长文润色/结构化输出时输出：\n"
+            "<<ACTION: refine_answer(\"用户原问题\", \"你的结论草稿\")>>\n"
+            "其中两段字符串用英文双引号包裹；草稿内请勿出现未转义的双引号。\n"
+            "若能直接给出简短最终答案，则直接输出正文，不要虚构 ACTION。\n"
+            "若任务为高复杂度、分析器倾向精化或涉及时效/高风险主题，服务器可能将你本轮无 ACTION 的正文视为草稿并强制进入审查与润色流程。\n"
+        )
+        sys_content = (agent_intro + "\n\n" + base_rules).strip()
+        thread_msgs: List[Dict[str, Any]] = []
+        if messages:
+            for m in messages[-16:]:
+                role = m.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                thread_msgs.append({"role": role, "content": _msg_content_to_text(m.get("content"))})
+        conv: List[Dict[str, Any]] = [{"role": "system", "content": sys_content}] + thread_msgs + [{"role": "user", "content": prompt}]
+
+        yield {
+            "event": "step",
+            "step": {
+                "name": "agent_start",
+                "status": "ok",
+                "meta": {
+                    "model": agent_model,
+                    "max_iterations": max_iter,
+                    "thread_turns": len(thread_msgs),
+                    "phase": "初始化推理线程（system + 近期对话 + 当前问题）",
+                },
+            },
+        }
+        yield {"event": "status", "phase": "agent", "message": "正在分析问题并规划工具调用…"}
+
+        for it in range(max_iter):
+            yield {
+                "event": "step",
+                "step": {
+                    "name": "agent_iteration",
+                    "status": "running",
+                    "meta": {
+                        "i": it + 1,
+                        "max": max_iter,
+                        "phase": "调用主模型生成本轮策略与正文",
+                        "model": agent_model,
+                    },
+                },
+            }
+            res, _att = await self._ask_with_fallback([agent_model], "", options, messages=conv)
+            if not res.success:
+                yield {"event": "error", "error": res.error or "Agent 调用失败"}
+                return
+            text = (res.content or "").strip()
+            conv.append({"role": "assistant", "content": text})
+
+            wm0 = RE_AGENT_WS.search(text)
+            rm0 = RE_AGENT_REFINE.search(text)
+            parse_text = text
+            if wm0 and rm0:
+                if wm0.start() < rm0.start():
+                    parse_text = text[: rm0.start()].rstrip()
+                    conv[-1]["content"] = parse_text
+                else:
+                    parse_text = text[: wm0.start()].rstrip()
+                    conv[-1]["content"] = parse_text
+
+            if RE_AGENT_REFINE.search(parse_text):
+                next_move = "refine_answer"
+            elif RE_AGENT_WS.search(parse_text):
+                next_move = "web_search"
+            else:
+                next_move = "direct_reply"
+            preview = text[:400] + ("…" if len(text) > 400 else "")
+            yield {
+                "event": "step",
+                "step": {
+                    "name": "agent_iteration",
+                    "status": "ok",
+                    "provider": res.provider,
+                    "model": res.model,
+                    "latency_ms": res.latency_ms,
+                    "meta": {
+                        "i": it + 1,
+                        "max": max_iter,
+                        "next_move": next_move,
+                        "branch_next": {
+                            "refine_answer": "进入 Refine 全链（审查+按需检索+润色）",
+                            "web_search": "触发联网检索后继续推理",
+                            "direct_reply": "本轮输出短文答复（流式）",
+                        }.get(next_move, next_move),
+                        "reply_preview": preview,
+                        "reply_chars": len(text),
+                        "phase": "本轮模型调用已完成，下一步按分支继续",
+                    },
+                },
+            }
+
+            rm = RE_AGENT_REFINE.search(parse_text)
+            if rm:
+                orig_q = (rm.group(1) or "").strip() or prompt
+                draft = (rm.group(2) or "").strip()
+                if len(draft) < 16:
+                    conv.append(
+                        {
+                            "role": "user",
+                            "content": "【系统】refine_answer 草稿过短或为空；请先 web_search 补充事实或输出完整草稿后再调用 refine_answer。",
+                        }
+                    )
+                    yield {
+                        "event": "step",
+                        "step": {
+                            "name": "agent_refine_answer",
+                            "status": "skipped",
+                            "meta": {"reason": "empty_or_tiny_draft", "draft_len": len(draft)},
+                        },
+                    }
+                    continue
+                yield {"event": "step", "step": {"name": "agent_refine_answer", "status": "running", "meta": {}}}
+                yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
+                async for ev in self._refine_from_draft_stream(
+                    orig_q,
+                    draft,
+                    options,
+                    messages,
+                    trace_id,
+                    hcfg,
+                    analysis,
+                    meta_extra={"agent_tool": "refine_answer"},
+                ):
+                    yield ev
+                yield {"event": "step", "step": {"name": "agent_refine_answer", "status": "ok"}}
+                return
+
+            wm = RE_AGENT_WS.search(parse_text)
+            if wm:
+                query = wm.group(1).strip()
+                vq, vfc, vreason = validate_search_query(query)
+                if vfc:
+                    conv.append(
+                        {
+                            "role": "user",
+                            "content": f"【系统】检索词未通过校验：{vreason or vfc}。请改写查询词后仅输出一行 <<ACTION: web_search(\"...\")>>。",
+                        }
+                    )
+                    yield {
+                        "event": "step",
+                        "step": {
+                            "name": "agent_web_search",
+                            "status": "skipped",
+                            "meta": {"query": query, "failure_code": vfc},
+                        },
+                    }
+                    continue
+                yield {
+                    "event": "step",
+                    "step": {"name": "agent_web_search", "status": "running", "meta": {"query": vq}},
+                }
+                sr = await self.tools.web_search(vq)
+                ctx = (sr.get("context") or "")[:12000]
+                st = Step(
+                    name="agent_web_search",
+                    status="error" if sr.get("error") else "ok",
+                    meta={"query": query, "sources": sr.get("sources") or [], "from": "agent"},
+                    error=sr.get("error"),
+                )
+                yield {"event": "step", "step": st.to_dict()}
+                if sr.get("error"):
+                    conv.append({"role": "user", "content": f"【观察】搜索失败：{sr.get('error')}，请换查询词或继续推理。"})
+                else:
+                    conv.append({"role": "user", "content": f"【观察】联网摘要：\n{ctx}\n请继续推理或给出最终答案。"})
+                continue
+
+            force_refine, coerce_reason = self._agent_plain_text_should_refine(analysis)
+            draft_plain = parse_text.strip()
+            if force_refine and draft_plain:
+                yield {
+                    "event": "step",
+                    "step": {
+                        "name": "agent_plain_coerce_refine",
+                        "status": "ok",
+                        "meta": {
+                            "reason": coerce_reason,
+                            "draft_chars": len(draft_plain),
+                            "phase": "无 ACTION 纯文本 → 强制 Review / Polish",
+                        },
+                    },
+                }
+                yield {
+                    "event": "status",
+                    "phase": "agent",
+                    "message": "高复杂度或精化/强时效倾向：将本轮正文作为草稿进入审查与润色…",
+                }
+                yield {
+                    "event": "step",
+                    "step": {
+                        "name": "agent_refine_answer",
+                        "status": "running",
+                        "meta": {"coerced_from_plain_text": True, "coerce_reason": coerce_reason},
+                    },
+                }
+                yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
+                async for ev in self._refine_from_draft_stream(
+                    prompt,
+                    draft_plain,
+                    options,
+                    messages,
+                    trace_id,
+                    hcfg,
+                    analysis,
+                    meta_extra={
+                        "agent_tool": "refine_answer",
+                        "coerced_plain_text": True,
+                        "coerce_reason": coerce_reason,
+                    },
+                ):
+                    yield ev
+                yield {
+                    "event": "step",
+                    "step": {
+                        "name": "agent_refine_answer",
+                        "status": "ok",
+                        "meta": {"coerced_plain_text": True},
+                    },
+                }
+                return
+
+            yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
+            async for ev in self._emit_text_chunks(text, options):
+                yield ev
+            return
+
+        # 迭代用尽：与 refine_answer 相同的全链路 Review + Polish（非 Fast 摘要）
+        draft_fb = compile_agent_fallback_draft(conv, prompt)
+        yield {
+            "event": "step",
+            "step": {
+                "name": "agent_refine_fallback",
+                "status": "running",
+                "meta": {"reason": "max_iterations_exhausted", "same_pipeline_as": "refine_answer"},
+            },
+        }
+        yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
+        fb_ok = True
+        async for ev in self._refine_from_draft_stream(
+            prompt,
+            draft_fb,
+            options,
+            messages,
+            trace_id,
+            hcfg,
+            analysis,
+            meta_extra={"agent_fallback": True, "reason": "max_iterations_exhausted"},
+        ):
+            yield ev
+            if ev.get("event") == "error":
+                fb_ok = False
+        yield {"event": "step", "step": {"name": "agent_refine_fallback", "status": "ok" if fb_ok else "error"}}
 
     async def run_stream(self, prompt: str, mode: str = "auto", options: Optional[Dict[str, Any]] = None, messages: Optional[List[Dict[str, Any]]] = None) -> AsyncGenerator[Dict[str, Any], None]:
         options = options or {}
@@ -363,13 +945,22 @@ class DualTrackHarness:
         hcfg = self.cfg.get("harness") or {}
         default_mode = hcfg.get("default_mode", "auto")
         mode = (mode or default_mode).lower()
-        if mode not in ("auto", "fast", "refine"):
+        if mode not in ("auto", "fast", "refine", "agent"):
             mode = "auto"
 
         yield {"event": "trace", "trace_id": trace_id}
+        yield {"event": "status", "phase": "analyze", "message": "正在分析问题…"}
 
         yield {"event": "step", "step": {"name": "complexity_analyze", "status": "running"}}
-        analysis = await self.analyze_complexity(prompt, options)
+        cx_cfg = hcfg.get("complexity") or {}
+        analyzer_deadline = float(cx_cfg.get("analyzer_total_timeout_s", 45))
+        try:
+            analysis = await asyncio.wait_for(
+                self.analyze_complexity(prompt, options),
+                timeout=analyzer_deadline,
+            )
+        except asyncio.TimeoutError:
+            analysis = self._analyzer_fallback_timeout(prompt)
         step_analyze = Step(
             name="complexity_analyze",
             status="ok",
@@ -379,57 +970,55 @@ class DualTrackHarness:
         steps.append(step_analyze)
         yield {"event": "step", "step": step_analyze.to_dict()}
 
-        chosen_track = "fast"
-        if mode == "fast":
-            chosen_track = "fast"
-        elif mode == "refine":
-            chosen_track = "refine"
-        else:
-            chosen_track = analysis.get("decision", "fast")
+        signals = derive_user_signals(prompt, options)
+        analysis = merge_signals_into_analysis(analysis, signals)
 
-        step_track = Step(name="track_select", status="ok", meta={"mode": mode, "track": chosen_track})
+        yield {"event": "status", "phase": "route", "message": "正在选择处理轨道…"}
+        intended_track = self._resolve_track(mode, analysis, options)
+        chosen_track = intended_track
+
+        step_track = Step(
+            name="track_select",
+            status="ok",
+            meta={
+                "mode": mode,
+                "track": chosen_track,
+                "task_type": analysis.get("task_type"),
+                "complexity": analysis.get("complexity"),
+                "decision": analysis.get("decision"),
+                "search_required": analysis.get("search_required"),
+                "intended_track": intended_track,
+                "search_intent": analysis.get("search_intent"),
+                "output_intent": analysis.get("output_intent"),
+                "fallback_reason": analysis.get("fallback_reason"),
+            },
+        )
         steps.append(step_track)
         yield {"event": "step", "step": step_track.to_dict()}
         yield {"event": "trace", "trace_id": trace_id, "track": chosen_track}
 
         should_search, search_reason = self.should_search(prompt, analysis, options)
-        if should_search:
+        search_mandatory = self._search_mandatory(analysis, options)
+        if chosen_track == "fast" and should_search:
+            yield {"event": "status", "phase": "search", "message": "正在联网检索（快轨）…"}
             yield {"event": "step", "step": {"name": "web_search", "status": "running"}}
-            search_query = self.build_search_query(prompt, analysis, options)
-            search_result = await self.perform_web_search(search_query)
-            search_context = search_result.get("context", "")
-            sources = search_result.get("sources", [])
-            hard_err = search_result.get("error")
-            step_ws = Step(
-                name="web_search",
-                status="error" if hard_err else "ok",
-                provider=search_result.get("provider_used"),
-                latency_ms=search_result.get("latency_ms"),
-                meta={
-                    "query": search_query,
-                    "query_effective": search_query,
-                    "reason": search_reason,
-                    "sources": sources,
-                    "result_count": len(sources),
-                    "failure_code": search_result.get("failure_code"),
-                    "degraded": bool(search_result.get("degraded")),
-                    "attempts": search_result.get("attempts") or [],
-                    "fallback_from": search_result.get("fallback_from"),
-                    "results_preview": search_context[:500] + ("..." if len(search_context) > 500 else ""),
-                },
-                error=hard_err,
+            prompt, step_ws, abort_err = await self._fast_entry_search_step(
+                prompt, analysis, options, search_reason, search_mandatory=search_mandatory
             )
             steps.append(step_ws)
             yield {"event": "step", "step": step_ws.to_dict()}
-
-            if step_ws.status == "error" or hard_err:
-                yield {"event": "error", "error": step_ws.error or hard_err or "联网搜索失败"}
+            if abort_err:
+                yield {"event": "error", "error": abort_err}
                 return
 
-            if search_context:
-                prompt = self._merge_search_into_prompt(prompt, search_context, options)
+        if chosen_track == "agent":
+            yield {"event": "status", "phase": "agent", "message": "正在 Agent 推理与按需工具…"}
+            async for ev in self._run_agent_stream(prompt, analysis, options, messages, trace_id, hcfg):
+                yield ev
+            return
 
         if chosen_track == "fast":
+            yield {"event": "status", "phase": "draft", "message": "正在生成回答…"}
             route = self.route_fast_model(prompt, analysis)
             step_route = Step(name="fast_route", status="ok", meta=route)
             steps.append(step_route)
@@ -465,12 +1054,35 @@ class DualTrackHarness:
         default_model = routing.get("default_model", "gpt-5.5")
         refine_models = analysis.get("refine_models") or {}
 
+        entry_block = ""
+        si0 = str(analysis.get("search_intent") or "none").lower()
+        if si0 in ("explicit", "required", "freshness_required"):
+            yield {"event": "status", "phase": "search", "message": "正在为精化流程做入口轻量检索…"}
+            step_re0 = Step(
+                name="refine_entry_web_search",
+                status="running",
+                meta={"phase": "Refine 入口 · 轻量联网（Layer1 前）"},
+            )
+            yield {"event": "step", "step": step_re0.to_dict()}
+            entry_block = await self._refine_entry_light_search(prompt, analysis, options)
+            step_re1 = Step(
+                name="refine_entry_web_search",
+                status="ok",
+                meta={"phase": "Refine 入口 · 轻量联网（Layer1 前）", "injected_chars": len(entry_block)},
+            )
+            steps.append(step_re1)
+            yield {"event": "step", "step": step_re1.to_dict()}
+
         # Layer 1 (Non-streaming for intermediate layers to keep things manageable)
-        yield {"event": "step", "step": {"name": "refine_layer1_draft", "status": "running"}}
+        yield {"event": "status", "phase": "draft", "message": "正在生成初稿…"}
+        yield {
+            "event": "step",
+            "step": {"name": "refine_layer1_draft", "status": "running", "meta": {"phase": "初稿层 · 生成草稿"}},
+        }
         # For Layer 1 & 2 we do NOT pass the entire chat history. They should only focus on the *current* task context.
         # We append history manually into the prompt if needed, or simply let Layer 3 handle the conversational tone.
         # Here we choose to just pass the prompt directly to keep drafts focused.
-        l1_prompt = f"{l1.get('instruction','').strip()}\n\n【原始问题】\n{prompt.strip()}\n"
+        l1_prompt = f"{l1.get('instruction','').strip()}\n{entry_block}\n\n【原始问题】\n{prompt.strip()}\n"
         
         # If we have messages, we should probably prefix the recent history to give context, but NOT as role messages
         # because the layer instructions expect a specific prompt format.
@@ -498,12 +1110,17 @@ class DualTrackHarness:
             yield {"event": "error", "error": "Layer 1 failed."}
             return
 
-        # Layer 2
-        yield {"event": "step", "step": {"name": "refine_layer2_review", "status": "running"}}
+        # Layer 2（审查；若输出 <<ACTION: web_search("...")>> 则联网核查后重审，最多 3 轮）
+        yield {"event": "status", "phase": "review", "message": "正在审查答案与必要时联网复核…"}
+        yield {
+            "event": "step",
+            "step": {"name": "refine_layer2_review", "status": "running", "meta": {"phase": "审查层 · 核对与必要时动作"}},
+        }
         l2_prompt = (
             f"{l2.get('instruction','').strip()}\n\n"
             f"【原始问题】\n{prompt.strip()}\n\n"
             f"【初稿答案】\n{r1.content.strip()}\n"
+            "\n如需核实实时数据，可在审查结论中单行输出：<<ACTION: web_search(\"查询词\")>>\n"
         )
         if messages:
             history_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in messages[-4:]])
@@ -511,30 +1128,110 @@ class DualTrackHarness:
 
         l2_candidates = refine_models.get("review") or [default_model]
         r2, a2 = await self._ask_with_fallback(l2_candidates, l2_prompt, options, messages=None)
+        if not r2.success:
+            step_l2 = Step(
+                name="refine_layer2_review",
+                status="error",
+                provider=r2.provider,
+                model=r2.model,
+                latency_ms=r2.latency_ms,
+                input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
+                error=r2.error,
+                meta={"attempts": a2, "candidates": l2_candidates},
+            )
+            steps.append(step_l2)
+            yield {"event": "step", "step": step_l2.to_dict()}
+            yield {"event": "error", "error": "Layer 2 failed."}
+            return
+
+        review_body = (r2.content or "").strip()
+        extra_ctx = ""
+        search_loops = 0
+        for _ in range(3):
+            wm = RE_AGENT_WS.search(review_body)
+            if not wm:
+                break
+            search_loops += 1
+            q = wm.group(1).strip()
+            yield {
+                "event": "status",
+                "phase": "search",
+                "message": f"正在联网检索（审查第 {search_loops} 轮）…",
+            }
+            yield {
+                "event": "step",
+                "step": {
+                    "name": "review_web_search",
+                    "status": "running",
+                    "meta": {"query": q, "review_round": search_loops, "phase": "审查内按需检索"},
+                },
+            }
+            vq, vfc, vreason = validate_search_query(q)
+            if vfc:
+                sr = {
+                    "context": "",
+                    "sources": [],
+                    "error": vreason or vfc,
+                    "failure_code": vfc,
+                    "provider_used": "none",
+                    "latency_ms": 0,
+                }
+            else:
+                sr = await self.perform_web_search(vq)
+            snip = (sr.get("context") or "")[:8000]
+            yield {
+                "event": "step",
+                "step": {
+                    "name": "review_web_search",
+                    "status": "error" if sr.get("error") else "ok",
+                    "meta": {
+                        "query": q,
+                        "review_round": search_loops,
+                        "phase": "审查内按需检索",
+                        "result_count": len(sr.get("sources") or []),
+                        "sources": sr.get("sources") or [],
+                    },
+                    "error": sr.get("error"),
+                },
+            }
+            if sr.get("error"):
+                extra_ctx += f"\n\n【联网核查失败】{sr.get('error')}"
+            else:
+                extra_ctx += f"\n\n【联网核查补充】\n{snip}"
+            retry_prompt = (
+                l2_prompt
+                + extra_ctx
+                + "\n\n请结合上述联网信息更新审查结论；若仍需核实可再次输出 <<ACTION: web_search(\"查询词\")>>。"
+            )
+            r2b, _ = await self._ask_with_fallback(l2_candidates, retry_prompt, options, messages=None)
+            if r2b.success:
+                review_body = (r2b.content or "").strip()
+            else:
+                break
+
         step_l2 = Step(
             name="refine_layer2_review",
-            status="ok" if r2.success else "error",
+            status="ok",
             provider=r2.provider,
             model=r2.model,
             latency_ms=r2.latency_ms,
             input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
-            output=r2.content if r2.success else None,
-            error=r2.error if not r2.success else None,
-            meta={"attempts": a2, "candidates": l2_candidates},
+            output=review_body,
+            meta={"attempts": a2, "candidates": l2_candidates, "review_search_loops": search_loops},
         )
         steps.append(step_l2)
         yield {"event": "step", "step": step_l2.to_dict()}
 
-        if not r2.success:
-            yield {"event": "error", "error": "Layer 2 failed."}
-            return
-
         # Layer 3 (Streaming the final output)
-        yield {"event": "step", "step": {"name": "refine_layer3_polish", "status": "running"}}
+        yield {"event": "status", "phase": "polish", "message": "正在生成最终回复…"}
+        yield {
+            "event": "step",
+            "step": {"name": "refine_layer3_polish", "status": "running", "meta": {"phase": "润色层 · 流式成文"}},
+        }
         l3_prompt = (
             f"{l3.get('instruction','').strip()}\n\n"
             f"【原始问题】\n{prompt.strip()}\n\n"
-            f"【审查层答案】\n{r2.content.strip()}\n"
+            f"【审查层答案】\n{review_body}\n"
         )
         l3_candidates = refine_models.get("polish") or [default_model]
         
@@ -557,10 +1254,18 @@ class DualTrackHarness:
         hcfg = self.cfg.get("harness") or {}
         default_mode = hcfg.get("default_mode", "auto")
         mode = (mode or default_mode).lower()
-        if mode not in ("auto", "fast", "refine"):
+        if mode not in ("auto", "fast", "refine", "agent"):
             mode = "auto"
 
-        analysis = await self.analyze_complexity(prompt, options)
+        cx_cfg = hcfg.get("complexity") or {}
+        analyzer_deadline = float(cx_cfg.get("analyzer_total_timeout_s", 45))
+        try:
+            analysis = await asyncio.wait_for(
+                self.analyze_complexity(prompt, options),
+                timeout=analyzer_deadline,
+            )
+        except asyncio.TimeoutError:
+            analysis = self._analyzer_fallback_timeout(prompt)
         steps.append(
             Step(
                 name="complexity_analyze",
@@ -570,51 +1275,52 @@ class DualTrackHarness:
             )
         )
 
-        chosen_track = "fast"
-        if mode == "fast":
-            chosen_track = "fast"
-        elif mode == "refine":
-            chosen_track = "refine"
-        else:
-            # auto
-            chosen_track = analysis.get("decision", "fast")
+        signals = derive_user_signals(prompt, options)
+        analysis = merge_signals_into_analysis(analysis, signals)
 
-        steps.append(Step(name="track_select", status="ok", meta={"mode": mode, "track": chosen_track}))
+        intended_track = self._resolve_track(mode, analysis, options)
+        chosen_track = intended_track
+        if chosen_track == "agent":
+            # 非流式接口暂不跑 Agent 循环，降级为 Refine 三阶段
+            chosen_track = "refine"
+            analysis = {
+                **analysis,
+                "sync_downgraded_from": "agent",
+                "intended_track": "agent",
+                "fallback_reason": analysis.get("fallback_reason") or "sync_api_no_agent_loop",
+            }
+
+        steps.append(
+            Step(
+                name="track_select",
+                status="ok",
+                meta={
+                    "mode": mode,
+                    "track": chosen_track,
+                    "task_type": analysis.get("task_type"),
+                    "intended_track": intended_track,
+                    "search_intent": analysis.get("search_intent"),
+                    "output_intent": analysis.get("output_intent"),
+                    "fallback_reason": analysis.get("fallback_reason"),
+                },
+            )
+        )
 
         should_search, search_reason = self.should_search(prompt, analysis, options)
-        if should_search:
-            search_query = self.build_search_query(prompt, analysis, options)
-            search_result = await self.perform_web_search(search_query)
-            search_context = search_result.get("context", "")
-            hard_err = search_result.get("error")
-            ws_step = Step(
-                name="web_search",
-                status="error" if hard_err else "ok",
-                provider=search_result.get("provider_used"),
-                latency_ms=search_result.get("latency_ms"),
-                meta={
-                    "query": search_query,
-                    "query_effective": search_query,
-                    "reason": search_reason,
-                    "sources": search_result.get("sources", []),
-                    "result_count": len(search_result.get("sources") or []),
-                    "failure_code": search_result.get("failure_code"),
-                    "degraded": bool(search_result.get("degraded")),
-                    "attempts": search_result.get("attempts") or [],
-                    "fallback_from": search_result.get("fallback_from"),
-                    "results_preview": search_context[:500] + ("..." if len(search_context) > 500 else ""),
-                },
-                error=hard_err,
+        search_mandatory = self._search_mandatory(analysis, options)
+        if chosen_track == "fast" and should_search:
+            prompt, ws_step, abort_err = await self._fast_entry_search_step(
+                prompt, analysis, options, search_reason, search_mandatory=search_mandatory
             )
             steps.append(ws_step)
-            if ws_step.status == "error" or hard_err:
+            if abort_err:
                 fail = AskResult(
                     success=False,
                     content="",
-                    provider=search_result.get("provider_used") or "web_search",
+                    provider=ws_step.provider or "web_search",
                     model="search",
-                    latency_ms=int(search_result.get("latency_ms") or 0),
-                    error=ws_step.error or str(hard_err or "联网搜索失败"),
+                    latency_ms=int(ws_step.latency_ms or 0),
+                    error=abort_err,
                 )
                 return {
                     "trace_id": trace_id,
@@ -622,8 +1328,6 @@ class DualTrackHarness:
                     "final": fail.to_dict(),
                     "steps": [s.to_dict() for s in steps],
                 }
-            if search_context:
-                prompt = self._merge_search_into_prompt(prompt, search_context, options)
 
         if chosen_track == "fast":
             route = self.route_fast_model(prompt, analysis)
@@ -687,9 +1391,28 @@ class DualTrackHarness:
 
         refine_models = analysis.get("refine_models") or {}
 
+        entry_block = ""
+        si_sync = str(analysis.get("search_intent") or "none").lower()
+        if si_sync in ("explicit", "required", "freshness_required"):
+            steps.append(
+                Step(
+                    name="refine_entry_web_search",
+                    status="running",
+                    meta={"phase": "Refine 入口 · 轻量联网（Layer1 前）"},
+                )
+            )
+            entry_block = await self._refine_entry_light_search(prompt, analysis, options)
+            steps.append(
+                Step(
+                    name="refine_entry_web_search",
+                    status="ok",
+                    meta={"phase": "Refine 入口 · 轻量联网（Layer1 前）", "injected_chars": len(entry_block)},
+                )
+            )
+
         # Layer 1
         # 对于 refine 链的第一层，我们将历史消息注入，但要把 prompt 包装为 l1_prompt
-        l1_prompt = f"{l1.get('instruction','').strip()}\n\n【原始问题】\n{prompt.strip()}\n"
+        l1_prompt = f"{l1.get('instruction','').strip()}\n{entry_block}\n\n【原始问题】\n{prompt.strip()}\n"
         l1_candidates = refine_models.get("draft") or [default_model]
         r1, a1 = await self._ask_with_fallback(l1_candidates, l1_prompt, options, messages=messages)
         steps.append(
@@ -714,29 +1437,28 @@ class DualTrackHarness:
                 "steps": [s.to_dict() for s in steps],
             }
 
-        # Layer 2
+        # Layer 2（含可选联网核查，与流式接口逻辑对齐）
         l2_prompt = (
             f"{l2.get('instruction','').strip()}\n\n"
             f"【原始问题】\n{prompt.strip()}\n\n"
             f"【初稿答案】\n{r1.content.strip()}\n"
+            "\n如需核实实时数据，可在审查结论中单行输出：<<ACTION: web_search(\"查询词\")>>\n"
         )
         l2_candidates = refine_models.get("review") or [default_model]
         r2, a2 = await self._ask_with_fallback(l2_candidates, l2_prompt, options, messages=messages)
-        steps.append(
-            Step(
-                name="refine_layer2_review",
-                status="ok" if r2.success else "error",
-                provider=r2.provider,
-                model=r2.model,
-                latency_ms=r2.latency_ms,
-                input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
-                output=r2.content if r2.success else None,
-                error=r2.error if not r2.success else None,
-                meta={"attempts": a2, "candidates": l2_candidates},
-            )
-        )
         if not r2.success:
-            # degrade: return layer1 as final
+            steps.append(
+                Step(
+                    name="refine_layer2_review",
+                    status="error",
+                    provider=r2.provider,
+                    model=r2.model,
+                    latency_ms=r2.latency_ms,
+                    input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
+                    error=r2.error,
+                    meta={"attempts": a2, "candidates": l2_candidates},
+                )
+            )
             steps.append(
                 Step(
                     name="refine_degrade_to_layer1",
@@ -752,11 +1474,67 @@ class DualTrackHarness:
                 "steps": [s.to_dict() for s in steps],
             }
 
+        review_body = (r2.content or "").strip()
+        extra_ctx = ""
+        search_loops = 0
+        for _ in range(3):
+            wm = RE_AGENT_WS.search(review_body)
+            if not wm:
+                break
+            search_loops += 1
+            q = wm.group(1).strip()
+            vq, vfc, vreason = validate_search_query(q)
+            if vfc:
+                sr = {
+                    "context": "",
+                    "sources": [],
+                    "error": vreason or vfc,
+                    "failure_code": vfc,
+                }
+            else:
+                sr = await self.perform_web_search(vq)
+            snip = (sr.get("context") or "")[:8000]
+            steps.append(
+                Step(
+                    name="review_web_search",
+                    status="error" if sr.get("error") else "ok",
+                    meta={"query": q, "sources": sr.get("sources") or []},
+                    error=sr.get("error"),
+                )
+            )
+            if sr.get("error"):
+                extra_ctx += f"\n\n【联网核查失败】{sr.get('error')}"
+            else:
+                extra_ctx += f"\n\n【联网核查补充】\n{snip}"
+            retry_prompt = (
+                l2_prompt
+                + extra_ctx
+                + "\n\n请结合上述联网信息更新审查结论；若仍需核实可再次输出 <<ACTION: web_search(\"查询词\")>>。"
+            )
+            r2b, _ = await self._ask_with_fallback(l2_candidates, retry_prompt, options, messages=messages)
+            if r2b.success:
+                review_body = (r2b.content or "").strip()
+            else:
+                break
+
+        steps.append(
+            Step(
+                name="refine_layer2_review",
+                status="ok",
+                provider=r2.provider,
+                model=r2.model,
+                latency_ms=r2.latency_ms,
+                input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
+                output=review_body,
+                meta={"attempts": a2, "candidates": l2_candidates, "review_search_loops": search_loops},
+            )
+        )
+
         # Layer 3
         l3_prompt = (
             f"{l3.get('instruction','').strip()}\n\n"
             f"【原始问题】\n{prompt.strip()}\n\n"
-            f"【审查层答案】\n{r2.content.strip()}\n"
+            f"【审查层答案】\n{review_body}\n"
         )
         l3_candidates = refine_models.get("polish") or [default_model]
         r3, a3 = await self._ask_with_fallback(l3_candidates, l3_prompt, options, messages=messages)

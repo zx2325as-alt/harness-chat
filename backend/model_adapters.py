@@ -98,7 +98,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 error=f"Missing API key env: {api_key_env}",
             )
 
-        timeout_s = float(self.cfg.get("timeout_s", 60))
+        timeout_s = float(options.get("request_timeout_s", self.cfg.get("timeout_s", 60)))
         t = Timer.start()
         headers: Dict[str, str] = {
             "Content-Type": "application/json",
@@ -112,7 +112,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 if k and v is not None:
                     headers[str(k)] = str(v)
 
-        max_retries = 3
+        max_retries = max(1, int(options.get("max_retries", self.cfg.get("max_retries", 3))))
         last_error = None
         for attempt in range(max_retries):
             try:

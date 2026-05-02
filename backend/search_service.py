@@ -62,9 +62,13 @@ class SearchService:
                 "raw_status": None,
             }
 
+        q = (query or "").strip()
+        if len(q) > 400:
+            q = q[:400]
+
         body: Dict[str, Any] = {
             "api_key": api_key,
-            "query": query,
+            "query": q,
             "search_depth": self.search_depth
             if self.search_depth in ("basic", "advanced", "fast", "ultra-fast")
             else "basic",

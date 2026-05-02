@@ -9,6 +9,7 @@
   "dependencies": {
     "core-js": "^3.39.0",
     "dompurify": "^3.4.1",
+    "katex": "^0.16.11",
     "marked": "^18.0.2",
     "vue": "^3.5.0"
   },

@@ -21,6 +21,10 @@ harness:
     include_answer: false
 
   complexity:
+    # 预判 LLM 单次请求超时（秒）、重试次数、整体硬超时（超过则降级为规则预判，避免 SSE 长时间无响应）
+    analyzer_request_timeout_s: 25
+    analyzer_max_retries: 1
+    analyzer_total_timeout_s: 48
     # 启用大模型进行预判
     use_llm_analyzer: true
     analyzer_model: "gpt-5.5" # 预判使用的模型，需在 models 下注册，要求速度快且能输出 JSON
@@ -41,6 +45,7 @@ harness:
       {
         "complexity": "high 或 low",
         "decision": "fast 或 refine",
+        "task_type": "conversation | generation | reasoning",
         "type": "general | web_search | document_qa | code | math_logic | writing | privacy_local",
         "search_required": true 或 false,
         "search_query": "若需要联网搜索，给出最适合搜索引擎的短查询词；否则为空字符串",
@@ -54,12 +59,18 @@ harness:
         "reason": "简短判定理由"
       }
       
+      task_type 含义（用于三轨路由）：
+      - conversation：闲聊、简单问答、翻译 → 通常配合 low → Fast 轨
+      - generation：长文、方案、写作、润色类 → 通常配合 high → Refine 轨
+      - reasoning：多步推理、工具链、数学证明、复杂逻辑 → Agent 轨（思考-行动-观察）
+      
       判断标准：
       - complexity: 若问题需要多步推理、深入分析论证、字数较长或任务繁重，填 "high"；若为简单的问答、翻译、信息检索或日常对话，填 "low"。
       - decision: 与 complexity 一致导向 — high 倾向 refine，low 倾向 fast（可被用户模式覆盖）。
       - search_required: 涉及实时信息、新闻、股价、天气、版本更新等填 true。
       - type: 需要实时外部信息填 web_search。
       - 隐私绝对优先：只要涉及隐私敏感数据，所有选用的模型都必须是 ollama-llama3。
+      - task_type 为 reasoning 时：数学推导、多约束决策、需多次查资料或代码验证的任务优先。
       
       用户输入如下：
       
@@ -68,6 +79,15 @@ harness:
       - "/refine"
       - "强制精化"
       - "精化轨"
+
+  # Agent 轨（task_type=reasoning）：思考-行动-观察；工具含联网与 refine_answer 封装
+  agent:
+    enabled: true
+    model: "gpt-5.5"
+    max_iterations: 5
+    system_prompt: |
+      你是严谨的推理智能体。每一步先简短说明推理意图，再决定是否需要工具。
+      工具调用必须使用指定单行格式，勿编造工具结果。
 
   routing:
     # 无规则命中时按顺序尝试，优先使用兼顾速度与质量的模型，失败则自动向后降级

@@ -4,7 +4,7 @@
       <div class="brand">
         <div class="dot" />
         <div class="title">Harness Chat</div>
-        <div class="subtitle">双轨 Harness（Fast / Refine）</div>
+        <div class="subtitle">Harness：Fast / Refine / Agent</div>
       </div>
       <div class="actions">
         <button class="tab" :class="{ active: view === 'chat' }" @click="view = 'chat'">聊天</button>
@@ -104,6 +104,9 @@ export default {
       abortController: null,
       stepUiTick: 0,
       showStepsPanel: true,
+      /** 流式期间防抖写入 localStorage，避免阻塞渲染导致「执行过程」整段结束后才刷新 */
+      _saveSessionsTimer: null,
+      _scrollBottomPending: false,
     };
   },
   computed: {
@@ -166,6 +169,28 @@ export default {
       } catch(e) {
         console.error("Failed to save sessions", e);
       }
+    },
+    scheduleSaveSessions() {
+      if (this._saveSessionsTimer) clearTimeout(this._saveSessionsTimer);
+      this._saveSessionsTimer = setTimeout(() => {
+        this._saveSessionsTimer = null;
+        this.saveSessions();
+      }, 80);
+    },
+    flushSaveSessions() {
+      if (this._saveSessionsTimer) {
+        clearTimeout(this._saveSessionsTimer);
+        this._saveSessionsTimer = null;
+      }
+      this.saveSessions();
+    },
+    scheduleScrollBottom() {
+      if (this._scrollBottomPending) return;
+      this._scrollBottomPending = true;
+      requestAnimationFrame(() => {
+        this._scrollBottomPending = false;
+        this.scrollToBottom();
+      });
     },
     createNewSession() {
       const newSession = {
@@ -254,18 +279,28 @@ export default {
         steps: [],
         documents: documents.map((d) => ({ name: d.name, status: d.status, meta: d.meta })),
         searchMode,
+        phaseMessage: "",
+        phase: "",
       };
       this.currentSession.stepRuns.push(run);
       this.activeRunId = run.id;
       this.saveSessions();
       return run;
     },
+    /** 同一步 name 可能多次出现（如审查多轮联网），用签名区分，避免互相覆盖 */
+    stepSignature(step) {
+      const n = step.name || "";
+      const m = step.meta || {};
+      if (n === "review_web_search" && m.review_round != null) return `${n}#r${m.review_round}`;
+      if (n === "agent_iteration" && m.i != null) return `${n}#${m.i}`;
+      return n;
+    },
     upsertStep(run, step) {
-      const idx = run.steps.findIndex((s) => s.name === step.name);
+      const sig = this.stepSignature(step);
+      const idx = run.steps.findIndex((s) => this.stepSignature(s) === sig);
       if (idx >= 0) run.steps.splice(idx, 1, step);
       else run.steps.push(step);
       this.stepUiTick += 1;
-      this.saveSessions();
     },
     bumpStepUi() {
       this.stepUiTick += 1;
@@ -383,16 +418,22 @@ export default {
                 pending.meta.track = event.track;
               }
               this.bumpStepUi();
-              this.saveSessions();
+              await this.$nextTick();
+            } else if (event.event === "status") {
+              run.phase = event.phase || "";
+              run.phaseMessage = event.message || "";
+              this.bumpStepUi();
+              await this.$nextTick();
             } else if (event.event === "step") {
               this.upsertStep(run, event.step);
-              this.scrollToBottom();
+              await this.$nextTick();
+              this.scheduleScrollBottom();
             } else if (event.event === "stream_start") {
               run.track = event.track;
               run.traceId = event.trace_id;
               pending.meta.track = event.track;
               this.bumpStepUi();
-              this.saveSessions();
+              await this.$nextTick();
             } else if (event.event === "model_start") {
               finalMeta.model = event.model;
               finalMeta.provider = event.provider;
@@ -403,13 +444,13 @@ export default {
               if (data.content) {
                 finalContent += data.content;
                 pending.content = finalContent;
-                this.scrollToBottom();
+                this.scheduleScrollBottom();
               }
             } else if (event.event === "error") {
               streamFailed = true;
               run.status = "error";
               this.bumpStepUi();
-              this.saveSessions();
+              this.flushSaveSessions();
               throw new Error(event.error);
             }
           }
@@ -421,14 +462,14 @@ export default {
           run.status = "ok";
         }
         this.bumpStepUi();
-        this.saveSessions();
+        this.flushSaveSessions();
       } catch (e) {
         if (e.name === "AbortError") {
           pending.meta.streaming = false;
           pending.content += "\n\n[用户已中断响应]";
           run.status = "stopped";
           this.bumpStepUi();
-          this.saveSessions();
+          this.flushSaveSessions();
         } else {
           const errText = String(e && e.message ? e.message : e);
           const idx = this.currentSession.messages.findIndex((m) => m.id === pending.id);
@@ -437,12 +478,12 @@ export default {
           else this.currentSession.messages.push(msg);
           run.status = "error";
           this.bumpStepUi();
-          this.saveSessions();
+          this.flushSaveSessions();
         }
       } finally {
         this.busy = false;
         this.bumpStepUi();
-        this.saveSessions();
+        this.flushSaveSessions();
         this.scrollToBottom();
       }
     },

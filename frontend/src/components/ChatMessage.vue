@@ -29,8 +29,7 @@
 </template>
 
 <script>
-import { marked } from "marked";
-import DOMPurify from "dompurify";
+import { renderMarkdownWithMath } from "../markdownMath.js";
 
 export default {
   name: "ChatMessage",
@@ -51,9 +50,7 @@ export default {
   },
   methods: {
     renderMarkdown(text) {
-      if (!text) return "";
-      const rawHtml = marked(text);
-      return DOMPurify.sanitize(rawHtml);
+      return renderMarkdownWithMath(text || "");
     },
   },
 };
@@ -184,5 +181,28 @@ export default {
 }
 .content.markdown-body :deep(a) {
   color: #a5b4fc;
+}
+
+/* KaTeX 深色气泡可读性 */
+.content.markdown-body :deep(.katex),
+.content.markdown-body :deep(.katex-display) {
+  color: #e8eef7;
+}
+.content.markdown-body :deep(.katex .mord),
+.content.markdown-body :deep(.katex .mrel),
+.content.markdown-body :deep(.katex .mbin),
+.content.markdown-body :deep(.katex .mop) {
+  color: inherit;
+}
+.content.markdown-body :deep(.katex-display) {
+  margin: 0.85em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-width: 100%;
+}
+.content.markdown-body :deep(.katex-fallback) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  color: #fca5a5;
 }
 </style>

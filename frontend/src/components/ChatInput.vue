@@ -123,6 +123,7 @@ import { API_BASE } from "../apiBase.js";
 
 const MODE_OPTIONS = [
   { value: "auto", label: "自动" },
+  { value: "agent", label: "Agent 轨" },
   { value: "refine", label: "精化轨" },
   { value: "fast", label: "快速轨" },
 ];
