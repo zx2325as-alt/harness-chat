@@ -22,6 +22,7 @@ class SearchService:
         self.max_results = int(h.get("max_results", 8))
         self.topic = str(h.get("topic", "general")).strip().lower()
         self.timeout_s = float(h.get("timeout_s", 15))
+        self.timeout_s_max = float(h.get("timeout_s_max", self.timeout_s))
         self.include_answer = bool(h.get("include_answer", False))
 
     def _api_key(self) -> Optional[str]:
@@ -79,7 +80,7 @@ class SearchService:
 
         t0 = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            async with httpx.AsyncClient(timeout=max(self.timeout_s, self.timeout_s_max)) as client:
                 r = await client.post(TAVILY_SEARCH_URL, json=body)
                 latency_ms = int((time.perf_counter() - t0) * 1000)
                 if r.status_code in (401, 403):

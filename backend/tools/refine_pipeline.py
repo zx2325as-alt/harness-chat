@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
+from search_query_util import validate_search_query
 from tools.parsing import RE_AGENT_WS
 
 
@@ -17,10 +18,12 @@ async def stream_refine_from_draft(
     analysis: Dict[str, Any],
     *,
     meta_extra: Optional[Dict[str, Any]] = None,
+    extra_review_context: str = "",
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
     harness: DualTrackHarness 实例（避免循环导入不写类型注解）。
     meta_extra: 写入各 step.meta，用于区分 agent 工具调用 / 兜底等。
+    extra_review_context: 可选自检文本，仅注入审查层 prompt，不进入最终用户可见草稿。
     """
     from harness import Step  # 运行时导入，避免与 harness 顶层循环依赖
 
@@ -34,8 +37,15 @@ async def stream_refine_from_draft(
     l2_prompt = (
         f"{l2.get('instruction','').strip()}\n\n【原始问题】\n{question.strip()}\n\n【初稿答案】\n{draft_text.strip()}\n"
     )
+    scr = (extra_review_context or "").strip()
+    if scr:
+        l2_prompt += (
+            "\n\n【自检与不确定性（供审查参考，勿直接当作用户可见正文）】\n"
+            f"{scr}\n"
+        )
     l2_candidates = refine_models.get("review") or [default_model]
-    r2, a2 = await harness._ask_with_fallback(l2_candidates, l2_prompt, options, messages=None)
+    opts_l2 = {**options, "temperature": float(l2.get("temperature", 0.1))}
+    r2, a2 = await harness._ask_with_fallback(l2_candidates, l2_prompt, opts_l2, messages=None)
     step_l2 = Step(
         name="refine_layer2_review",
         status="ok" if r2.success else "error",
@@ -45,7 +55,13 @@ async def stream_refine_from_draft(
         input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
         output=r2.content if r2.success else None,
         error=r2.error if not r2.success else None,
-        meta={**extra_meta, "attempts": a2, "candidates": l2_candidates, "from_agent": True},
+        meta={
+            **extra_meta,
+            "attempts": a2,
+            "candidates": l2_candidates,
+            "from_agent": True,
+            "pipeline_phase": "review",
+        },
     )
     yield {"event": "step", "step": step_l2.to_dict()}
     if not r2.success:
@@ -70,10 +86,20 @@ async def stream_refine_from_draft(
                     "query": q,
                     "review_round": review_snip_loop,
                     "phase": "审查内按需检索",
+                    "pipeline_phase": "retrieval",
                 },
             },
         }
-        sr = await harness.tools.web_search(q)
+        vq, vfc, vreason = validate_search_query(q)
+        if vfc:
+            sr = {
+                "context": "",
+                "sources": [],
+                "error": vreason or vfc,
+                "failure_code": vfc,
+            }
+        else:
+            sr = await harness.perform_web_search(vq, options)
         snip = (sr.get("context") or "")[:8000]
         yield {
             "event": "step",
@@ -87,6 +113,7 @@ async def stream_refine_from_draft(
                     "phase": "审查内按需检索",
                     "result_count": len(sr.get("sources") or []),
                     "sources": sr.get("sources") or [],
+                    "pipeline_phase": "retrieval",
                 },
                 "error": sr.get("error"),
             },
@@ -100,7 +127,7 @@ async def stream_refine_from_draft(
             + extra_ctx
             + "\n\n请结合上述联网信息更新审查结论，若仍需核实可再次输出 <<ACTION: web_search(\"查询词\")>>。"
         )
-        r2b, _ = await harness._ask_with_fallback(l2_candidates, retry_prompt, options, messages=None)
+        r2b, _ = await harness._ask_with_fallback(l2_candidates, retry_prompt, opts_l2, messages=None)
         if r2b.success:
             review_body = r2b.content
         else:
@@ -109,15 +136,16 @@ async def stream_refine_from_draft(
         f"{l3.get('instruction','').strip()}\n\n【原始问题】\n{question.strip()}\n\n【审查层答案】\n{review_body.strip()}\n"
     )
     l3_candidates = refine_models.get("polish") or [default_model]
+    opts_l3 = {**options, "temperature": float(l3.get("temperature", 0.3))}
     yield {
         "event": "step",
         "step": {
             "name": "refine_layer3_polish",
             "status": "running",
-            "meta": {**extra_meta, "from_agent": True},
+            "meta": {**extra_meta, "from_agent": True, "pipeline_phase": "polish"},
         },
     }
-    async for s_event in harness._stream_with_fallback(l3_candidates, l3_prompt, options, messages=messages):
+    async for s_event in harness._stream_with_fallback(l3_candidates, l3_prompt, opts_l3, messages=messages):
         yield s_event
 
 

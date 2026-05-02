@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import FastAPI, Request, UploadFile, File, Body
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import json
@@ -137,7 +137,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    harness = DualTrackHarness(cfg)
+    harness = DualTrackHarness(cfg, redis_client=redis_client)
 
     @app.post("/api/documents/parse")
     async def parse_documents(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
@@ -149,6 +149,23 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> Dict[str, Any]:
+        return {"ok": True}
+
+    @app.post("/api/feedback")
+    async def feedback(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        """隐式反馈埋点（客户端可选调用）：复制/重生成等行为用于离线评估。"""
+        ev = str(payload.get("event") or "unknown")
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        line = json.dumps(
+            {"event": ev, "session_id": payload.get("session_id"), "trace_id": payload.get("trace_id"), "meta": meta},
+            ensure_ascii=False,
+        )
+        try:
+            log_path = os.path.join(ROOT, "feedback.log")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
         return {"ok": True}
 
     @app.get("/api/config")

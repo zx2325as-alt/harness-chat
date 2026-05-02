@@ -11,10 +11,12 @@ import json
 import re
 import asyncio
 import time
+import hashlib
+import difflib
 from datetime import datetime, timedelta
 
 from search_service import SearchService
-from routing_signals import derive_user_signals, merge_signals_into_analysis
+from routing_signals import derive_user_signals, merge_signals_into_analysis, reasoning_keyword_boost
 from search_query_util import soft_degrade_note, validate_search_query
 
 from tools.layer import HarnessTools
@@ -78,11 +80,20 @@ class ModelRegistry:
 
 
 class DualTrackHarness:
-    def __init__(self, cfg: Dict[str, Any]):
+    def __init__(self, cfg: Dict[str, Any], redis_client: Any = None):
         self.cfg = cfg
         self.registry = ModelRegistry(cfg.get("models", {}))
         self.search = SearchService(cfg)
         self.tools = HarnessTools(self)
+        self._redis = redis_client
+        self._pipeline_seq = 0
+
+    def _tag(self, phase: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        self._pipeline_seq += 1
+        d: Dict[str, Any] = {"pipeline_phase": phase, "pipeline_sequence": self._pipeline_seq}
+        if extra:
+            d.update(extra)
+        return d
 
     def _keyword_hit(self, text: str, keywords: List[str]) -> List[str]:
         t = (text or "").lower()
@@ -105,6 +116,8 @@ class DualTrackHarness:
                 "complexity": "high",
                 "type": "general",
                 "task_type": "generation",
+                "confidence": 1.0,
+                "suggested_track": "refine",
             }
 
         use_llm = bool(hcfg.get("use_llm_analyzer", False))
@@ -117,6 +130,8 @@ class DualTrackHarness:
                 "complexity": "high" if length > 200 else "low",
                 "type": "general",
                 "task_type": "generation" if length > 200 else "conversation",
+                "confidence": 0.55,
+                "suggested_track": "refine" if length > 200 else "fast",
             }
 
         analyzer_model = hcfg.get("analyzer_model", "gpt-5.5")
@@ -155,6 +170,15 @@ class DualTrackHarness:
                     if not task_type:
                         task_type = self._infer_task_type_from_json(data)
 
+                    try:
+                        confidence = float(data.get("confidence", 0.85))
+                    except (TypeError, ValueError):
+                        confidence = 0.85
+                    confidence = max(0.0, min(1.0, confidence))
+                    suggested_track = str(data.get("suggested_track") or "").strip().lower()
+                    if suggested_track not in ("fast", "refine", "agent", ""):
+                        suggested_track = ""
+
                     return {
                         "decision": decision,
                         "reasons": [f"llm_reason: {reason}"],
@@ -168,6 +192,8 @@ class DualTrackHarness:
                         "refine_models": refine_models,
                         "reason": reason,
                         "raw_llm_response": res.content,
+                        "confidence": confidence,
+                        "suggested_track": suggested_track or None,
                     }
                 except json.JSONDecodeError:
                     return {
@@ -177,6 +203,8 @@ class DualTrackHarness:
                         "type": "general",
                         "task_type": "conversation",
                         "raw_llm_response": res.content,
+                        "confidence": 0.35,
+                        "suggested_track": "fast",
                     }
         except Exception as e:
             return {
@@ -185,6 +213,8 @@ class DualTrackHarness:
                 "complexity": "low",
                 "type": "general",
                 "task_type": "conversation",
+                "confidence": 0.35,
+                "suggested_track": "fast",
             }
             
         return {
@@ -193,6 +223,8 @@ class DualTrackHarness:
             "complexity": "low",
             "type": "general",
             "task_type": "conversation",
+            "confidence": 0.3,
+            "suggested_track": "fast",
         }
 
     def _analyzer_fallback_timeout(self, prompt: str) -> Dict[str, Any]:
@@ -206,6 +238,8 @@ class DualTrackHarness:
             "task_type": "generation" if length > 200 else "conversation",
             "reason": "复杂度预判超时，已按长度规则降级并继续处理",
             "analyzer_timed_out": True,
+            "confidence": 0.45,
+            "suggested_track": "refine" if length > 200 else "fast",
         }
 
     def route_fast_model(self, prompt: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
@@ -239,6 +273,124 @@ class DualTrackHarness:
             "candidates": unique_candidates,
             "selected": unique_candidates[0],
         }
+
+    def apply_confidence_track_guard(self, mode: str, analysis: Dict[str, Any], prompt: str, chosen: str) -> str:
+        if (mode or "auto").lower() != "auto":
+            return chosen
+        try:
+            cf = float(analysis.get("confidence", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            cf = 1.0
+        if cf < 0.6 and len((prompt or "").strip()) > 200 and chosen == "fast":
+            analysis["track_upgrade_reason"] = "low_analyzer_confidence"
+            return "refine"
+        return chosen
+
+    def _merge_task_model_templates(self, analysis: Dict[str, Any]) -> None:
+        hcfg = self.cfg.get("harness") or {}
+        tpl_root = hcfg.get("task_model_templates") or {}
+        tt = str(analysis.get("task_type") or "conversation").lower()
+        tpl = tpl_root.get(tt) or tpl_root.get("conversation") or {}
+        if not tpl:
+            return
+        if not str(analysis.get("selected_model") or "").strip() and tpl.get("selected_model"):
+            analysis["selected_model"] = tpl["selected_model"]
+        if not analysis.get("fallback_models") and tpl.get("fallback_models"):
+            analysis["fallback_models"] = list(tpl["fallback_models"])
+        rm = analysis.get("refine_models")
+        if not isinstance(rm, dict):
+            rm = {}
+        rtpl = tpl.get("refine_models") or {}
+        for k in ("draft", "review", "polish"):
+            if not rm.get(k) and rtpl.get(k):
+                rm[k] = list(rtpl[k])
+        if rm:
+            analysis["refine_models"] = rm
+
+    def _postprocess_analysis(self, prompt: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
+        out = {**analysis}
+        self._merge_task_model_templates(out)
+        hit, reason = reasoning_keyword_boost(prompt)
+        if hit and str(out.get("complexity") or "low").lower() == "low":
+            out["complexity"] = "high"
+            out["task_type"] = "reasoning"
+            out["decision"] = "refine"
+            out["reasoning_rule_boost"] = reason
+        return out
+
+    def _norm_cache_prompt(self, p: str) -> str:
+        return re.sub(r"\s+", " ", (p or "").strip().lower())
+
+    def _fast_cache_key_source(self, options: Dict[str, Any], augmented_prompt: str) -> str:
+        """与联网摘要无关的稳定键：优先原始用户面（search_prompt_base），否则入口钉死的身份串。"""
+        opts = options or {}
+        return str(opts.get("_fast_cache_identity") or opts.get("search_prompt_base") or augmented_prompt or "").strip()
+
+    async def _try_fast_cache_hit(self, options: Dict[str, Any], augmented_prompt: str) -> Optional[str]:
+        fcfg = (self.cfg.get("harness") or {}).get("fast_answer_cache") or {}
+        if not fcfg.get("enabled") or not self._redis:
+            return None
+        key_src = self._fast_cache_key_source(options, augmented_prompt)
+        norm = self._norm_cache_prompt(key_src)
+        pref = str(fcfg.get("key_prefix") or "harness:fast:v1:")
+        thresh = float(fcfg.get("similarity_threshold", 0.9))
+        max_scan = int(fcfg.get("max_scan_keys", 400))
+        key = pref + hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+        def _sync() -> Optional[str]:
+            v = self._redis.get(key)
+            if v:
+                return str(v)
+            raw = self._redis.lrange(pref + "lru", 0, -1)
+            best_a: Optional[str] = None
+            best_r = 0.0
+            for i, row in enumerate(raw or []):
+                if i >= max_scan:
+                    break
+                try:
+                    o = json.loads(row)
+                    n2 = str(o.get("n") or "")
+                    r = difflib.SequenceMatcher(a=norm, b=n2).ratio()
+                    if r > best_r:
+                        best_r = r
+                        best_a = str(o.get("a") or "")
+                except Exception:
+                    continue
+            if best_r >= thresh and best_a:
+                return best_a
+            return None
+
+        try:
+            return await asyncio.to_thread(_sync)
+        except Exception:
+            return None
+
+    async def _store_fast_cache_answer(self, options: Dict[str, Any], augmented_prompt: str, answer: str) -> None:
+        fcfg = (self.cfg.get("harness") or {}).get("fast_answer_cache") or {}
+        if not fcfg.get("enabled") or not self._redis or not (answer or "").strip():
+            return
+        key_src = self._fast_cache_key_source(options, augmented_prompt)
+        norm = self._norm_cache_prompt(key_src)
+        pref = str(fcfg.get("key_prefix") or "harness:fast:v1:")
+        ttl = int(fcfg.get("ttl_sec", 864000))
+        key = pref + hashlib.sha256(norm.encode("utf-8")).hexdigest()
+        row = json.dumps({"n": norm, "a": answer}, ensure_ascii=False)
+
+        def _sync() -> None:
+            self._redis.set(key, answer, ex=ttl)
+            self._redis.lpush(pref + "lru", row)
+            self._redis.ltrim(pref + "lru", 0, 199)
+
+        try:
+            await asyncio.to_thread(_sync)
+        except Exception:
+            pass
+
+    def _layer_opts(self, hcfg: Dict[str, Any], layer_key: str, base: Dict[str, Any]) -> Dict[str, Any]:
+        chain = hcfg.get("refine_chain") or {}
+        lay = chain.get(layer_key) or {}
+        t = float(lay.get("temperature", 0.2))
+        return {**base, "temperature": t}
 
     def should_search(self, prompt: str, analysis: Dict[str, Any], options: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         opts = options or {}
@@ -321,7 +473,14 @@ class DualTrackHarness:
 
         if extras:
             base = f"{base} " + " ".join(extras)
-        return base.strip()
+        base = base.strip()
+        if str(analysis.get("search_intent") or "").lower() == "freshness_required":
+            y = datetime.now().year
+            for tok in (f"{y}年", "近期", "最新进展", "latest update"):
+                if tok not in base and tok.lower() not in base.lower():
+                    base = f"{base} {tok}".strip()
+                    break
+        return base
 
     def _merge_search_into_prompt(self, prompt: str, search_context: str, options: Optional[Dict[str, Any]]) -> str:
         """合并检索摘要：锚定用户表述，避免检索片段与用户所指实体不一致时被当成事实。"""
@@ -405,7 +564,8 @@ class DualTrackHarness:
             return True
         return False
 
-    async def perform_web_search(self, query: str) -> Dict[str, Any]:
+    async def perform_web_search(self, query: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        options = options or {}
         vq, fc, reason = validate_search_query((query or "").strip())
         if fc:
             return {
@@ -418,7 +578,34 @@ class DualTrackHarness:
                 "latency_ms": 0,
                 "attempts": [],
             }
-        return await self.search.search(vq)
+        sr = await self.search.search(vq)
+        if sr.get("error") or not (sr.get("sources") or []):
+            return sr
+        h = self.cfg.get("harness") or {}
+        rcfg = (h.get("search") or {}).get("relevance_filter") or {}
+        if not rcfg.get("enabled", False):
+            return sr
+        try:
+            from search_relevance import filter_sources_by_relevance, rebuild_context_from_sources
+
+            uq = str(options.get("search_prompt_base") or "")[:6000]
+            mk = str(rcfg.get("model") or "gpt-5.5")
+            kept, fmeta = await filter_sources_by_relevance(
+                self,
+                uq,
+                list(sr.get("sources") or []),
+                model_key=mk,
+                options=options,
+            )
+            if kept and len(kept) != len(sr.get("sources") or []):
+                sr["sources"] = kept
+                sr["context"] = rebuild_context_from_sources(
+                    kept, datetime.now().isoformat(timespec="seconds")
+                )
+            sr["relevance_filter_meta"] = fmeta
+        except Exception as e:
+            sr["relevance_filter_meta"] = {"error": str(e)}
+        return sr
 
     async def _fast_entry_search_step(
         self,
@@ -467,7 +654,7 @@ class DualTrackHarness:
                 None,
             )
 
-        sr = await self.perform_web_search(vq)
+        sr = await self.perform_web_search(vq, options)
         search_context = sr.get("context", "")
         sources = sr.get("sources", [])
         hard_err = sr.get("error")
@@ -531,7 +718,7 @@ class DualTrackHarness:
         vq, fc, vreason = validate_search_query(raw_q)
         if fc:
             return f"\n【入口联网】检索词未通过校验（{vreason or fc}），请依赖常识与后续审查层按需检索。\n"
-        sr = await self.perform_web_search(vq)
+        sr = await self.perform_web_search(vq, options)
         if sr.get("error"):
             return f"\n【入口联网】检索未成功：{sr.get('error')}。后续审查层仍可输出 <<ACTION: web_search(\"...\")>> 复核。\n"
         ctx = (sr.get("context") or "").strip()
@@ -566,6 +753,16 @@ class DualTrackHarness:
                 return "agent"
             analysis["agent_disabled_fallback"] = True
             analysis["fallback_reason"] = "agent_disabled_by_config"
+            return "refine"
+
+        if mode == "auto" and analysis.get("high_risk_domain"):
+            analysis["search_required"] = True
+            si_h = str(analysis.get("search_intent") or "none").lower()
+            if si_h in ("none", "optional"):
+                analysis["search_intent"] = "required"
+            if ag_enabled:
+                return "agent"
+            analysis["fallback_reason"] = analysis.get("fallback_reason") or "high_risk_agent_disabled"
             return "refine"
 
         tt = str(analysis.get("task_type") or "").strip().lower()
@@ -638,6 +835,64 @@ class DualTrackHarness:
             return True, "type_web_search"
         return False, ""
 
+    def _pick_agent_self_check_model(self, hcfg: Dict[str, Any], analysis: Dict[str, Any], agent_model: str) -> str:
+        """非空 agent_self_check_model 为强制覆盖；否则按推理向 selected → reasoning.review[0] → 主模型 → 路由默认。"""
+        scfg = hcfg.get("complexity") or {}
+        override = str(scfg.get("agent_self_check_model") or "").strip()
+        if override:
+            return override
+        raw_rk = scfg.get("self_check_reasoning_models")
+        if isinstance(raw_rk, list) and raw_rk:
+            rk = {str(x).strip() for x in raw_rk if str(x).strip()}
+        else:
+            rk = {
+                "claude-sonnet-4-6-thinking",
+                "grok-4-20-reasoning",
+                "deepseek-v4-pro",
+            }
+        sm = str(analysis.get("selected_model") or "").strip()
+        if sm and sm in rk:
+            return sm
+        tpl = hcfg.get("task_model_templates") or {}
+        rev = (tpl.get("reasoning") or {}).get("review") or []
+        if isinstance(rev, list) and rev:
+            first = str(rev[0]).strip()
+            if first:
+                return first
+        am = str(agent_model or "").strip()
+        if am:
+            return am
+        routing = self.cfg.get("routing") or {}
+        default_model = str(routing.get("default_model") or "gpt-5.5").strip()
+        dm = routing.get("default_models") or [default_model]
+        if isinstance(dm, list) and dm:
+            z = str(dm[0]).strip()
+            if z:
+                return z
+        return default_model or "gpt-5.5"
+
+    async def _agent_self_check_block(
+        self,
+        orig_q: str,
+        draft: str,
+        hcfg: Dict[str, Any],
+        analysis: Dict[str, Any],
+        options: Dict[str, Any],
+        agent_model: str,
+    ) -> str:
+        if str(analysis.get("complexity") or "").lower() != "high":
+            return ""
+        scfg = hcfg.get("complexity") or {}
+        cm = self._pick_agent_self_check_model(hcfg, analysis, agent_model)
+        sc_prompt = (
+            "请只做自检清单，不要输出对用户最终答案。\n"
+            "分两块：\n1) 我已核实或可依赖的事实\n2) 我仍不确定或需要更多证据的点\n\n"
+            f"【用户问题】\n{orig_q[:4000]}\n【草稿】\n{draft[:12000]}"
+        )
+        opts_sc = {**options, "temperature": 0.1}
+        rsc, _ = await self._ask_with_fallback([cm], sc_prompt, opts_sc, None)
+        return (rsc.content or "").strip() if rsc and rsc.success else ""
+
     async def _refine_from_draft_stream(
         self,
         question: str,
@@ -649,6 +904,7 @@ class DualTrackHarness:
         analysis: Dict[str, Any],
         *,
         meta_extra: Optional[Dict[str, Any]] = None,
+        extra_review_context: str = "",
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Agent 的 refine_answer：委托工具层 stream_refine_from_draft。"""
         async for ev in stream_refine_from_draft(
@@ -661,6 +917,7 @@ class DualTrackHarness:
             hcfg,
             analysis,
             meta_extra=meta_extra,
+            extra_review_context=extra_review_context,
         ):
             yield ev
 
@@ -697,6 +954,7 @@ class DualTrackHarness:
                     continue
                 thread_msgs.append({"role": role, "content": _msg_content_to_text(m.get("content"))})
         conv: List[Dict[str, Any]] = [{"role": "system", "content": sys_content}] + thread_msgs + [{"role": "user", "content": prompt}]
+        options.setdefault("_agent_loop_ctx", {"last_query": "", "last_ok": False})
 
         yield {
             "event": "step",
@@ -796,6 +1054,16 @@ class DualTrackHarness:
                         },
                     }
                     continue
+                extra_sc = await self._agent_self_check_block(orig_q, draft, hcfg, analysis, options, agent_model)
+                if extra_sc:
+                    yield {
+                        "event": "step",
+                        "step": {
+                            "name": "agent_self_check",
+                            "status": "ok",
+                            "meta": {**self._tag("review"), "chars": len(extra_sc)},
+                        },
+                    }
                 yield {"event": "step", "step": {"name": "agent_refine_answer", "status": "running", "meta": {}}}
                 yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
                 async for ev in self._refine_from_draft_stream(
@@ -807,6 +1075,7 @@ class DualTrackHarness:
                     hcfg,
                     analysis,
                     meta_extra={"agent_tool": "refine_answer"},
+                    extra_review_context=extra_sc,
                 ):
                     yield ev
                 yield {"event": "step", "step": {"name": "agent_refine_answer", "status": "ok"}}
@@ -836,8 +1105,9 @@ class DualTrackHarness:
                     "event": "step",
                     "step": {"name": "agent_web_search", "status": "running", "meta": {"query": vq}},
                 }
-                sr = await self.tools.web_search(vq)
+                sr = await self.tools.web_search(vq, options)
                 ctx = (sr.get("context") or "")[:12000]
+                lo = options.get("_agent_loop_ctx") or {}
                 st = Step(
                     name="agent_web_search",
                     status="error" if sr.get("error") else "ok",
@@ -845,9 +1115,22 @@ class DualTrackHarness:
                     error=sr.get("error"),
                 )
                 yield {"event": "step", "step": st.to_dict()}
-                if sr.get("error"):
-                    conv.append({"role": "user", "content": f"【观察】搜索失败：{sr.get('error')}，请换查询词或继续推理。"})
+                if sr.get("error") or not (sr.get("sources") or []):
+                    hint = ""
+                    if lo.get("last_query"):
+                        hint = (
+                            f"【系统】上一轮检索词为「{lo.get('last_query')}」。"
+                            "请换用不同角度、更泛化或拆分子问题的检索词，避免重复同一查询。"
+                        )
+                    conv.append(
+                        {
+                            "role": "user",
+                            "content": f"【观察】搜索失败或无有效结果：{sr.get('error') or 'empty'}。{hint}请换查询词或继续推理。",
+                        }
+                    )
                 else:
+                    lo["last_query"] = vq
+                    lo["last_ok"] = True
                     conv.append({"role": "user", "content": f"【观察】联网摘要：\n{ctx}\n请继续推理或给出最终答案。"})
                 continue
 
@@ -879,6 +1162,7 @@ class DualTrackHarness:
                         "meta": {"coerced_from_plain_text": True, "coerce_reason": coerce_reason},
                     },
                 }
+                extra_sc2 = await self._agent_self_check_block(prompt, draft_plain, hcfg, analysis, options, agent_model)
                 yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
                 async for ev in self._refine_from_draft_stream(
                     prompt,
@@ -893,6 +1177,7 @@ class DualTrackHarness:
                         "coerced_plain_text": True,
                         "coerce_reason": coerce_reason,
                     },
+                    extra_review_context=extra_sc2,
                 ):
                     yield ev
                 yield {
@@ -939,8 +1224,11 @@ class DualTrackHarness:
 
     async def run_stream(self, prompt: str, mode: str = "auto", options: Optional[Dict[str, Any]] = None, messages: Optional[List[Dict[str, Any]]] = None) -> AsyncGenerator[Dict[str, Any], None]:
         options = options or {}
+        if "_fast_cache_identity" not in options:
+            options["_fast_cache_identity"] = str(options.get("search_prompt_base") or prompt or "").strip()
         trace_id = options.get("trace_id") or new_trace_id()
         steps: List[Step] = []
+        self._pipeline_seq = 0
 
         hcfg = self.cfg.get("harness") or {}
         default_mode = hcfg.get("default_mode", "auto")
@@ -961,36 +1249,51 @@ class DualTrackHarness:
             )
         except asyncio.TimeoutError:
             analysis = self._analyzer_fallback_timeout(prompt)
+        sig_base = str(options.get("search_prompt_base") or prompt or "").strip()
+        analysis = self._postprocess_analysis(sig_base, analysis)
+        signals = derive_user_signals(sig_base, options)
+        analysis = merge_signals_into_analysis(analysis, signals, sig_base)
+
         step_analyze = Step(
             name="complexity_analyze",
             status="ok",
-            meta=analysis,
+            meta={**analysis, **self._tag("intake")},
             input_preview=(prompt[:240] + ("…" if len(prompt) > 240 else "")),
         )
         steps.append(step_analyze)
         yield {"event": "step", "step": step_analyze.to_dict()}
 
-        signals = derive_user_signals(prompt, options)
-        analysis = merge_signals_into_analysis(analysis, signals)
-
         yield {"event": "status", "phase": "route", "message": "正在选择处理轨道…"}
         intended_track = self._resolve_track(mode, analysis, options)
-        chosen_track = intended_track
+        chosen_track = self.apply_confidence_track_guard(mode, analysis, sig_base, intended_track)
+        if options.get("upgrade_track") and mode == "auto":
+            bump = {"fast": "refine", "refine": "agent"}
+            nt = bump.get(chosen_track)
+            if nt:
+                ag_en = bool((hcfg.get("agent") or {}).get("enabled", True))
+                if nt == "agent" and not ag_en:
+                    nt = "refine"
+                    analysis["fallback_reason"] = analysis.get("fallback_reason") or "upgrade_target_agent_disabled"
+                analysis["client_track_upgrade"] = f"{chosen_track}->{nt}"
+                chosen_track = nt
 
         step_track = Step(
             name="track_select",
             status="ok",
             meta={
+                **self._tag("routing"),
                 "mode": mode,
                 "track": chosen_track,
                 "task_type": analysis.get("task_type"),
                 "complexity": analysis.get("complexity"),
                 "decision": analysis.get("decision"),
+                "confidence": analysis.get("confidence"),
                 "search_required": analysis.get("search_required"),
                 "intended_track": intended_track,
                 "search_intent": analysis.get("search_intent"),
                 "output_intent": analysis.get("output_intent"),
                 "fallback_reason": analysis.get("fallback_reason"),
+                "high_risk_domain": analysis.get("high_risk_domain"),
             },
         )
         steps.append(step_track)
@@ -1018,20 +1321,38 @@ class DualTrackHarness:
             return
 
         if chosen_track == "fast":
+            cached = await self._try_fast_cache_hit(options, prompt)
+            if cached:
+                yield {
+                    "event": "step",
+                    "step": {
+                        "name": "fast_answer_cache",
+                        "status": "ok",
+                        "meta": {**self._tag("cache"), "chars": len(cached)},
+                    },
+                }
+                yield {"event": "stream_start", "track": "fast", "trace_id": trace_id}
+                async for s_event in self._emit_text_chunks(cached, options):
+                    yield s_event
+                return
             yield {"event": "status", "phase": "draft", "message": "正在生成回答…"}
             route = self.route_fast_model(prompt, analysis)
-            step_route = Step(name="fast_route", status="ok", meta=route)
+            step_route = Step(
+                name="fast_route",
+                status="ok",
+                meta={**route, **self._tag("draft")},
+            )
             steps.append(step_route)
             yield {"event": "step", "step": step_route.to_dict()}
 
             candidates = route.get("candidates") or [route.get("selected")]
-            
-            # Start streaming the final answer
             yield {"event": "stream_start", "track": "fast", "trace_id": trace_id}
-            
+            buf: List[str] = []
             async for s_event in self._stream_with_fallback(candidates, prompt, options, messages=messages):
                 yield s_event
-                
+                if s_event.get("event") == "chunk":
+                    buf.append(str((s_event.get("data") or {}).get("content") or ""))
+            await self._store_fast_cache_answer(options, prompt, "".join(buf))
             return
 
         # refine track
@@ -1091,7 +1412,9 @@ class DualTrackHarness:
             l1_prompt = f"【近期对话上下文参考】\n{history_text}\n\n" + l1_prompt
 
         l1_candidates = refine_models.get("draft") or [default_model]
-        r1, a1 = await self._ask_with_fallback(l1_candidates, l1_prompt, options, messages=None)
+        r1, a1 = await self._ask_with_fallback(
+            l1_candidates, l1_prompt, self._layer_opts(hcfg, "layer1", options), messages=None
+        )
         step_l1 = Step(
             name="refine_layer1_draft",
             status="ok" if r1.success else "error",
@@ -1101,7 +1424,7 @@ class DualTrackHarness:
             input_preview=l1_prompt[:240] + ("…" if len(l1_prompt) > 240 else ""),
             output=r1.content if r1.success else None,
             error=r1.error if not r1.success else None,
-            meta={"attempts": a1, "candidates": l1_candidates},
+            meta={**self._tag("draft"), "attempts": a1, "candidates": l1_candidates},
         )
         steps.append(step_l1)
         yield {"event": "step", "step": step_l1.to_dict()}
@@ -1127,7 +1450,9 @@ class DualTrackHarness:
             l2_prompt = f"【近期对话上下文参考】\n{history_text}\n\n" + l2_prompt
 
         l2_candidates = refine_models.get("review") or [default_model]
-        r2, a2 = await self._ask_with_fallback(l2_candidates, l2_prompt, options, messages=None)
+        r2, a2 = await self._ask_with_fallback(
+            l2_candidates, l2_prompt, self._layer_opts(hcfg, "layer2", options), messages=None
+        )
         if not r2.success:
             step_l2 = Step(
                 name="refine_layer2_review",
@@ -1177,7 +1502,7 @@ class DualTrackHarness:
                     "latency_ms": 0,
                 }
             else:
-                sr = await self.perform_web_search(vq)
+                sr = await self.perform_web_search(vq, options)
             snip = (sr.get("context") or "")[:8000]
             yield {
                 "event": "step",
@@ -1203,7 +1528,9 @@ class DualTrackHarness:
                 + extra_ctx
                 + "\n\n请结合上述联网信息更新审查结论；若仍需核实可再次输出 <<ACTION: web_search(\"查询词\")>>。"
             )
-            r2b, _ = await self._ask_with_fallback(l2_candidates, retry_prompt, options, messages=None)
+            r2b, _ = await self._ask_with_fallback(
+                l2_candidates, retry_prompt, self._layer_opts(hcfg, "layer2", options), messages=None
+            )
             if r2b.success:
                 review_body = (r2b.content or "").strip()
             else:
@@ -1217,7 +1544,12 @@ class DualTrackHarness:
             latency_ms=r2.latency_ms,
             input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
             output=review_body,
-            meta={"attempts": a2, "candidates": l2_candidates, "review_search_loops": search_loops},
+            meta={
+                **self._tag("review"),
+                "attempts": a2,
+                "candidates": l2_candidates,
+                "review_search_loops": search_loops,
+            },
         )
         steps.append(step_l2)
         yield {"event": "step", "step": step_l2.to_dict()}
@@ -1236,13 +1568,15 @@ class DualTrackHarness:
         l3_candidates = refine_models.get("polish") or [default_model]
         
         yield {"event": "stream_start", "track": "refine", "trace_id": trace_id}
-        async for s_event in self._stream_with_fallback(l3_candidates, l3_prompt, options, messages=messages):
+        async for s_event in self._stream_with_fallback(
+            l3_candidates, l3_prompt, self._layer_opts(hcfg, "layer3", options), messages=messages
+        ):
             yield s_event
-            
+
         step_l3 = Step(
             name="refine_layer3_polish",
             status="ok",
-            meta={"candidates": l3_candidates},
+            meta={**self._tag("polish"), "candidates": l3_candidates},
         )
         yield {"event": "step", "step": step_l3.to_dict()}
 
@@ -1250,6 +1584,7 @@ class DualTrackHarness:
         options = options or {}
         trace_id = options.get("trace_id") or new_trace_id()
         steps: List[Step] = []
+        self._pipeline_seq = 0
 
         hcfg = self.cfg.get("harness") or {}
         default_mode = hcfg.get("default_mode", "auto")
@@ -1266,20 +1601,32 @@ class DualTrackHarness:
             )
         except asyncio.TimeoutError:
             analysis = self._analyzer_fallback_timeout(prompt)
+        sig_base = str(options.get("search_prompt_base") or prompt or "").strip()
+        analysis = self._postprocess_analysis(sig_base, analysis)
+        signals = derive_user_signals(sig_base, options)
+        analysis = merge_signals_into_analysis(analysis, signals, sig_base)
+
         steps.append(
             Step(
                 name="complexity_analyze",
                 status="ok",
-                meta=analysis,
+                meta={**analysis, **self._tag("intake")},
                 input_preview=(prompt[:240] + ("…" if len(prompt) > 240 else "")),
             )
         )
 
-        signals = derive_user_signals(prompt, options)
-        analysis = merge_signals_into_analysis(analysis, signals)
-
         intended_track = self._resolve_track(mode, analysis, options)
-        chosen_track = intended_track
+        chosen_track = self.apply_confidence_track_guard(mode, analysis, sig_base, intended_track)
+        if options.get("upgrade_track") and mode == "auto":
+            bump = {"fast": "refine", "refine": "agent"}
+            nt = bump.get(chosen_track)
+            if nt:
+                ag_en = bool((hcfg.get("agent") or {}).get("enabled", True))
+                if nt == "agent" and not ag_en:
+                    nt = "refine"
+                    analysis["fallback_reason"] = analysis.get("fallback_reason") or "upgrade_target_agent_disabled"
+                analysis["client_track_upgrade"] = f"{chosen_track}->{nt}"
+                chosen_track = nt
         if chosen_track == "agent":
             # 非流式接口暂不跑 Agent 循环，降级为 Refine 三阶段
             chosen_track = "refine"
@@ -1295,13 +1642,16 @@ class DualTrackHarness:
                 name="track_select",
                 status="ok",
                 meta={
+                    **self._tag("routing"),
                     "mode": mode,
                     "track": chosen_track,
                     "task_type": analysis.get("task_type"),
+                    "confidence": analysis.get("confidence"),
                     "intended_track": intended_track,
                     "search_intent": analysis.get("search_intent"),
                     "output_intent": analysis.get("output_intent"),
                     "fallback_reason": analysis.get("fallback_reason"),
+                    "high_risk_domain": analysis.get("high_risk_domain"),
                 },
             )
         )
@@ -1414,7 +1764,9 @@ class DualTrackHarness:
         # 对于 refine 链的第一层，我们将历史消息注入，但要把 prompt 包装为 l1_prompt
         l1_prompt = f"{l1.get('instruction','').strip()}\n{entry_block}\n\n【原始问题】\n{prompt.strip()}\n"
         l1_candidates = refine_models.get("draft") or [default_model]
-        r1, a1 = await self._ask_with_fallback(l1_candidates, l1_prompt, options, messages=messages)
+        r1, a1 = await self._ask_with_fallback(
+            l1_candidates, l1_prompt, self._layer_opts(hcfg, "layer1", options), messages=messages
+        )
         steps.append(
             Step(
                 name="refine_layer1_draft",
@@ -1425,7 +1777,7 @@ class DualTrackHarness:
                 input_preview=l1_prompt[:240] + ("…" if len(l1_prompt) > 240 else ""),
                 output=r1.content if r1.success else None,
                 error=r1.error if not r1.success else None,
-                meta={"attempts": a1, "candidates": l1_candidates},
+                meta={**self._tag("draft"), "attempts": a1, "candidates": l1_candidates},
             )
         )
         if not r1.success:
@@ -1445,7 +1797,9 @@ class DualTrackHarness:
             "\n如需核实实时数据，可在审查结论中单行输出：<<ACTION: web_search(\"查询词\")>>\n"
         )
         l2_candidates = refine_models.get("review") or [default_model]
-        r2, a2 = await self._ask_with_fallback(l2_candidates, l2_prompt, options, messages=messages)
+        r2, a2 = await self._ask_with_fallback(
+            l2_candidates, l2_prompt, self._layer_opts(hcfg, "layer2", options), messages=messages
+        )
         if not r2.success:
             steps.append(
                 Step(
@@ -1492,7 +1846,7 @@ class DualTrackHarness:
                     "failure_code": vfc,
                 }
             else:
-                sr = await self.perform_web_search(vq)
+                sr = await self.perform_web_search(vq, options)
             snip = (sr.get("context") or "")[:8000]
             steps.append(
                 Step(
@@ -1511,7 +1865,9 @@ class DualTrackHarness:
                 + extra_ctx
                 + "\n\n请结合上述联网信息更新审查结论；若仍需核实可再次输出 <<ACTION: web_search(\"查询词\")>>。"
             )
-            r2b, _ = await self._ask_with_fallback(l2_candidates, retry_prompt, options, messages=messages)
+            r2b, _ = await self._ask_with_fallback(
+                l2_candidates, retry_prompt, self._layer_opts(hcfg, "layer2", options), messages=messages
+            )
             if r2b.success:
                 review_body = (r2b.content or "").strip()
             else:
@@ -1526,7 +1882,7 @@ class DualTrackHarness:
                 latency_ms=r2.latency_ms,
                 input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
                 output=review_body,
-                meta={"attempts": a2, "candidates": l2_candidates, "review_search_loops": search_loops},
+                meta={**self._tag("review"), "attempts": a2, "candidates": l2_candidates, "review_search_loops": search_loops},
             )
         )
 
@@ -1537,7 +1893,9 @@ class DualTrackHarness:
             f"【审查层答案】\n{review_body}\n"
         )
         l3_candidates = refine_models.get("polish") or [default_model]
-        r3, a3 = await self._ask_with_fallback(l3_candidates, l3_prompt, options, messages=messages)
+        r3, a3 = await self._ask_with_fallback(
+            l3_candidates, l3_prompt, self._layer_opts(hcfg, "layer3", options), messages=messages
+        )
         steps.append(
             Step(
                 name="refine_layer3_polish",
@@ -1548,7 +1906,7 @@ class DualTrackHarness:
                 input_preview=l3_prompt[:240] + ("…" if len(l3_prompt) > 240 else ""),
                 output=r3.content if r3.success else None,
                 error=r3.error if not r3.success else None,
-                meta={"attempts": a3, "candidates": l3_candidates},
+                meta={**self._tag("polish"), "attempts": a3, "candidates": l3_candidates},
             )
         )
 

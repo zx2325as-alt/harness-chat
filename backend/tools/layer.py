@@ -21,8 +21,8 @@ class HarnessTools:
     def __init__(self, harness: "DualTrackHarness"):
         self._h = harness
 
-    async def web_search(self, query: str) -> Dict[str, Any]:
-        return await web_search(self._h, query)
+    async def web_search(self, query: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return await web_search(self._h, query, options)
 
     async def stream_refine_from_draft(
         self,
