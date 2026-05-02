@@ -144,12 +144,29 @@ def create_app() -> FastAPI:
         documents = []
         for f in files:
             data = await f.read()
-            documents.append(extract_document(f.filename or "未命名文件", data).to_dict())
+            name = f.filename or "未命名文件"
+
+            def _sync_extract() -> Dict[str, Any]:
+                return extract_document(name, data).to_dict()
+
+            documents.append(await asyncio.to_thread(_sync_extract))
         return {"documents": documents}
 
     @app.get("/api/health")
     async def health() -> Dict[str, Any]:
         return {"ok": True}
+
+    @app.delete("/api/session/{session_id}/history")
+    async def clear_session_history(session_id: str) -> Dict[str, Any]:
+        """清空服务端 Redis 中该会话的上下文（与前端「清空上下文」配合）。"""
+        if not redis_client or not session_id:
+            return {"ok": True, "cleared": False, "reason": "no_redis_or_session"}
+        key = f"chat_session:{session_id}"
+        try:
+            await asyncio.to_thread(redis_client.delete, key)
+            return {"ok": True, "cleared": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     @app.post("/api/feedback")
     async def feedback(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
@@ -214,7 +231,7 @@ def create_app() -> FastAPI:
         session_id = req.session_id
         redis_key = f"chat_session:{session_id}" if session_id else None
         
-        # Build context from Redis instead of Frontend (if enabled)
+        # 优先用 Redis 中的历史（非空才覆盖）；否则用请求体，避免 Redis 空列表抹掉首轮上下文
         historical_messages = [m.model_dump() for m in req.messages]
         if redis_client and redis_key:
             try:
@@ -223,7 +240,8 @@ def create_app() -> FastAPI:
                     asyncio.to_thread(redis_client.lrange, redis_key, 0, -1),
                     timeout=2.5,
                 )
-                historical_messages = [json.loads(m) for m in cached_msgs]
+                if cached_msgs:
+                    historical_messages = [json.loads(m) for m in cached_msgs]
             except Exception as e:
                 print(f"Redis history skipped (timeout/error): {e}")
             
@@ -268,6 +286,7 @@ def create_app() -> FastAPI:
                         redis_client.rpush(redis_key, json.dumps(current_user_msg))
                         redis_client.rpush(redis_key, json.dumps({"role": "assistant", "content": final_answer}))
                         redis_client.expire(redis_key, 60 * 60 * 24 * 30)  # 30 days
+                        yield f"data: {json.dumps({'event': 'history_stored', 'session_id': session_id}, ensure_ascii=False)}\n\n"
                     except Exception as e:
                         print(f"Failed to save to redis: {e}")
                         

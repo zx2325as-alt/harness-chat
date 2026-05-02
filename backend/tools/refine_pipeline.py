@@ -25,7 +25,7 @@ async def stream_refine_from_draft(
     meta_extra: 写入各 step.meta，用于区分 agent 工具调用 / 兜底等。
     extra_review_context: 可选自检文本，仅注入审查层 prompt，不进入最终用户可见草稿。
     """
-    from harness import Step  # 运行时导入，避免与 harness 顶层循环依赖
+    from harness import Step, _pg  # 运行时导入，避免与 harness 顶层循环依赖
 
     extra_meta = dict(meta_extra or {})
     chain = hcfg.get("refine_chain") or {}
@@ -55,13 +55,17 @@ async def stream_refine_from_draft(
         input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
         output=r2.content if r2.success else None,
         error=r2.error if not r2.success else None,
-        meta={
-            **extra_meta,
-            "attempts": a2,
-            "candidates": l2_candidates,
-            "from_agent": True,
-            "pipeline_phase": "review",
-        },
+        meta=_pg(
+            {
+                **extra_meta,
+                "attempts": a2,
+                "candidates": l2_candidates,
+                "from_agent": True,
+                "pipeline_phase": "review",
+            },
+            "polishing",
+            "审查层：对照草稿与自检要点核对事实与结构…",
+        ),
     )
     yield {"event": "step", "step": step_l2.to_dict()}
     if not r2.success:
@@ -81,13 +85,17 @@ async def stream_refine_from_draft(
             "step": {
                 "name": "review_web_search",
                 "status": "running",
-                "meta": {
-                    **extra_meta,
-                    "query": q,
-                    "review_round": review_snip_loop,
-                    "phase": "审查内按需检索",
-                    "pipeline_phase": "retrieval",
-                },
+                "meta": _pg(
+                    {
+                        **extra_meta,
+                        "query": q,
+                        "review_round": review_snip_loop,
+                        "phase": "审查内按需检索",
+                        "pipeline_phase": "retrieval",
+                    },
+                    "polishing",
+                    f"审查中联网：第 {review_snip_loop} 轮「{q[:60]}{'…' if len(q) > 60 else ''}」…",
+                ),
             },
         }
         vq, vfc, vreason = validate_search_query(q)
@@ -101,20 +109,29 @@ async def stream_refine_from_draft(
         else:
             sr = await harness.perform_web_search(vq, options)
         snip = (sr.get("context") or "")[:8000]
+        rc = len(sr.get("sources") or [])
         yield {
             "event": "step",
             "step": {
                 "name": "review_web_search",
                 "status": "error" if sr.get("error") else "ok",
-                "meta": {
-                    **extra_meta,
-                    "query": q,
-                    "review_round": review_snip_loop,
-                    "phase": "审查内按需检索",
-                    "result_count": len(sr.get("sources") or []),
-                    "sources": sr.get("sources") or [],
-                    "pipeline_phase": "retrieval",
-                },
+                "meta": _pg(
+                    {
+                        **extra_meta,
+                        "query": q,
+                        "review_round": review_snip_loop,
+                        "phase": "审查内按需检索",
+                        "result_count": rc,
+                        "sources": sr.get("sources") or [],
+                        "pipeline_phase": "retrieval",
+                    },
+                    "polishing",
+                    (
+                        f"审查检索完成，约 {rc} 条来源。"
+                        if not sr.get("error")
+                        else f"审查检索失败：{sr.get('error') or 'error'}"
+                    ),
+                ),
                 "error": sr.get("error"),
             },
         }
@@ -142,11 +159,30 @@ async def stream_refine_from_draft(
         "step": {
             "name": "refine_layer3_polish",
             "status": "running",
-            "meta": {**extra_meta, "from_agent": True, "pipeline_phase": "polish"},
+            "meta": _pg(
+                {**extra_meta, "from_agent": True, "pipeline_phase": "polish"},
+                "polishing",
+                "润色层：流式生成对用户可见的最终答复…",
+            ),
         },
     }
     async for s_event in harness._stream_with_fallback(l3_candidates, l3_prompt, opts_l3, messages=messages):
         yield s_event
+
+    # 与 harness.run_stream 一致：必须补发 ok，否则前端 upsert 后「润色层」永远停在 running，
+    # 而后面的 agent_refine_answer ok / 合并后处理卡片会显示已完成，造成状态矛盾。
+    yield {
+        "event": "step",
+        "step": {
+            "name": "refine_layer3_polish",
+            "status": "ok",
+            "meta": _pg(
+                {**extra_meta, "from_agent": True, "pipeline_phase": "polish"},
+                "polishing",
+                "润色层流式输出已完成。",
+            ),
+        },
+    }
 
 
 def compile_agent_fallback_draft(conv: List[Dict[str, Any]], user_prompt: str, max_chars: int = 12000) -> str:

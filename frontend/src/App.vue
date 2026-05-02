@@ -23,9 +23,12 @@
 
     <div class="app-body">
       <aside class="sidebar" v-if="view === 'chat'">
-        <button class="new-chat-btn" @click="createNewSession">
-          <span class="icon">+</span> 新建对话
-        </button>
+        <div class="sidebar-actions">
+          <button class="new-chat-btn" @click="createNewSession">
+            <span class="icon">+</span> 新建对话
+          </button>
+          <button type="button" class="clear-ctx-btn" :disabled="busy" @click="clearSessionContext">清空上下文</button>
+        </div>
         <div class="session-list">
           <div 
             class="session-item" 
@@ -40,9 +43,10 @@
         </div>
       </aside>
 
-      <main class="main" :class="{ 'no-right': hideRightPanel }">
+      <main class="main" :class="{ 'no-right': hideRightPanel }" :style="mainGridStyle">
         <section class="left">
           <div v-if="view === 'chat'" class="chat">
+            <div v-if="chatBanner" class="chat-banner" role="status">{{ chatBanner }}</div>
             <div class="messages" ref="msgRef">
               <ChatMessage
                 v-for="m in currentMessages"
@@ -52,6 +56,8 @@
                 :meta="m.meta"
                 @edit="onEditMessage(m)"
                 @regenerate="onRegenerateMessage(m)"
+                @copy="onMessageCopy(m, $event)"
+                @retry="onRetryFromMessage(m)"
               />
             </div>
             <ChatInput
@@ -69,11 +75,22 @@
           </div>
         </section>
 
+        <div
+          v-if="view === 'chat' && showStepsPanel"
+          class="col-resizer"
+          title="拖拽调整执行面板宽度"
+          @mousedown.prevent="onPanelResizeStart"
+        />
         <aside v-if="view === 'chat' && showStepsPanel" class="right">
           <div class="panelHeader">
             <div class="panelTitle">执行过程</div>
           </div>
-          <StepDisplay class="steps-panel-inner" :runs="currentStepRuns" :render-tick="stepUiTick" />
+          <StepDisplay
+            ref="stepDisplay"
+            class="steps-panel-inner"
+            :runs="currentStepRuns"
+            :render-tick="stepUiTick"
+          />
         </aside>
       </main>
     </div>
@@ -86,6 +103,15 @@ import ChatMessage from "./components/ChatMessage.vue";
 import StepDisplay from "./components/StepDisplay.vue";
 import ConfigView from "./components/ConfigView.vue";
 import { API_BASE } from "./apiBase.js";
+import { sendFeedback } from "./feedbackApi.js";
+import {
+  idbSessionsSupported,
+  loadSessionsJsonFromIdb,
+  saveSessionsJsonToIdb,
+} from "./idbSessions.js";
+
+/** SSE 在这么长时间内完全无事件则客户端主动断开（有 step/status 等即会刷新） */
+const CHAT_STREAM_IDLE_MS = 180000;
 
 export default {
   name: "App",
@@ -104,12 +130,23 @@ export default {
       abortController: null,
       stepUiTick: 0,
       showStepsPanel: true,
-      /** 流式期间防抖写入 localStorage，避免阻塞渲染导致「执行过程」整段结束后才刷新 */
+      rightPanelWidth: 320,
+      chatBanner: "",
+      /** 服务端 Redis 已持久化本轮后，后续请求可省略 messages 体积 */
       _saveSessionsTimer: null,
       _scrollBottomPending: false,
+      _panelResize: null,
+      _streamIdleTimer: null,
+      _dwellTimer: null,
+      _lastChunkAt: 0,
     };
   },
   computed: {
+    mainGridStyle() {
+      if (this.view !== "chat" || !this.showStepsPanel) return {};
+      const w = Math.min(520, Math.max(240, this.rightPanelWidth));
+      return { gridTemplateColumns: `minmax(0, 1fr) 5px ${w}px` };
+    },
     hideRightPanel() {
       return this.view !== "chat" || !this.showStepsPanel;
     },
@@ -125,15 +162,27 @@ export default {
       return this.currentSession.stepRuns;
     },
   },
-  mounted() {
+  async mounted() {
     this.loadConfig();
-    this.loadSessions();
+    await this.loadSessionsFromStorage();
     try {
       const v = localStorage.getItem("harness_show_steps");
       if (v === "0") this.showStepsPanel = false;
+      const pw = parseInt(localStorage.getItem("harness_panel_w") || "", 10);
+      if (!Number.isNaN(pw) && pw >= 200) this.rightPanelWidth = pw;
     } catch (_) {
       /* ignore */
     }
+    this._dwellTimer = setInterval(() => {
+      if (this.view === "chat" && this.currentSessionId && !this.busy) {
+        sendFeedback("session_tick", { session_id: this.currentSessionId, idle: true });
+      }
+    }, 120000);
+  },
+  beforeUnmount() {
+    if (this._dwellTimer) clearInterval(this._dwellTimer);
+    if (this._streamIdleTimer) clearInterval(this._streamIdleTimer);
+    this._detachPanelResize();
   },
   watch: {
     showStepsPanel(val) {
@@ -145,14 +194,42 @@ export default {
     },
   },
   methods: {
-    loadSessions() {
+    async loadSessionsFromStorage() {
+      let raw = null;
       try {
-        const saved = localStorage.getItem("harness_sessions");
-        if (saved) {
-          this.sessions = JSON.parse(saved);
+        if (await idbSessionsSupported()) {
+          raw = await loadSessionsJsonFromIdb();
         }
-      } catch(e) {
-        console.error("Failed to load sessions", e);
+      } catch (e) {
+        console.warn("IndexedDB load skipped:", e);
+      }
+      if (!raw) {
+        try {
+          raw = localStorage.getItem("harness_sessions");
+        } catch (_) {
+          /* ignore */
+        }
+      }
+      if (raw) {
+        try {
+          this.sessions = JSON.parse(raw);
+        } catch (e) {
+          console.error("Failed to parse sessions", e);
+          this.sessions = [];
+        }
+        try {
+          if (await idbSessionsSupported()) {
+            await saveSessionsJsonToIdb(raw);
+            try {
+              localStorage.setItem("harness_sessions_idb", "1");
+              localStorage.removeItem("harness_sessions");
+            } catch (_) {
+              /* ignore */
+            }
+          }
+        } catch (e) {
+          console.warn("Migrate sessions to IDB failed:", e);
+        }
       }
       if (this.sessions.length === 0) {
         this.createNewSession();
@@ -161,13 +238,63 @@ export default {
       }
       this.sessions.forEach((s) => {
         if (!s.stepRuns) s.stepRuns = [];
+        if (s.useServerHistoryOnly == null) s.useServerHistoryOnly = false;
       });
     },
     saveSessions() {
+      const payload = JSON.stringify(this.sessions);
+      const persist = async () => {
+        try {
+          if (await idbSessionsSupported()) {
+            await saveSessionsJsonToIdb(payload);
+            try {
+              localStorage.setItem("harness_sessions_idb", "1");
+              localStorage.removeItem("harness_sessions");
+            } catch (_) {
+              /* ignore */
+            }
+            return;
+          }
+        } catch (e) {
+          console.warn("IndexedDB save failed, fallback localStorage:", e);
+        }
+        try {
+          localStorage.setItem("harness_sessions", payload);
+        } catch (e) {
+          if (e && e.name === "QuotaExceededError") {
+            this._pruneSessionsForQuota();
+            try {
+              localStorage.setItem("harness_sessions", JSON.stringify(this.sessions));
+            } catch (e2) {
+              console.error("Failed to save sessions after prune", e2);
+            }
+          } else {
+            console.error("Failed to save sessions", e);
+          }
+        }
+      };
+      persist().catch((e) => console.error("saveSessions persist", e));
+    },
+    _pruneSessionsForQuota() {
+      while (this.sessions.length > 1) {
+        const rm = this.sessions.pop();
+        if (rm && rm.id === this.currentSessionId && this.sessions[0]) {
+          this.currentSessionId = this.sessions[0].id;
+        }
+      }
+      const s = this.sessions[0];
+      if (s && s.messages && s.messages.length > 40) {
+        s.messages = s.messages.slice(-40);
+      }
+      if (s && s.stepRuns && s.stepRuns.length > 15) {
+        s.stepRuns = s.stepRuns.slice(-15);
+      }
+    },
+    newSessionId() {
       try {
-        localStorage.setItem("harness_sessions", JSON.stringify(this.sessions));
-      } catch(e) {
-        console.error("Failed to save sessions", e);
+        return crypto.randomUUID();
+      } catch (_) {
+        return `session-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
       }
     },
     scheduleSaveSessions() {
@@ -194,9 +321,10 @@ export default {
     },
     createNewSession() {
       const newSession = {
-        id: `session-${Date.now()}`,
+        id: this.newSessionId(),
         messages: [],
         stepRuns: [],
+        useServerHistoryOnly: false,
       };
       this.sessions.unshift(newSession);
       this.currentSessionId = newSession.id;
@@ -305,6 +433,196 @@ export default {
     bumpStepUi() {
       this.stepUiTick += 1;
     },
+    _userContentToPrompt(content) {
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) return content;
+      return String(content ?? "");
+    },
+    /** 供 API 的历史条：不含当前用户句；若 useServerHistoryOnly 则发空数组由 Redis 补全 */
+    buildHistoryForApi(lastUser, pendingId) {
+      const uid = lastUser && lastUser.id;
+      const rows = this.currentSession.messages.filter(
+        (m) =>
+          (m.role === "user" || m.role === "assistant") &&
+          !m.meta?.pending &&
+          !m.meta?.error &&
+          m.id !== pendingId &&
+          (!uid || m.id !== uid)
+      );
+      const mapped = rows.map((m) => ({ role: m.role, content: m.content }));
+      if (this.currentSession.useServerHistoryOnly) return [];
+      return mapped;
+    },
+    _computeModelChainFromRun(run) {
+      const labels = {
+        refine_layer1_draft: "初稿",
+        refine_layer2_review: "审查",
+        refine_layer3_polish: "润色",
+        agent_iteration: "Agent",
+        fast_route: "快轨",
+      };
+      const parts = [];
+      (run.steps || []).forEach((s) => {
+        if (s.status === "ok" && s.model) {
+          const lb = labels[s.name] || s.name;
+          parts.push(`${lb}:${s.model}`);
+        }
+      });
+      return parts.length ? parts.join(" → ") : "";
+    },
+    _sseReconnectDelayMs(attemptIdx) {
+      const base = 700 * Math.pow(2, attemptIdx);
+      return Math.min(32000, base + Math.random() * 500);
+    },
+    async _applyStreamSseEvent(event, ctx, bundle) {
+      const { run, pending, lastUser, documents, searchMode } = bundle;
+      // 任意 SSE 业务事件都应刷新空闲计时：仅在有 chunk 正文时刷新会导致
+      // 预判/联网/Agent 推理/精化层等长时间无流式正文时被误判为断流并 abort。
+      this._lastChunkAt = Date.now();
+      if (event.event === "trace") {
+        run.traceId = event.trace_id;
+        if (event.track) {
+          run.track = event.track;
+          pending.meta.track = event.track;
+        }
+        this.bumpStepUi();
+        await this.$nextTick();
+      } else if (event.event === "status") {
+        run.phase = event.phase || "";
+        run.phaseMessage = event.message || "";
+        this.bumpStepUi();
+        await this.$nextTick();
+      } else if (event.event === "step") {
+        this.upsertStep(run, event.step);
+        const st = event.step || {};
+        const meta = st.meta || {};
+        if (st.name === "track_select" && meta.agent_disabled_fallback) {
+          this.chatBanner = "您选择了 Agent 轨，但当前配置已关闭 Agent，已自动使用精化轨。";
+        }
+        if (st.name === "web_search" && (meta.degraded || meta.failure_code) && st.status === "ok") {
+          this.chatBanner =
+            "联网检索未完全成功（已降级或跳过），回答中的实时信息可能不完整。详见右侧「执行过程」。";
+        }
+        await this.$nextTick();
+        this.scheduleScrollBottom();
+      } else if (event.event === "stream_start") {
+        run.track = event.track;
+        run.traceId = event.trace_id;
+        pending.meta.track = event.track;
+        this.bumpStepUi();
+        await this.$nextTick();
+      } else if (event.event === "model_start") {
+        ctx.finalMeta.model = event.model;
+        ctx.finalMeta.provider = event.provider;
+      } else if (event.event === "model_end") {
+        ctx.finalMeta.latency_ms = event.latency_ms || 0;
+      } else if (event.event === "model_error") {
+        ctx.modelErrors.push(`${event.model || "?"}: ${event.error || "失败"}`);
+        run.phaseMessage = `模型重试中…（${ctx.modelErrors.length} 次失败）`;
+        this.bumpStepUi();
+      } else if (event.event === "chunk") {
+        const data = event.data || {};
+        if (data.content) {
+          ctx.finalContent += data.content;
+          pending.content = ctx.finalContent;
+          this.scheduleScrollBottom();
+        }
+      } else if (event.event === "history_stored") {
+        this.currentSession.useServerHistoryOnly = true;
+      } else if (event.event === "error") {
+        ctx.streamFailed = true;
+        run.status = "error";
+        this.bumpStepUi();
+        this.flushSaveSessions();
+        throw new Error(event.error);
+      }
+    },
+    async _pumpChatSseReader(reader, decoder, ctx, bundle) {
+      while (!ctx.receivedDone && !ctx.streamFailed) {
+        let chunk;
+        try {
+          chunk = await reader.read();
+        } catch (e) {
+          if (e && e.name === "AbortError") throw e;
+          throw new Error((e && e.message) || String(e));
+        }
+        if (chunk.done) return false;
+        ctx.buffer += decoder.decode(chunk.value, { stream: true });
+        const lines = ctx.buffer.split("\n");
+        ctx.buffer = lines.pop() || "";
+        for (const lineRaw of lines) {
+          const line = lineRaw.trim();
+          if (!line || !line.startsWith("data: ")) continue;
+          const dataStr = line.substring(6);
+          if (dataStr === "[DONE]") {
+            ctx.receivedDone = true;
+            return true;
+          }
+          let event;
+          try {
+            event = JSON.parse(dataStr);
+          } catch (e) {
+            console.error("SSE parse error", e);
+            continue;
+          }
+          await this._applyStreamSseEvent(event, ctx, bundle);
+          if (ctx.receivedDone || ctx.streamFailed) return true;
+        }
+      }
+      return !!ctx.receivedDone;
+    },
+    onPanelResizeStart(e) {
+      const startX = e.clientX;
+      const startW = this.rightPanelWidth;
+      const onMove = (ev) => {
+        const dx = startX - ev.clientX;
+        this.rightPanelWidth = Math.min(520, Math.max(240, startW + dx));
+      };
+      const onUp = () => {
+        this._detachPanelResize();
+        try {
+          localStorage.setItem("harness_panel_w", String(this.rightPanelWidth));
+        } catch (_) {
+          /* ignore */
+        }
+      };
+      this._panelResize = { onMove, onUp };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp, { once: true });
+    },
+    _detachPanelResize() {
+      if (!this._panelResize) return;
+      window.removeEventListener("pointermove", this._panelResize.onMove);
+      this._panelResize = null;
+    },
+    async clearSessionContext() {
+      if (this.busy || !this.currentSession) return;
+      this.currentSession.messages = [];
+      this.currentSession.stepRuns = [];
+      this.currentSession.useServerHistoryOnly = false;
+      this.chatBanner = "";
+      try {
+        await fetch(`${API_BASE}/api/session/${encodeURIComponent(this.currentSession.id)}/history`, {
+          method: "DELETE",
+        });
+      } catch (_) {
+        /* ignore */
+      }
+      this.saveSessions();
+      sendFeedback("clear_context", { session_id: this.currentSession.id });
+    },
+    onMessageCopy(msg, detail) {
+      sendFeedback("copy_answer", {
+        session_id: this.currentSession && this.currentSession.id,
+        message_id: msg && msg.id,
+        ...(detail || {}),
+      });
+    },
+    onRetryFromMessage(msg) {
+      const ctx = msg && msg.meta && msg.meta.resumeContext;
+      if (!ctx || this.busy) return;
+      this._triggerStream({ ...ctx, upgradeTrack: false });
+    },
     async onSend(payload) {
       if (!payload || this.busy) return;
       if (!this.currentSession) this.createNewSession();
@@ -328,15 +646,18 @@ export default {
         documents: userMsg.meta.documents,
         searchMode: userMsg.meta.searchMode,
         userMsg,
+        upgradeTrack: false,
       });
     },
     async _triggerStream(context = null) {
       this.busy = true;
       this.abortController = new AbortController();
+      this.chatBanner = "";
 
       const lastUser = context?.userMsg || [...this.currentSession.messages].reverse().find((m) => m.role === "user");
       const documents = context?.documents || lastUser?.meta?.documents || [];
       const searchMode = context?.searchMode || lastUser?.meta?.searchMode || "auto";
+      const upgradeTrack = Boolean(context?.upgradeTrack);
       const run = this.createStepRun(lastUser || { content: "" }, documents, searchMode);
 
       const pending = {
@@ -348,125 +669,172 @@ export default {
       this.currentSession.messages.push(pending);
       this.scrollToBottom();
 
+      const promptBody = this._userContentToPrompt(lastUser && lastUser.content);
+      const modelErrors = [];
+
       try {
-        const history = this.currentSession.messages
-          .filter((m) => (m.role === "user" || m.role === "assistant") && !m.meta?.pending && !m.meta?.error && m.id !== pending.id)
-          .map((m) => ({ role: m.role, content: m.content }));
-
-        const r = await fetch(`${API_BASE}/api/chat/stream`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            session_id: this.currentSession.id,
-            prompt: "",
-            messages: history,
-            mode: this.mode,
-            options: {
-              documents,
-              search_mode: searchMode,
-              stream_slice_chars: 6,
-            },
-          }),
-          signal: this.abortController.signal,
+        const history = this.buildHistoryForApi(lastUser, pending.id);
+        const reqBody = JSON.stringify({
+          session_id: this.currentSession.id,
+          prompt: promptBody,
+          messages: history,
+          mode: this.mode,
+          options: {
+            documents,
+            search_mode: searchMode,
+            stream_slice_chars: 6,
+            upgrade_track: upgradeTrack,
+            prefer_server_history: Boolean(this.currentSession.useServerHistoryOnly),
+          },
         });
-        if (!r.ok) {
-          const t = await r.text();
-          throw new Error(`HTTP ${r.status}: ${t}`);
-        }
 
-        const reader = r.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        let finalContent = "";
-        let finalMeta = { track: "", provider: "", model: "", success: true, latency_ms: 0 };
-        let streamFailed = false;
-        let receivedDone = false;
+        const ctx = {
+          buffer: "",
+          receivedDone: false,
+          streamFailed: false,
+          finalContent: "",
+          finalMeta: { track: "", provider: "", model: "", success: true, latency_ms: 0, model_chain: "" },
+          modelErrors,
+        };
+        const bundle = { run, pending, lastUser, documents, searchMode };
+        const MAX_SSE_CONNECTS = 8;
 
         pending.content = "";
         pending.meta = { ...pending.meta, streaming: true, track: "" };
+        this._lastChunkAt = Date.now();
+        if (this._streamIdleTimer) clearInterval(this._streamIdleTimer);
+        this._streamIdleTimer = setInterval(() => {
+          if (Date.now() - this._lastChunkAt > CHAT_STREAM_IDLE_MS) {
+            if (this.abortController) this.abortController.abort();
+          }
+        }, 4000);
 
-        while (!receivedDone) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-
-          const lines = buffer.split("\n");
-          buffer = lines.pop();
-
-          for (let line of lines) {
-            line = line.trim();
-            if (!line) continue;
-            if (!line.startsWith("data: ")) continue;
-            const dataStr = line.substring(6);
-            if (dataStr === "[DONE]") {
-              receivedDone = true;
-              break;
-            }
-
-            let event;
-            try {
-              event = JSON.parse(dataStr);
-            } catch (e) {
-              console.error("SSE parse error", e);
-              continue;
-            }
-
-            if (event.event === "trace") {
-              run.traceId = event.trace_id;
-              if (event.track) {
-                run.track = event.track;
-                pending.meta.track = event.track;
-              }
-              this.bumpStepUi();
-              await this.$nextTick();
-            } else if (event.event === "status") {
-              run.phase = event.phase || "";
-              run.phaseMessage = event.message || "";
-              this.bumpStepUi();
-              await this.$nextTick();
-            } else if (event.event === "step") {
-              this.upsertStep(run, event.step);
-              await this.$nextTick();
-              this.scheduleScrollBottom();
-            } else if (event.event === "stream_start") {
-              run.track = event.track;
-              run.traceId = event.trace_id;
-              pending.meta.track = event.track;
-              this.bumpStepUi();
-              await this.$nextTick();
-            } else if (event.event === "model_start") {
-              finalMeta.model = event.model;
-              finalMeta.provider = event.provider;
-            } else if (event.event === "model_end") {
-              finalMeta.latency_ms = event.latency_ms || 0;
-            } else if (event.event === "chunk") {
-              const data = event.data || {};
-              if (data.content) {
-                finalContent += data.content;
-                pending.content = finalContent;
-                this.scheduleScrollBottom();
-              }
-            } else if (event.event === "error") {
-              streamFailed = true;
-              run.status = "error";
+        let lastConnectError = null;
+        for (let attempt = 0; attempt < MAX_SSE_CONNECTS && !ctx.receivedDone && !ctx.streamFailed; attempt++) {
+          if (attempt > 0) {
+            if (ctx.finalContent.length > 0) {
+              pending.content +=
+                "\n\n[流传输中断；为避免重复生成，已停止自动重连。请点击「重试」或重新发送。]";
+              pending.meta.streaming = false;
+              pending.meta.stopped = true;
+              pending.meta.resumeContext = { userMsg: lastUser, documents, searchMode };
+              run.status = "stopped";
+              run.phaseMessage = "流传输中断";
               this.bumpStepUi();
               this.flushSaveSessions();
-              throw new Error(event.error);
+              break;
+            }
+            const waitMs = this._sseReconnectDelayMs(attempt - 1);
+            run.phaseMessage = `网络中断，${Math.round(waitMs / 100) / 10}s 后自动重连 (${attempt}/${MAX_SSE_CONNECTS - 1})…`;
+            this.chatBanner = "连接不稳定，正在自动重连…";
+            this.bumpStepUi();
+            await new Promise((r) => setTimeout(r, waitMs));
+            ctx.buffer = "";
+          }
+
+          let res;
+          try {
+            res = await fetch(`${API_BASE}/api/chat/stream`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: reqBody,
+              signal: this.abortController.signal,
+            });
+          } catch (fe) {
+            lastConnectError = fe;
+            if (fe && fe.name === "AbortError") throw fe;
+            if (attempt === MAX_SSE_CONNECTS - 1) throw fe;
+            continue;
+          }
+
+          if (!res.ok) {
+            const t = await res.text().catch(() => "");
+            lastConnectError = new Error(`HTTP ${res.status}: ${t}`);
+            if (attempt === MAX_SSE_CONNECTS - 1) throw lastConnectError;
+            continue;
+          }
+
+          const reader = res.body && res.body.getReader();
+          if (!reader) {
+            lastConnectError = new Error("响应无可读流");
+            if (attempt === MAX_SSE_CONNECTS - 1) throw lastConnectError;
+            continue;
+          }
+
+          const decoder = new TextDecoder();
+          try {
+            const completed = await this._pumpChatSseReader(reader, decoder, ctx, bundle);
+            if (ctx.receivedDone || ctx.streamFailed) break;
+            if (!completed && ctx.finalContent.length > 0) {
+              pending.content +=
+                "\n\n[流传输中断；为避免重复生成，已停止自动重连。请点击「重试」或重新发送。]";
+              pending.meta.streaming = false;
+              pending.meta.stopped = true;
+              pending.meta.resumeContext = { userMsg: lastUser, documents, searchMode };
+              run.status = "stopped";
+              run.phaseMessage = "流传输中断";
+              this.bumpStepUi();
+              this.flushSaveSessions();
+              break;
+            }
+            if (!completed && ctx.finalContent.length === 0) {
+              lastConnectError = new Error("连接在收到内容前关闭");
+              if (attempt === MAX_SSE_CONNECTS - 1) throw lastConnectError;
+            }
+          } catch (readErr) {
+            lastConnectError = readErr;
+            if (readErr && readErr.name === "AbortError") throw readErr;
+            if (ctx.finalContent.length > 0) {
+              pending.content +=
+                "\n\n[流传输中断；为避免重复生成，已停止自动重连。请点击「重试」或重新发送。]";
+              pending.meta.streaming = false;
+              pending.meta.stopped = true;
+              pending.meta.resumeContext = { userMsg: lastUser, documents, searchMode };
+              run.status = "stopped";
+              run.phaseMessage = "流传输中断";
+              this.bumpStepUi();
+              this.flushSaveSessions();
+              break;
+            }
+            if (attempt === MAX_SSE_CONNECTS - 1) throw readErr;
+          } finally {
+            try {
+              await reader.cancel("close_or_reconnect");
+            } catch (_) {
+              /* ignore */
             }
           }
         }
 
+        if (lastConnectError && !ctx.receivedDone && !ctx.streamFailed && ctx.finalContent.length === 0) {
+          throw lastConnectError;
+        }
+
         pending.meta.streaming = false;
-        pending.meta = { ...pending.meta, ...finalMeta };
-        if (!streamFailed && run.status !== "error" && run.status !== "stopped") {
+        ctx.finalMeta.model_chain = this._computeModelChainFromRun(run) || ctx.finalMeta.model_chain;
+        pending.meta = { ...pending.meta, ...ctx.finalMeta };
+        if (!ctx.streamFailed && run.status !== "error" && run.status !== "stopped") {
           run.status = "ok";
         }
         this.bumpStepUi();
         this.flushSaveSessions();
       } catch (e) {
+        if (this._streamIdleTimer) {
+          clearInterval(this._streamIdleTimer);
+          this._streamIdleTimer = null;
+        }
         if (e.name === "AbortError") {
+          const idle = Date.now() - this._lastChunkAt > CHAT_STREAM_IDLE_MS - 10000;
           pending.meta.streaming = false;
-          pending.content += "\n\n[用户已中断响应]";
+          pending.content += idle
+            ? "\n\n[长时间无任何服务端推送，已中止连接；若模型仍在推理，可稍后重试。]"
+            : "\n\n[用户已中断响应]";
+          pending.meta.stopped = true;
+          pending.meta.resumeContext = {
+            userMsg: lastUser,
+            documents,
+            searchMode,
+          };
           run.status = "stopped";
           this.bumpStepUi();
           this.flushSaveSessions();
@@ -481,6 +849,10 @@ export default {
           this.flushSaveSessions();
         }
       } finally {
+        if (this._streamIdleTimer) {
+          clearInterval(this._streamIdleTimer);
+          this._streamIdleTimer = null;
+        }
         this.busy = false;
         this.bumpStepUi();
         this.flushSaveSessions();
@@ -497,13 +869,24 @@ export default {
       const idx = this.currentSession.messages.findIndex((m) => m.id === msg.id);
       if (idx >= 0) {
         let text = "";
-        if (typeof msg.content === 'string') text = msg.content;
-        else if (Array.isArray(msg.content)) text = msg.content.filter(c=>c.type==='text').map(c=>c.text).join('\n');
-        
+        const images = [];
+        if (typeof msg.content === "string") text = msg.content;
+        else if (Array.isArray(msg.content)) {
+          msg.content.forEach((c) => {
+            if (c && c.type === "text") text += (text ? "\n" : "") + (c.text || "");
+            if (c && c.type === "image_url" && c.image_url && c.image_url.url) {
+              images.push({ url: c.image_url.url, name: "图片", type: "image/png" });
+            }
+          });
+        }
         this.currentSession.messages.splice(idx);
         this.saveSessions();
-        if (this.$refs.chatInput) {
-          this.$refs.chatInput.draft = text;
+        if (this.$refs.chatInput && this.$refs.chatInput.prefillFromUserEdit) {
+          this.$refs.chatInput.prefillFromUserEdit({
+            text,
+            images,
+            documents: (msg.meta && msg.meta.documents) || [],
+          });
         }
       }
     },
@@ -514,10 +897,12 @@ export default {
         const lastUser = this.currentSession.messages.slice(0, idx).reverse().find((m) => m.role === "user");
         this.currentSession.messages.splice(idx);
         this.saveSessions();
+        sendFeedback("regenerate", { session_id: this.currentSession.id, message_id: msg.id });
         this._triggerStream({
           userMsg: lastUser,
           documents: lastUser?.meta?.documents || [],
           searchMode: lastUser?.meta?.searchMode || "auto",
+          upgradeTrack: true,
         });
       }
     },
@@ -607,8 +992,14 @@ export default {
   display: flex;
   flex-direction: column;
 }
-.new-chat-btn {
+.sidebar-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   margin: 14px;
+}
+.new-chat-btn {
+  margin: 0;
   padding: 10px 14px;
   background: linear-gradient(135deg, #4f46e5, #6366f1);
   border: none;
@@ -629,6 +1020,23 @@ export default {
 .new-chat-btn .icon {
   font-size: 16px;
   line-height: 1;
+}
+.clear-ctx-btn {
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid #3d4d64;
+  background: #252d3d;
+  color: #94a3b8;
+  font-size: 12px;
+  cursor: pointer;
+}
+.clear-ctx-btn:hover:not(:disabled) {
+  border-color: #64748b;
+  color: #e2e8f0;
+}
+.clear-ctx-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 .session-list {
   flex: 1;
@@ -679,9 +1087,20 @@ export default {
 .main {
   flex: 1;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 392px;
+  grid-template-columns: minmax(0, 1fr);
   gap: 0;
   min-height: 0;
+}
+.col-resizer {
+  width: 5px;
+  cursor: col-resize;
+  background: #1e2433;
+  border-left: 1px solid #2f3a4d;
+  border-right: 1px solid #2f3a4d;
+  flex-shrink: 0;
+}
+.col-resizer:hover {
+  background: rgba(99, 102, 241, 0.15);
 }
 .main.no-right {
   grid-template-columns: 1fr;
@@ -724,6 +1143,17 @@ export default {
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+.chat-banner {
+  flex-shrink: 0;
+  margin: 0 16px 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  color: #fcd34d;
+  font-size: 13px;
+  line-height: 1.45;
 }
 .messages {
   flex: 1;

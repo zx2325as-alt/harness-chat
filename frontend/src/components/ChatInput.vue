@@ -5,6 +5,14 @@
         <div class="att-item" v-for="(att, idx) in attachments" :key="idx">
           <span class="att-name">{{ att.name }}</span>
           <span class="att-status" :class="att.status">{{ statusLabel(att.status) }}</span>
+          <button
+            v-if="att.status === 'error' && att.kind === 'document' && att.file"
+            type="button"
+            class="att-retry"
+            @click="retryParse(idx)"
+          >
+            重试
+          </button>
           <button type="button" class="att-del" @click="removeAttachment(idx)" aria-label="移除">×</button>
         </div>
       </div>
@@ -56,6 +64,7 @@
               type="button"
               class="dd-trigger"
               :disabled="busy"
+              :title="searchModeHint"
               aria-haspopup="listbox"
               :aria-expanded="openMenu === 'search'"
               @click.stop="toggleMenu('search')"
@@ -129,9 +138,9 @@ const MODE_OPTIONS = [
 ];
 
 const SEARCH_OPTIONS = [
-  { value: "auto", label: "自动" },
-  { value: "on", label: "开启" },
-  { value: "off", label: "关闭" },
+  { value: "auto", label: "自动（快轨）" },
+  { value: "on", label: "开启（快轨）" },
+  { value: "off", label: "关闭（快轨）" },
 ];
 
 export default {
@@ -157,6 +166,9 @@ export default {
     },
     searchLabel() {
       return SEARCH_OPTIONS.find((o) => o.value === this.searchMode)?.label ?? this.searchMode;
+    },
+    searchModeHint() {
+      return "仅影响「快速轨」入口是否做前置联网检索；精化轨 / Agent 仍按内部逻辑按需搜索。";
     },
   },
   watch: {
@@ -197,6 +209,59 @@ export default {
     removeAttachment(idx) {
       this.attachments.splice(idx, 1);
     },
+    async retryParse(idx) {
+      const att = this.attachments[idx];
+      if (!att || att.kind !== "document" || !att.file || this.busy) return;
+      att.status = "parsing";
+      att.error = "";
+      const form = new FormData();
+      form.append("files", att.file);
+      try {
+        const res = await fetch(`${API_BASE}/api/documents/parse`, {
+          method: "POST",
+          body: form,
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const doc = (data.documents || [])[0];
+        if (doc) {
+          att.doc = doc;
+          att.status = doc.status === "ok" ? "ok" : "error";
+        } else {
+          att.status = "error";
+        }
+      } catch (err) {
+        att.status = "error";
+        att.error = String(err?.message || err);
+      }
+    },
+    /** 从用户消息恢复输入区（编辑 / 多模态） */
+    prefillFromUserEdit({ text = "", images = [], documents = [] }) {
+      this.draft = text;
+      this.attachments = [];
+      (images || []).forEach((im) => {
+        if (im && im.url) {
+          this.attachments.push({
+            name: im.name || "图片",
+            kind: "image",
+            type: im.type || "image/png",
+            data: im.url,
+            status: "ok",
+          });
+        }
+      });
+      (documents || []).forEach((d) => {
+        if (d && d.name) {
+          this.attachments.push({
+            name: d.name,
+            kind: "document",
+            status: d.status === "ok" ? "ok" : "error",
+            doc: d.status === "ok" ? d : null,
+            error: d.error,
+          });
+        }
+      });
+    },
     async onFileChange(e) {
       const files = e.target.files;
       if (!files || !files.length) return;
@@ -228,7 +293,7 @@ export default {
       const form = new FormData();
       docFiles.forEach((f) => form.append("files", f));
       docFiles.forEach((f) =>
-        this.attachments.push({ name: f.name, kind: "document", status: "parsing", doc: null })
+        this.attachments.push({ name: f.name, kind: "document", status: "parsing", doc: null, file: f })
       );
       const parseSlotsStart = this.attachments.length - docFiles.length;
 
@@ -340,6 +405,19 @@ export default {
 }
 .att-status.error {
   color: #fca5a5;
+}
+.att-retry {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid #4b5c78;
+  background: #2f3a4d;
+  color: #a5b4fc;
+  cursor: pointer;
+}
+.att-retry:hover {
+  border-color: rgba(129, 140, 248, 0.5);
+  color: #e0e7ff;
 }
 .att-del {
   background: none;

@@ -36,6 +36,40 @@ def _msg_content_to_text(content: Any) -> str:
     return str(content or "")
 
 
+def _format_messages_snippet(messages: Optional[List[Dict[str, Any]]], n: int = 4) -> str:
+    if not messages:
+        return ""
+    return "\n".join(
+        f"{m.get('role')}: {_msg_content_to_text(m.get('content'))}" for m in messages[-n:]
+    )
+
+
+def _pg(meta: Optional[Dict[str, Any]], phase_group: str, event_summary: str) -> Dict[str, Any]:
+    """为步骤 meta 注入前端分组与叙事摘要。"""
+    m = dict(meta or {})
+    m["phase_group"] = phase_group
+    m["event_summary"] = event_summary
+    return m
+
+
+def _analyze_step_summary(analysis: Dict[str, Any]) -> str:
+    tt = str(analysis.get("task_type") or "通用")
+    cx = str(analysis.get("complexity") or "—")
+    dec = str(analysis.get("decision") or "").strip()
+    tail = f"；调度倾向：{dec}" if dec else ""
+    return f"归类「{tt}」、复杂度「{cx}」{tail}。"
+
+
+def _track_select_summary(chosen: str, intended: str, analysis: Dict[str, Any]) -> str:
+    names = {"fast": "快速答复", "refine": "草稿→审查→润色", "agent": "Agent 多轮推理"}
+    base = names.get(chosen, chosen or "—")
+    sm = str(analysis.get("selected_model") or "").strip()
+    extra = f" 主选模型：{sm}。" if sm else ""
+    if intended and str(intended) != str(chosen):
+        return f"原计划「{names.get(intended, intended)}」，实际执行「{base}」。{extra}".strip()
+    return f"执行路径：「{base}」。{extra}".strip()
+
+
 @dataclass
 class Step:
     name: str
@@ -623,14 +657,18 @@ class DualTrackHarness:
         raw_q = self.build_search_query(prompt, analysis, options)
         vq, fc, vreason = validate_search_query(raw_q)
         if fc:
-            meta = {
-                "query": raw_q,
-                "query_effective": None,
-                "reason": search_reason,
-                "failure_code": fc,
-                "skipped": True,
-                "validate_only": True,
-            }
+            meta = _pg(
+                {
+                    "query": raw_q,
+                    "query_effective": None,
+                    "reason": search_reason,
+                    "failure_code": fc,
+                    "skipped": True,
+                    "validate_only": True,
+                },
+                "search",
+                f"检索词未通过校验（{vreason or fc}），已按策略处理。",
+            )
             if search_mandatory:
                 err = vreason or fc
                 return (
@@ -649,7 +687,11 @@ class DualTrackHarness:
                 Step(
                     name="web_search",
                     status="ok",
-                    meta={**meta, "degraded": True, "note": "校验未通过，已跳过检索调用"},
+                    meta=_pg(
+                        {**meta, "degraded": True, "note": "校验未通过，已跳过检索调用"},
+                        "search",
+                        "快轨入口：检索词未过审，已跳过联网并继续生成。",
+                    ),
                 ),
                 None,
             )
@@ -658,18 +700,20 @@ class DualTrackHarness:
         search_context = sr.get("context", "")
         sources = sr.get("sources", [])
         hard_err = sr.get("error")
+        nsrc = len(sources)
         meta = {
             "query": raw_q,
             "query_effective": vq,
             "reason": search_reason,
             "sources": sources,
-            "result_count": len(sources),
+            "result_count": nsrc,
             "failure_code": sr.get("failure_code"),
             "degraded": bool(sr.get("degraded")),
             "attempts": sr.get("attempts") or [],
             "fallback_from": sr.get("fallback_from"),
             "results_preview": search_context[:500] + ("..." if len(search_context) > 500 else ""),
         }
+        ok_summary = f"快轨入口：已检索「{(vq or raw_q)[:72]}{'…' if len(str(vq or raw_q)) > 72 else ''}」，摘要已并入上下文（约 {nsrc} 条来源）。"
         if hard_err and search_mandatory:
             return (
                 prompt,
@@ -678,7 +722,7 @@ class DualTrackHarness:
                     status="error",
                     provider=sr.get("provider_used"),
                     latency_ms=sr.get("latency_ms"),
-                    meta=meta,
+                    meta=_pg(meta, "search", f"联网失败（强制检索）：{hard_err}"),
                     error=hard_err,
                 ),
                 f"当前无法完成实时联网检索：{hard_err}",
@@ -692,7 +736,11 @@ class DualTrackHarness:
                     status="ok",
                     provider=sr.get("provider_used"),
                     latency_ms=sr.get("latency_ms"),
-                    meta={**meta, "degraded": True},
+                    meta=_pg(
+                        {**meta, "degraded": True},
+                        "search",
+                        f"联网未完全成功，已降级继续：{hard_err}",
+                    ),
                 ),
                 None,
             )
@@ -701,7 +749,7 @@ class DualTrackHarness:
             status="ok",
             provider=sr.get("provider_used"),
             latency_ms=sr.get("latency_ms"),
-            meta=meta,
+            meta=_pg(meta, "search", ok_summary),
         )
         if search_context:
             prompt = self._merge_search_into_prompt(prompt, search_context, options)
@@ -961,12 +1009,16 @@ class DualTrackHarness:
             "step": {
                 "name": "agent_start",
                 "status": "ok",
-                "meta": {
-                    "model": agent_model,
-                    "max_iterations": max_iter,
-                    "thread_turns": len(thread_msgs),
-                    "phase": "初始化推理线程（system + 近期对话 + 当前问题）",
-                },
+                "meta": _pg(
+                    {
+                        "model": agent_model,
+                        "max_iterations": max_iter,
+                        "thread_turns": len(thread_msgs),
+                        "phase": "初始化推理线程（system + 近期对话 + 当前问题）",
+                    },
+                    "reasoning",
+                    f"Agent 已启动：主模型「{agent_model}」，最多 {max_iter} 轮「思考→行动→观察」。",
+                ),
             },
         }
         yield {"event": "status", "phase": "agent", "message": "正在分析问题并规划工具调用…"}
@@ -977,12 +1029,16 @@ class DualTrackHarness:
                 "step": {
                     "name": "agent_iteration",
                     "status": "running",
-                    "meta": {
-                        "i": it + 1,
-                        "max": max_iter,
-                        "phase": "调用主模型生成本轮策略与正文",
-                        "model": agent_model,
-                    },
+                    "meta": _pg(
+                        {
+                            "i": it + 1,
+                            "max": max_iter,
+                            "phase": "调用主模型生成本轮策略与正文",
+                            "model": agent_model,
+                        },
+                        "reasoning",
+                        f"第 {it + 1}/{max_iter} 轮：正在调用主模型推理…",
+                    ),
                 },
             }
             res, _att = await self._ask_with_fallback([agent_model], "", options, messages=conv)
@@ -1010,6 +1066,15 @@ class DualTrackHarness:
             else:
                 next_move = "direct_reply"
             preview = text[:400] + ("…" if len(text) > 400 else "")
+            branch_cn = {
+                "refine_answer": "进入审查与润色全链",
+                "web_search": "触发联网检索后继续推理",
+                "direct_reply": "本轮将直接流式输出答复",
+            }.get(next_move, next_move)
+            iter_summary = (
+                f"第 {it + 1}/{max_iter} 轮思考完成：下一步 — {branch_cn}。"
+                f"（模型输出约 {len(text)} 字）"
+            )
             yield {
                 "event": "step",
                 "step": {
@@ -1018,19 +1083,23 @@ class DualTrackHarness:
                     "provider": res.provider,
                     "model": res.model,
                     "latency_ms": res.latency_ms,
-                    "meta": {
-                        "i": it + 1,
-                        "max": max_iter,
-                        "next_move": next_move,
-                        "branch_next": {
-                            "refine_answer": "进入 Refine 全链（审查+按需检索+润色）",
-                            "web_search": "触发联网检索后继续推理",
-                            "direct_reply": "本轮输出短文答复（流式）",
-                        }.get(next_move, next_move),
-                        "reply_preview": preview,
-                        "reply_chars": len(text),
-                        "phase": "本轮模型调用已完成，下一步按分支继续",
-                    },
+                    "meta": _pg(
+                        {
+                            "i": it + 1,
+                            "max": max_iter,
+                            "next_move": next_move,
+                            "branch_next": {
+                                "refine_answer": "进入 Refine 全链（审查+按需检索+润色）",
+                                "web_search": "触发联网检索后继续推理",
+                                "direct_reply": "本轮输出短文答复（流式）",
+                            }.get(next_move, next_move),
+                            "reply_preview": preview,
+                            "reply_chars": len(text),
+                            "phase": "本轮模型调用已完成，下一步按分支继续",
+                        },
+                        "reasoning",
+                        iter_summary,
+                    ),
                 },
             }
 
@@ -1050,7 +1119,11 @@ class DualTrackHarness:
                         "step": {
                             "name": "agent_refine_answer",
                             "status": "skipped",
-                            "meta": {"reason": "empty_or_tiny_draft", "draft_len": len(draft)},
+                            "meta": _pg(
+                                {"reason": "empty_or_tiny_draft", "draft_len": len(draft)},
+                                "polishing",
+                                "refine_answer 草稿过短，已跳过并回到推理循环。",
+                            ),
                         },
                     }
                     continue
@@ -1061,10 +1134,21 @@ class DualTrackHarness:
                         "step": {
                             "name": "agent_self_check",
                             "status": "ok",
-                            "meta": {**self._tag("review"), "chars": len(extra_sc)},
+                            "meta": _pg(
+                                {**self._tag("review"), "chars": len(extra_sc)},
+                                "polishing",
+                                f"高复杂度自检完成（约 {len(extra_sc)} 字），供审查层参考。",
+                            ),
                         },
                     }
-                yield {"event": "step", "step": {"name": "agent_refine_answer", "status": "running", "meta": {}}}
+                yield {
+                    "event": "step",
+                    "step": {
+                        "name": "agent_refine_answer",
+                        "status": "running",
+                        "meta": _pg({}, "polishing", "按 Agent 工具调用：进入审查 → 按需联网 → 润色…"),
+                    },
+                }
                 yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
                 async for ev in self._refine_from_draft_stream(
                     orig_q,
@@ -1078,7 +1162,14 @@ class DualTrackHarness:
                     extra_review_context=extra_sc,
                 ):
                     yield ev
-                yield {"event": "step", "step": {"name": "agent_refine_answer", "status": "ok"}}
+                yield {
+                    "event": "step",
+                    "step": {
+                        "name": "agent_refine_answer",
+                        "status": "ok",
+                        "meta": _pg({}, "polishing", "Agent 触发的审查与润色流水线已完成。"),
+                    },
+                }
                 return
 
             wm = RE_AGENT_WS.search(parse_text)
@@ -1097,21 +1188,42 @@ class DualTrackHarness:
                         "step": {
                             "name": "agent_web_search",
                             "status": "skipped",
-                            "meta": {"query": query, "failure_code": vfc},
+                            "meta": _pg(
+                                {"query": query, "failure_code": vfc},
+                                "reasoning",
+                                f"联网动作已跳过：检索词未过审（{vreason or vfc}）。",
+                            ),
                         },
                     }
                     continue
                 yield {
                     "event": "step",
-                    "step": {"name": "agent_web_search", "status": "running", "meta": {"query": vq}},
+                    "step": {
+                        "name": "agent_web_search",
+                        "status": "running",
+                        "meta": _pg(
+                            {"query": vq},
+                            "reasoning",
+                            f"行动：联网搜索「{str(vq)[:72]}{'…' if len(str(vq)) > 72 else ''}」…",
+                        ),
+                    },
                 }
                 sr = await self.tools.web_search(vq, options)
                 ctx = (sr.get("context") or "")[:12000]
                 lo = options.get("_agent_loop_ctx") or {}
+                n_ok = len(sr.get("sources") or [])
                 st = Step(
                     name="agent_web_search",
                     status="error" if sr.get("error") else "ok",
-                    meta={"query": query, "sources": sr.get("sources") or [], "from": "agent"},
+                    meta=_pg(
+                        {"query": query, "sources": sr.get("sources") or [], "from": "agent"},
+                        "reasoning",
+                        (
+                            f"观察：检索返回约 {n_ok} 条来源，摘要已注入对话。"
+                            if not sr.get("error")
+                            else f"观察：检索失败 — {sr.get('error') or 'error'}"
+                        ),
+                    ),
                     error=sr.get("error"),
                 )
                 yield {"event": "step", "step": st.to_dict()}
@@ -1142,11 +1254,15 @@ class DualTrackHarness:
                     "step": {
                         "name": "agent_plain_coerce_refine",
                         "status": "ok",
-                        "meta": {
-                            "reason": coerce_reason,
-                            "draft_chars": len(draft_plain),
-                            "phase": "无 ACTION 纯文本 → 强制 Review / Polish",
-                        },
+                        "meta": _pg(
+                            {
+                                "reason": coerce_reason,
+                                "draft_chars": len(draft_plain),
+                                "phase": "无 ACTION 纯文本 → 强制 Review / Polish",
+                            },
+                            "polishing",
+                            f"策略：本轮无工具调用，因「{coerce_reason}」将正文视为草稿，强制进入审查与润色。",
+                        ),
                     },
                 }
                 yield {
@@ -1159,7 +1275,11 @@ class DualTrackHarness:
                     "step": {
                         "name": "agent_refine_answer",
                         "status": "running",
-                        "meta": {"coerced_from_plain_text": True, "coerce_reason": coerce_reason},
+                        "meta": _pg(
+                            {"coerced_from_plain_text": True, "coerce_reason": coerce_reason},
+                            "polishing",
+                            "后处理：对纯文本草稿执行审查与润色流水线…",
+                        ),
                     },
                 }
                 extra_sc2 = await self._agent_self_check_block(prompt, draft_plain, hcfg, analysis, options, agent_model)
@@ -1185,7 +1305,11 @@ class DualTrackHarness:
                     "step": {
                         "name": "agent_refine_answer",
                         "status": "ok",
-                        "meta": {"coerced_plain_text": True},
+                        "meta": _pg(
+                            {"coerced_plain_text": True},
+                            "polishing",
+                            "强制精化流水线已完成。",
+                        ),
                     },
                 }
                 return
@@ -1202,7 +1326,11 @@ class DualTrackHarness:
             "step": {
                 "name": "agent_refine_fallback",
                 "status": "running",
-                "meta": {"reason": "max_iterations_exhausted", "same_pipeline_as": "refine_answer"},
+                "meta": _pg(
+                    {"reason": "max_iterations_exhausted", "same_pipeline_as": "refine_answer"},
+                    "polishing",
+                    "迭代次数用尽：正将多轮对话摘录拼成草稿，走审查与润色兜底。",
+                ),
             },
         }
         yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
@@ -1220,7 +1348,18 @@ class DualTrackHarness:
             yield ev
             if ev.get("event") == "error":
                 fb_ok = False
-        yield {"event": "step", "step": {"name": "agent_refine_fallback", "status": "ok" if fb_ok else "error"}}
+        yield {
+            "event": "step",
+            "step": {
+                "name": "agent_refine_fallback",
+                "status": "ok" if fb_ok else "error",
+                "meta": _pg(
+                    {},
+                    "polishing",
+                    "Agent 兜底 Refine 已完成。" if fb_ok else "Agent 兜底 Refine 失败。",
+                ),
+            },
+        }
 
     async def run_stream(self, prompt: str, mode: str = "auto", options: Optional[Dict[str, Any]] = None, messages: Optional[List[Dict[str, Any]]] = None) -> AsyncGenerator[Dict[str, Any], None]:
         options = options or {}
@@ -1239,7 +1378,14 @@ class DualTrackHarness:
         yield {"event": "trace", "trace_id": trace_id}
         yield {"event": "status", "phase": "analyze", "message": "正在分析问题…"}
 
-        yield {"event": "step", "step": {"name": "complexity_analyze", "status": "running"}}
+        yield {
+            "event": "step",
+            "step": {
+                "name": "complexity_analyze",
+                "status": "running",
+                "meta": _pg({}, "intake", "正在调用预判模型分析意图与复杂度…"),
+            },
+        }
         cx_cfg = hcfg.get("complexity") or {}
         analyzer_deadline = float(cx_cfg.get("analyzer_total_timeout_s", 45))
         try:
@@ -1257,7 +1403,7 @@ class DualTrackHarness:
         step_analyze = Step(
             name="complexity_analyze",
             status="ok",
-            meta={**analysis, **self._tag("intake")},
+            meta=_pg({**analysis, **self._tag("intake")}, "intake", _analyze_step_summary(analysis)),
             input_preview=(prompt[:240] + ("…" if len(prompt) > 240 else "")),
         )
         steps.append(step_analyze)
@@ -1266,7 +1412,8 @@ class DualTrackHarness:
         yield {"event": "status", "phase": "route", "message": "正在选择处理轨道…"}
         intended_track = self._resolve_track(mode, analysis, options)
         chosen_track = self.apply_confidence_track_guard(mode, analysis, sig_base, intended_track)
-        if options.get("upgrade_track") and mode == "auto":
+        # upgrade_track：重新生成等场景下客户端可要求升轨，不限于 auto 模式
+        if options.get("upgrade_track"):
             bump = {"fast": "refine", "refine": "agent"}
             nt = bump.get(chosen_track)
             if nt:
@@ -1280,21 +1427,26 @@ class DualTrackHarness:
         step_track = Step(
             name="track_select",
             status="ok",
-            meta={
-                **self._tag("routing"),
-                "mode": mode,
-                "track": chosen_track,
-                "task_type": analysis.get("task_type"),
-                "complexity": analysis.get("complexity"),
-                "decision": analysis.get("decision"),
-                "confidence": analysis.get("confidence"),
-                "search_required": analysis.get("search_required"),
-                "intended_track": intended_track,
-                "search_intent": analysis.get("search_intent"),
-                "output_intent": analysis.get("output_intent"),
-                "fallback_reason": analysis.get("fallback_reason"),
-                "high_risk_domain": analysis.get("high_risk_domain"),
-            },
+            meta=_pg(
+                {
+                    **self._tag("routing"),
+                    "mode": mode,
+                    "track": chosen_track,
+                    "task_type": analysis.get("task_type"),
+                    "complexity": analysis.get("complexity"),
+                    "decision": analysis.get("decision"),
+                    "confidence": analysis.get("confidence"),
+                    "search_required": analysis.get("search_required"),
+                    "intended_track": intended_track,
+                    "search_intent": analysis.get("search_intent"),
+                    "output_intent": analysis.get("output_intent"),
+                    "fallback_reason": analysis.get("fallback_reason"),
+                    "high_risk_domain": analysis.get("high_risk_domain"),
+                    "agent_disabled_fallback": bool(analysis.get("agent_disabled_fallback")),
+                },
+                "intake",
+                _track_select_summary(chosen_track, intended_track, analysis),
+            ),
         )
         steps.append(step_track)
         yield {"event": "step", "step": step_track.to_dict()}
@@ -1304,7 +1456,14 @@ class DualTrackHarness:
         search_mandatory = self._search_mandatory(analysis, options)
         if chosen_track == "fast" and should_search:
             yield {"event": "status", "phase": "search", "message": "正在联网检索（快轨）…"}
-            yield {"event": "step", "step": {"name": "web_search", "status": "running"}}
+            yield {
+                "event": "step",
+                "step": {
+                    "name": "web_search",
+                    "status": "running",
+                    "meta": _pg({}, "search", "快轨入口：正在联网补充实时信息…"),
+                },
+            }
             prompt, step_ws, abort_err = await self._fast_entry_search_step(
                 prompt, analysis, options, search_reason, search_mandatory=search_mandatory
             )
@@ -1328,7 +1487,11 @@ class DualTrackHarness:
                     "step": {
                         "name": "fast_answer_cache",
                         "status": "ok",
-                        "meta": {**self._tag("cache"), "chars": len(cached)},
+                        "meta": _pg(
+                            {**self._tag("cache"), "chars": len(cached)},
+                            "fast",
+                            "命中本地/Redis 答案缓存，跳过模型调用。",
+                        ),
                     },
                 }
                 yield {"event": "stream_start", "track": "fast", "trace_id": trace_id}
@@ -1340,7 +1503,11 @@ class DualTrackHarness:
             step_route = Step(
                 name="fast_route",
                 status="ok",
-                meta={**route, **self._tag("draft")},
+                meta=_pg(
+                    {**route, **self._tag("draft")},
+                    "fast",
+                    f"快轨已选定首选模型「{route.get('selected') or '—'}」，将单段流式生成。",
+                ),
             )
             steps.append(step_route)
             yield {"event": "step", "step": step_route.to_dict()}
@@ -1359,7 +1526,17 @@ class DualTrackHarness:
         chain = hcfg.get("refine_chain") or {}
         if not chain.get("enabled", True):
             route = self.route_fast_model(prompt, analysis)
-            steps.append(Step(name="refine_disabled_fallback_fast", status="ok", meta=route))
+            steps.append(
+                Step(
+                    name="refine_disabled_fallback_fast",
+                    status="ok",
+                    meta=_pg(
+                        dict(route) if isinstance(route, dict) else {"route": route},
+                        "fast",
+                        "精化链已关闭，已改为快轨单段生成。",
+                    ),
+                )
+            )
             candidates = route.get("candidates") or [route.get("selected")]
             
             yield {"event": "stream_start", "track": "fast", "trace_id": trace_id}
@@ -1382,14 +1559,25 @@ class DualTrackHarness:
             step_re0 = Step(
                 name="refine_entry_web_search",
                 status="running",
-                meta={"phase": "Refine 入口 · 轻量联网（Layer1 前）"},
+                meta=_pg(
+                    {"phase": "Refine 入口 · 轻量联网（Layer1 前）"},
+                    "search",
+                    "精化轨：入口轻量联网，为初稿补充实时摘要…",
+                ),
             )
             yield {"event": "step", "step": step_re0.to_dict()}
             entry_block = await self._refine_entry_light_search(prompt, analysis, options)
             step_re1 = Step(
                 name="refine_entry_web_search",
                 status="ok",
-                meta={"phase": "Refine 入口 · 轻量联网（Layer1 前）", "injected_chars": len(entry_block)},
+                meta=_pg(
+                    {
+                        "phase": "Refine 入口 · 轻量联网（Layer1 前）",
+                        "injected_chars": len(entry_block),
+                    },
+                    "search",
+                    f"入口联网完成，已向初稿上下文注入约 {len(entry_block)} 字摘要。",
+                ),
             )
             steps.append(step_re1)
             yield {"event": "step", "step": step_re1.to_dict()}
@@ -1398,7 +1586,11 @@ class DualTrackHarness:
         yield {"event": "status", "phase": "draft", "message": "正在生成初稿…"}
         yield {
             "event": "step",
-            "step": {"name": "refine_layer1_draft", "status": "running", "meta": {"phase": "初稿层 · 生成草稿"}},
+            "step": {
+                "name": "refine_layer1_draft",
+                "status": "running",
+                "meta": _pg({"phase": "初稿层 · 生成草稿"}, "refine", "精化轨：正在生成初稿…"),
+            },
         }
         # For Layer 1 & 2 we do NOT pass the entire chat history. They should only focus on the *current* task context.
         # We append history manually into the prompt if needed, or simply let Layer 3 handle the conversational tone.
@@ -1407,9 +1599,9 @@ class DualTrackHarness:
         
         # If we have messages, we should probably prefix the recent history to give context, but NOT as role messages
         # because the layer instructions expect a specific prompt format.
-        if messages:
-            history_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in messages[-4:]])
-            l1_prompt = f"【近期对话上下文参考】\n{history_text}\n\n" + l1_prompt
+        ht = _format_messages_snippet(messages, 4)
+        if ht:
+            l1_prompt = f"【近期对话上下文参考】\n{ht}\n\n" + l1_prompt
 
         l1_candidates = refine_models.get("draft") or [default_model]
         r1, a1 = await self._ask_with_fallback(
@@ -1424,7 +1616,11 @@ class DualTrackHarness:
             input_preview=l1_prompt[:240] + ("…" if len(l1_prompt) > 240 else ""),
             output=r1.content if r1.success else None,
             error=r1.error if not r1.success else None,
-            meta={**self._tag("draft"), "attempts": a1, "candidates": l1_candidates},
+            meta=_pg(
+                {**self._tag("draft"), "attempts": a1, "candidates": l1_candidates},
+                "refine",
+                f"初稿层完成（模型 {r1.model or '—'}）。",
+            ),
         )
         steps.append(step_l1)
         yield {"event": "step", "step": step_l1.to_dict()}
@@ -1437,7 +1633,11 @@ class DualTrackHarness:
         yield {"event": "status", "phase": "review", "message": "正在审查答案与必要时联网复核…"}
         yield {
             "event": "step",
-            "step": {"name": "refine_layer2_review", "status": "running", "meta": {"phase": "审查层 · 核对与必要时动作"}},
+            "step": {
+                "name": "refine_layer2_review",
+                "status": "running",
+                "meta": _pg({"phase": "审查层 · 核对与必要时动作"}, "refine", "审查层：核对初稿，必要时触发联网核查…"),
+            },
         }
         l2_prompt = (
             f"{l2.get('instruction','').strip()}\n\n"
@@ -1445,9 +1645,9 @@ class DualTrackHarness:
             f"【初稿答案】\n{r1.content.strip()}\n"
             "\n如需核实实时数据，可在审查结论中单行输出：<<ACTION: web_search(\"查询词\")>>\n"
         )
-        if messages:
-            history_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in messages[-4:]])
-            l2_prompt = f"【近期对话上下文参考】\n{history_text}\n\n" + l2_prompt
+        ht2 = _format_messages_snippet(messages, 4)
+        if ht2:
+            l2_prompt = f"【近期对话上下文参考】\n{ht2}\n\n" + l2_prompt
 
         l2_candidates = refine_models.get("review") or [default_model]
         r2, a2 = await self._ask_with_fallback(
@@ -1462,7 +1662,7 @@ class DualTrackHarness:
                 latency_ms=r2.latency_ms,
                 input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
                 error=r2.error,
-                meta={"attempts": a2, "candidates": l2_candidates},
+                meta=_pg({"attempts": a2, "candidates": l2_candidates}, "refine", "审查层调用失败。"),
             )
             steps.append(step_l2)
             yield {"event": "step", "step": step_l2.to_dict()}
@@ -1488,7 +1688,11 @@ class DualTrackHarness:
                 "step": {
                     "name": "review_web_search",
                     "status": "running",
-                    "meta": {"query": q, "review_round": search_loops, "phase": "审查内按需检索"},
+                    "meta": _pg(
+                        {"query": q, "review_round": search_loops, "phase": "审查内按需检索"},
+                        "refine",
+                        f"审查中联网：第 {search_loops} 轮，检索「{q[:60]}{'…' if len(q) > 60 else ''}」…",
+                    ),
                 },
             }
             vq, vfc, vreason = validate_search_query(q)
@@ -1504,18 +1708,27 @@ class DualTrackHarness:
             else:
                 sr = await self.perform_web_search(vq, options)
             snip = (sr.get("context") or "")[:8000]
+            rc = len(sr.get("sources") or [])
             yield {
                 "event": "step",
                 "step": {
                     "name": "review_web_search",
                     "status": "error" if sr.get("error") else "ok",
-                    "meta": {
-                        "query": q,
-                        "review_round": search_loops,
-                        "phase": "审查内按需检索",
-                        "result_count": len(sr.get("sources") or []),
-                        "sources": sr.get("sources") or [],
-                    },
+                    "meta": _pg(
+                        {
+                            "query": q,
+                            "review_round": search_loops,
+                            "phase": "审查内按需检索",
+                            "result_count": rc,
+                            "sources": sr.get("sources") or [],
+                        },
+                        "refine",
+                        (
+                            f"审查检索完成：约 {rc} 条来源。"
+                            if not sr.get("error")
+                            else f"审查检索失败：{sr.get('error') or 'error'}"
+                        ),
+                    ),
                     "error": sr.get("error"),
                 },
             }
@@ -1544,12 +1757,16 @@ class DualTrackHarness:
             latency_ms=r2.latency_ms,
             input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
             output=review_body,
-            meta={
-                **self._tag("review"),
-                "attempts": a2,
-                "candidates": l2_candidates,
-                "review_search_loops": search_loops,
-            },
+            meta=_pg(
+                {
+                    **self._tag("review"),
+                    "attempts": a2,
+                    "candidates": l2_candidates,
+                    "review_search_loops": search_loops,
+                },
+                "refine",
+                f"审查层完成；其间联网核查 {search_loops} 轮。",
+            ),
         )
         steps.append(step_l2)
         yield {"event": "step", "step": step_l2.to_dict()}
@@ -1558,7 +1775,11 @@ class DualTrackHarness:
         yield {"event": "status", "phase": "polish", "message": "正在生成最终回复…"}
         yield {
             "event": "step",
-            "step": {"name": "refine_layer3_polish", "status": "running", "meta": {"phase": "润色层 · 流式成文"}},
+            "step": {
+                "name": "refine_layer3_polish",
+                "status": "running",
+                "meta": _pg({"phase": "润色层 · 流式成文"}, "refine", "润色层：按审查结论流式生成最终答复…"),
+            },
         }
         l3_prompt = (
             f"{l3.get('instruction','').strip()}\n\n"
@@ -1576,7 +1797,11 @@ class DualTrackHarness:
         step_l3 = Step(
             name="refine_layer3_polish",
             status="ok",
-            meta={**self._tag("polish"), "candidates": l3_candidates},
+            meta=_pg(
+                {**self._tag("polish"), "candidates": l3_candidates},
+                "refine",
+                "润色层流式输出已完成。",
+            ),
         )
         yield {"event": "step", "step": step_l3.to_dict()}
 
@@ -1610,14 +1835,14 @@ class DualTrackHarness:
             Step(
                 name="complexity_analyze",
                 status="ok",
-                meta={**analysis, **self._tag("intake")},
+                meta=_pg({**analysis, **self._tag("intake")}, "intake", _analyze_step_summary(analysis)),
                 input_preview=(prompt[:240] + ("…" if len(prompt) > 240 else "")),
             )
         )
 
         intended_track = self._resolve_track(mode, analysis, options)
         chosen_track = self.apply_confidence_track_guard(mode, analysis, sig_base, intended_track)
-        if options.get("upgrade_track") and mode == "auto":
+        if options.get("upgrade_track"):
             bump = {"fast": "refine", "refine": "agent"}
             nt = bump.get(chosen_track)
             if nt:
@@ -1641,18 +1866,23 @@ class DualTrackHarness:
             Step(
                 name="track_select",
                 status="ok",
-                meta={
-                    **self._tag("routing"),
-                    "mode": mode,
-                    "track": chosen_track,
-                    "task_type": analysis.get("task_type"),
-                    "confidence": analysis.get("confidence"),
-                    "intended_track": intended_track,
-                    "search_intent": analysis.get("search_intent"),
-                    "output_intent": analysis.get("output_intent"),
-                    "fallback_reason": analysis.get("fallback_reason"),
-                    "high_risk_domain": analysis.get("high_risk_domain"),
-                },
+                meta=_pg(
+                    {
+                        **self._tag("routing"),
+                        "mode": mode,
+                        "track": chosen_track,
+                        "task_type": analysis.get("task_type"),
+                        "confidence": analysis.get("confidence"),
+                        "intended_track": intended_track,
+                        "search_intent": analysis.get("search_intent"),
+                        "output_intent": analysis.get("output_intent"),
+                        "fallback_reason": analysis.get("fallback_reason"),
+                        "high_risk_domain": analysis.get("high_risk_domain"),
+                        "agent_disabled_fallback": bool(analysis.get("agent_disabled_fallback")),
+                    },
+                    "intake",
+                    _track_select_summary(chosen_track, intended_track, analysis),
+                ),
             )
         )
 

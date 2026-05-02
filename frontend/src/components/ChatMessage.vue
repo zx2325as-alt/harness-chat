@@ -2,12 +2,24 @@
   <div class="msg" :class="{ user: role === 'user', assistant: role !== 'user' }">
     <div class="bubble" :class="{ 'user-bubble': role === 'user' }">
       <div class="meta" v-if="role !== 'user' && meta && !meta.pending">
-        <span v-if="meta.track" class="pill">{{ meta.track }}</span>
+        <span v-if="meta.track" class="pill" :title="metaTitle">{{ meta.track }}</span>
         <span v-if="meta.provider" class="pill">{{ meta.provider }}</span>
-        <span v-if="meta.model" class="pill">{{ meta.model }}</span>
+        <span v-if="meta.model" class="pill" :title="'末段模型: ' + meta.model">{{ meta.model }}</span>
         <span v-if="meta.latency_ms != null" class="pill">{{ meta.latency_ms }}ms</span>
         <span v-if="meta.streaming" class="pill active">生成中</span>
         <span v-if="meta.success === false" class="pill danger">失败</span>
+        <button
+          v-if="!meta.streaming && role === 'assistant'"
+          type="button"
+          class="pill btn-copy"
+          title="复制全文"
+          @click="onCopy"
+        >
+          复制
+        </button>
+      </div>
+      <div v-if="role === 'assistant' && meta?.model_chain && !meta?.pending" class="model-chain">
+        {{ meta.model_chain }}
       </div>
 
       <div class="content markdown-body">
@@ -23,6 +35,7 @@
       <div class="actions" v-if="!meta?.pending && !meta?.streaming && role !== 'system'">
         <button class="action-btn" v-if="role === 'user'" @click="$emit('edit')">编辑</button>
         <button class="action-btn" v-if="role === 'assistant'" @click="$emit('regenerate')">重新生成</button>
+        <button v-if="role === 'assistant' && meta?.stopped" class="action-btn" @click="$emit('retry')">重试</button>
       </div>
     </div>
   </div>
@@ -38,8 +51,15 @@ export default {
     content: { type: [String, Array], required: true },
     meta: { type: Object, default: null },
   },
-  emits: ["edit", "regenerate"],
+  emits: ["edit", "regenerate", "copy", "retry"],
   computed: {
+    metaTitle() {
+      const m = this.meta || {};
+      const parts = [];
+      if (m.track) parts.push("轨道: " + m.track);
+      if (m.model_chain) parts.push(m.model_chain);
+      return parts.join("\n") || "";
+    },
     textContent() {
       if (typeof this.content === "string") return this.content;
       return "";
@@ -51,6 +71,23 @@ export default {
   methods: {
     renderMarkdown(text) {
       return renderMarkdownWithMath(text || "");
+    },
+    plainTextFromContent() {
+      const c = this.content;
+      if (typeof c === "string") return c;
+      if (!Array.isArray(c)) return "";
+      return c
+        .filter((p) => p && p.type === "text")
+        .map((p) => p.text || "")
+        .join("\n");
+    },
+    onCopy() {
+      const t = this.plainTextFromContent();
+      if (!t) return;
+      navigator.clipboard?.writeText(t).then(
+        () => this.$emit("copy", { chars: t.length }),
+        () => {}
+      );
     },
   },
 };
@@ -98,6 +135,23 @@ export default {
 .pill.active {
   background: rgba(99, 102, 241, 0.22);
   color: #c7d2fe;
+}
+.pill.btn-copy {
+  cursor: pointer;
+  border: 1px solid #3d4d64;
+  background: #1e2433;
+}
+.pill.btn-copy:hover {
+  border-color: rgba(129, 140, 248, 0.45);
+  color: #c7d2fe;
+}
+.model-chain {
+  font-size: 11px;
+  color: #64748b;
+  margin: -4px 0 10px;
+  line-height: 1.45;
+  max-width: 100%;
+  word-break: break-word;
 }
 .content {
   line-height: 1.7;
