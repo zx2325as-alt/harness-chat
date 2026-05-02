@@ -20,7 +20,7 @@ from routing_signals import derive_user_signals, merge_signals_into_analysis, re
 from search_query_util import soft_degrade_note, validate_search_query
 
 from tools.layer import HarnessTools
-from tools.parsing import RE_AGENT_REFINE, RE_AGENT_WS
+from tools.parsing import RE_AGENT_REFINE, RE_AGENT_WS, parse_agent_action
 from tools.refine_pipeline import compile_agent_fallback_draft, stream_refine_from_draft
 
 
@@ -82,8 +82,26 @@ class Step:
     error: Optional[str] = None
     meta: Optional[Dict[str, Any]] = None
 
+    def _step_id(self) -> str:
+        meta = self.meta or {}
+        if meta.get("step_id"):
+            return str(meta["step_id"])
+        pg = str(meta.get("phase_group") or meta.get("pipeline_phase") or "")
+        if self.name == "agent_iteration" and meta.get("i") is not None:
+            return f"{self.name}:{meta.get('i')}"
+        if self.name == "review_web_search" and meta.get("review_round") is not None:
+            return f"{self.name}:{pg}:{meta.get('review_round')}"
+        if self.name == "agent_web_search" and meta.get("query"):
+            return f"{self.name}:{meta.get('query')}"
+        return f"{self.name}:{pg}" if pg else self.name
+
     def to_dict(self) -> Dict[str, Any]:
+        meta = dict(self.meta or {})
+        sid = self._step_id()
+        meta.setdefault("step_id", sid)
+        meta.setdefault("parent_id", meta.get("phase_group") or meta.get("pipeline_phase") or "")
         return {
+            "step_id": sid,
             "name": self.name,
             "status": self.status,
             "provider": self.provider,
@@ -92,7 +110,7 @@ class Step:
             "input_preview": self.input_preview,
             "output": self.output,
             "error": self.error,
-            "meta": self.meta or {},
+            "meta": meta,
         }
 
 
@@ -559,6 +577,7 @@ class DualTrackHarness:
     async def _stream_with_fallback(
         self, candidates: List[str], prompt: str, options: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
+        last_error = ""
         for mk in candidates:
             if not mk:
                 continue
@@ -566,26 +585,47 @@ class DualTrackHarness:
                 adapter = self.registry.get(mk)
                 yield {"event": "model_start", "model": mk, "provider": adapter.provider}
                 started_at = time.perf_counter()
+                emitted_chars = 0
 
                 async for chunk in adapter.stream(prompt, options, messages=messages):
                     content = chunk.get("content") or ""
+                    reasoning = chunk.get("reasoning_content") or ""
                     if content:
+                        emitted_chars += len(content)
+                    elif reasoning:
+                        emitted_chars += len(reasoning)
                         step = int(options.get("stream_slice_chars") or 8)
                         for idx in range(0, len(content), step):
                             yield {"event": "chunk", "data": {"content": content[idx : idx + step]}}
                             await asyncio.sleep(0)
 
+                if emitted_chars <= 0:
+                    last_error = f"{mk} stream ended without content"
+                    yield {
+                        "event": "model_error",
+                        "model": mk,
+                        "error": last_error,
+                        "error_code": "EMPTY_STREAM",
+                    }
+                    continue
+
                 yield {
                     "event": "model_end",
                     "model": mk,
                     "latency_ms": int((time.perf_counter() - started_at) * 1000),
+                    "chars": emitted_chars,
                 }
                 return
             except Exception as e:
-                yield {"event": "model_error", "model": mk, "error": str(e)}
+                last_error = str(e)
+                yield {"event": "model_error", "model": mk, "error": last_error}
                 continue
 
-        yield {"event": "error", "error": "All fallback models failed in stream."}
+        yield {
+            "event": "error",
+            "error": f"All fallback models failed in stream. Last error: {last_error or 'unknown'}",
+            "error_code": "STREAM_FALLBACK_EXHAUSTED",
+        }
 
     def _search_mandatory(self, analysis: Dict[str, Any], options: Dict[str, Any]) -> bool:
         si = str(analysis.get("search_intent") or "none").lower()
@@ -714,6 +754,25 @@ class DualTrackHarness:
             "results_preview": search_context[:500] + ("..." if len(search_context) > 500 else ""),
         }
         ok_summary = f"快轨入口：已检索「{(vq or raw_q)[:72]}{'…' if len(str(vq or raw_q)) > 72 else ''}」，摘要已并入上下文（约 {nsrc} 条来源）。"
+        if search_mandatory and not hard_err and not sources:
+            fc_empty = str(sr.get("failure_code") or "SEARCH_EMPTY_SOURCES")
+            user_err = f"强制联网未获得有效来源（{fc_empty}）。"
+            return (
+                prompt,
+                Step(
+                    name="web_search",
+                    status="error",
+                    provider=sr.get("provider_used"),
+                    latency_ms=sr.get("latency_ms"),
+                    meta=_pg(
+                        {**meta, "failure_code": fc_empty},
+                        "search",
+                        user_err,
+                    ),
+                    error=user_err,
+                ),
+                user_err,
+            )
         if hard_err and search_mandatory:
             return (
                 prompt,
@@ -986,6 +1045,10 @@ class DualTrackHarness:
         agent_intro = (acfg.get("system_prompt") or "").strip()
         base_rules = (
             "你是具备工具调用能力的智能体，按「思考 → 行动 → 观察」循环推理。\n"
+            "优先使用严格 JSON 工具动作，例如：\n"
+            "{\"action\":\"web_search\",\"query\":\"查询词\"}\n"
+            "{\"action\":\"refine_answer\",\"question\":\"用户原问题\",\"draft\":\"你的结论草稿\"}\n"
+            "JSON 动作必须单独输出，且不要包裹额外正文。\n"
             "需要实时信息时输出单行（仅此一行即可）：<<ACTION: web_search(\"查询词\")>>\n"
             "推理已完成且需要长文润色/结构化输出时输出：\n"
             "<<ACTION: refine_answer(\"用户原问题\", \"你的结论草稿\")>>\n"
@@ -1059,9 +1122,11 @@ class DualTrackHarness:
                     parse_text = text[: wm0.start()].rstrip()
                     conv[-1]["content"] = parse_text
 
-            if RE_AGENT_REFINE.search(parse_text):
+            action = parse_agent_action(parse_text)
+            action_name = action.get("action") or ""
+            if action_name == "refine_answer":
                 next_move = "refine_answer"
-            elif RE_AGENT_WS.search(parse_text):
+            elif action_name == "web_search":
                 next_move = "web_search"
             else:
                 next_move = "direct_reply"
@@ -1103,10 +1168,9 @@ class DualTrackHarness:
                 },
             }
 
-            rm = RE_AGENT_REFINE.search(parse_text)
-            if rm:
-                orig_q = (rm.group(1) or "").strip() or prompt
-                draft = (rm.group(2) or "").strip()
+            if action_name == "refine_answer":
+                orig_q = (action.get("question") or "").strip() or prompt
+                draft = (action.get("draft") or "").strip()
                 if len(draft) < 16:
                     conv.append(
                         {
@@ -1150,6 +1214,7 @@ class DualTrackHarness:
                     },
                 }
                 yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
+                refine_ok = True
                 async for ev in self._refine_from_draft_stream(
                     orig_q,
                     draft,
@@ -1162,19 +1227,27 @@ class DualTrackHarness:
                     extra_review_context=extra_sc,
                 ):
                     yield ev
+                    if ev.get("event") == "error":
+                        refine_ok = False
                 yield {
                     "event": "step",
                     "step": {
                         "name": "agent_refine_answer",
-                        "status": "ok",
-                        "meta": _pg({}, "polishing", "Agent 触发的审查与润色流水线已完成。"),
+                        "status": "ok" if refine_ok else "error",
+                        "meta": _pg(
+                            {},
+                            "polishing",
+                            "Agent 触发的审查与润色流水线已完成。"
+                            if refine_ok
+                            else "Agent 触发的审查与润色流水线失败。",
+                        ),
+                        "error": None if refine_ok else "Agent refine_answer failed",
                     },
                 }
                 return
 
-            wm = RE_AGENT_WS.search(parse_text)
-            if wm:
-                query = wm.group(1).strip()
+            if action_name == "web_search":
+                query = (action.get("query") or "").strip()
                 vq, vfc, vreason = validate_search_query(query)
                 if vfc:
                     conv.append(
@@ -1216,7 +1289,7 @@ class DualTrackHarness:
                     name="agent_web_search",
                     status="error" if sr.get("error") else "ok",
                     meta=_pg(
-                        {"query": query, "sources": sr.get("sources") or [], "from": "agent"},
+                        {"query": vq, "query_raw": query, "sources": sr.get("sources") or [], "from": "agent"},
                         "reasoning",
                         (
                             f"观察：检索返回约 {n_ok} 条来源，摘要已注入对话。"
@@ -1283,7 +1356,21 @@ class DualTrackHarness:
                     },
                 }
                 extra_sc2 = await self._agent_self_check_block(prompt, draft_plain, hcfg, analysis, options, agent_model)
+                if extra_sc2:
+                    yield {
+                        "event": "step",
+                        "step": {
+                            "name": "agent_self_check",
+                            "status": "ok",
+                            "meta": _pg(
+                                {**self._tag("review"), "chars": len(extra_sc2), "coerced_plain_text": True},
+                                "polishing",
+                                f"强制精化前自检完成（约 {len(extra_sc2)} 字），供审查层参考。",
+                            ),
+                        },
+                    }
                 yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
+                refine_ok = True
                 async for ev in self._refine_from_draft_stream(
                     prompt,
                     draft_plain,
@@ -1300,16 +1387,19 @@ class DualTrackHarness:
                     extra_review_context=extra_sc2,
                 ):
                     yield ev
+                    if ev.get("event") == "error":
+                        refine_ok = False
                 yield {
                     "event": "step",
                     "step": {
                         "name": "agent_refine_answer",
-                        "status": "ok",
+                        "status": "ok" if refine_ok else "error",
                         "meta": _pg(
                             {"coerced_plain_text": True},
                             "polishing",
-                            "强制精化流水线已完成。",
+                            "强制精化流水线已完成。" if refine_ok else "强制精化流水线失败。",
                         ),
+                        "error": None if refine_ok else "Agent coerced refine failed",
                     },
                 }
                 return
@@ -1789,19 +1879,23 @@ class DualTrackHarness:
         l3_candidates = refine_models.get("polish") or [default_model]
         
         yield {"event": "stream_start", "track": "refine", "trace_id": trace_id}
+        l3_ok = True
         async for s_event in self._stream_with_fallback(
             l3_candidates, l3_prompt, self._layer_opts(hcfg, "layer3", options), messages=messages
         ):
             yield s_event
+            if s_event.get("event") == "error":
+                l3_ok = False
 
         step_l3 = Step(
             name="refine_layer3_polish",
-            status="ok",
+            status="ok" if l3_ok else "error",
             meta=_pg(
                 {**self._tag("polish"), "candidates": l3_candidates},
                 "refine",
-                "润色层流式输出已完成。",
+                "润色层流式输出已完成。" if l3_ok else "润色层流式输出失败，请查看错误事件。",
             ),
+            error=None if l3_ok else "Layer 3 stream failed",
         )
         yield {"event": "step", "step": step_l3.to_dict()}
 

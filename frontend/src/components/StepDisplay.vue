@@ -99,9 +99,29 @@
                       <span class="sum-st" :class="item.step.status">{{ statusShort(item.step.status) }}</span>
                       <span v-if="item.step.provider" class="sum-meta">{{ item.step.provider }}</span>
                       <span v-if="item.step.latency_ms != null" class="sum-meta">{{ item.step.latency_ms }}ms</span>
+                      <span
+                        v-if="item.step.name === 'agent_postprocess_bundle' && (item.step.meta || {})._bundle_latency_sum_ms"
+                        class="sum-meta"
+                      >
+                        Σ {{ (item.step.meta || {})._bundle_latency_sum_ms }}ms
+                      </span>
                     </summary>
 
                     <div class="step-inner">
+                      <details
+                        v-if="item.step.name === 'agent_postprocess_bundle' && ((item.step.meta || {})._bundle_steps || []).length"
+                        class="bundle-substeps"
+                      >
+                        <summary>展开子步骤（耗时与状态）</summary>
+                        <ul class="bundle-ul">
+                          <li v-for="(bs, bi) in (item.step.meta || {})._bundle_steps || []" :key="bi" class="bundle-li">
+                            <span class="bundle-name">{{ humanStepName(bs.name, bs.meta) }}</span>
+                            <span class="bundle-st" :class="bs.status">{{ statusShort(bs.status) }}</span>
+                            <span v-if="bs.latency_ms != null" class="bundle-meta">{{ bs.latency_ms }}ms</span>
+                            <span v-if="bs.error" class="bundle-err">{{ bs.error }}</span>
+                          </li>
+                        </ul>
+                      </details>
                       <p
                         v-if="
                           (item.step.meta || {}).event_summary &&
@@ -283,6 +303,7 @@ export default {
           const err = chunk.some((x) => x.status === "error");
           const st = running ? "running" : err ? "error" : "ok";
           const last = chunk[chunk.length - 1];
+          const latSum = chunk.reduce((acc, x) => acc + (x.latency_ms || 0), 0);
           out.push({
             name: "agent_postprocess_bundle",
             status: st,
@@ -290,6 +311,8 @@ export default {
               phase_group: "polishing",
               event_summary: "后处理：自检 → 审查 → 润色（合并为一步展示）",
               _bundle_members: chunk.map((c) => c.name).join(" → "),
+              _bundle_steps: chunk.map((c) => ({ ...c })),
+              _bundle_latency_sum_ms: latSum || null,
             },
             model: last?.model,
             provider: last?.provider,
@@ -333,6 +356,9 @@ export default {
       return table[n] || "other";
     },
     groupedPhases(run) {
+      const cacheKey = `${run?.id || "x"}:${this.renderTick}:${(run?.steps || []).length}`;
+      if (!this._groupedPhaseCache) this._groupedPhaseCache = {};
+      if (this._groupedPhaseCache[cacheKey]) return this._groupedPhaseCache[cacheKey];
       const order = ["intake", "search", "fast", "reasoning", "refine", "polishing", "other"];
       const titles = {
         intake: "分析与调度",
@@ -353,10 +379,23 @@ export default {
         const k = buckets[g] !== undefined ? g : "other";
         buckets[k].push({ step, globalIdx });
       });
-      return order.filter((k) => buckets[k].length).map((k) => ({ key: k, title: titles[k], steps: buckets[k] }));
+      const phases = order.filter((k) => buckets[k].length).map((k) => ({ key: k, title: titles[k], steps: buckets[k] }));
+      this._groupedPhaseCache = { [cacheKey]: phases };
+      return phases;
+    },
+    _flattenStepsForPipe(stepsWrap) {
+      const flat = [];
+      (stepsWrap || []).forEach((w) => {
+        const s = w.step;
+        if (!s) return;
+        flat.push(s);
+        const inner = (s.meta && s.meta._bundle_steps) || [];
+        inner.forEach((sub) => flat.push(sub));
+      });
+      return flat;
     },
     polishPipeClass(stepsWrap, role) {
-      const steps = stepsWrap.map((x) => x.step);
+      const steps = this._flattenStepsForPipe(stepsWrap);
       const pick = (name) => steps.find((s) => s.name === name);
       if (role === "self") {
         const sc = pick("agent_self_check");
@@ -384,7 +423,8 @@ export default {
       return "ok";
     },
     refinePipeClass(stepsWrap, layer) {
-      const pick = (name) => stepsWrap.map((x) => x.step).find((s) => s.name === name);
+      const steps = this._flattenStepsForPipe(stepsWrap);
+      const pick = (name) => steps.find((s) => s.name === name);
       if (layer === "draft") {
         const s = pick("refine_layer1_draft");
         if (!s) return "idle";
@@ -612,6 +652,7 @@ export default {
         }
         case "agent_postprocess_bundle": {
           if (m._bundle_members) this._line(rows, "合并子步骤", m._bundle_members);
+          if (m._bundle_latency_sum_ms != null) this._line(rows, "子步骤耗时合计", `${m._bundle_latency_sum_ms}ms`);
           break;
         }
         case "track_select":
@@ -1015,6 +1056,56 @@ export default {
   cursor: pointer;
   font-weight: 600;
   color: #a5b4fc;
+}
+.bundle-substeps {
+  margin-bottom: 10px;
+  border-radius: 8px;
+  border: 1px solid #2f3a4d;
+  background: #1a1f2b;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+.bundle-substeps > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #a5b4fc;
+}
+.bundle-ul {
+  margin: 8px 0 0;
+  padding-left: 1.1em;
+  list-style: disc;
+}
+.bundle-li {
+  margin: 4px 0;
+  line-height: 1.45;
+}
+.bundle-name {
+  margin-right: 6px;
+}
+.bundle-st {
+  font-size: 11px;
+  margin-right: 6px;
+  opacity: 0.9;
+}
+.bundle-st.ok {
+  color: #6ee7b7;
+}
+.bundle-st.running {
+  color: #a5b4fc;
+}
+.bundle-st.error {
+  color: #fca5a5;
+}
+.bundle-meta {
+  font-size: 11px;
+  color: #64748b;
+}
+.bundle-err {
+  display: block;
+  font-size: 11px;
+  color: #fca5a5;
+  margin-top: 2px;
 }
 .steps-col {
   display: flex;

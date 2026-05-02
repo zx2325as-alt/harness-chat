@@ -166,8 +166,11 @@ async def stream_refine_from_draft(
             ),
         },
     }
+    l3_ok = True
     async for s_event in harness._stream_with_fallback(l3_candidates, l3_prompt, opts_l3, messages=messages):
         yield s_event
+        if s_event.get("event") == "error":
+            l3_ok = False
 
     # 与 harness.run_stream 一致：必须补发 ok，否则前端 upsert 后「润色层」永远停在 running，
     # 而后面的 agent_refine_answer ok / 合并后处理卡片会显示已完成，造成状态矛盾。
@@ -175,12 +178,13 @@ async def stream_refine_from_draft(
         "event": "step",
         "step": {
             "name": "refine_layer3_polish",
-            "status": "ok",
+            "status": "ok" if l3_ok else "error",
             "meta": _pg(
                 {**extra_meta, "from_agent": True, "pipeline_phase": "polish"},
                 "polishing",
-                "润色层流式输出已完成。",
+                "润色层流式输出已完成。" if l3_ok else "润色层流式输出失败，请查看错误事件。",
             ),
+            "error": None if l3_ok else "Layer 3 stream failed",
         },
     }
 

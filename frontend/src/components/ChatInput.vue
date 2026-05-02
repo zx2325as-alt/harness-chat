@@ -109,8 +109,8 @@
           <button
             type="button"
             class="send"
-            :disabled="busy || (!draft.trim() && attachments.length === 0)"
-            title="发送"
+            :disabled="!canSend"
+            :title="sendTitle"
             @click="send"
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -121,6 +121,8 @@
       </div>
       <div class="foot-hint">
         <span v-if="busy">处理中…</span>
+        <span v-else-if="hasParsingAttachment">文档仍在解析中，完成后才能发送</span>
+        <span v-else-if="hasImageAttachment">图片目前不会进入模型，请先移除图片或改传文档/文本</span>
         <span v-else>文档将上传解析后加入本轮上下文</span>
       </div>
     </div>
@@ -161,6 +163,21 @@ export default {
     };
   },
   computed: {
+    hasParsingAttachment() {
+      return this.attachments.some((a) => a.status === "parsing");
+    },
+    hasImageAttachment() {
+      return this.attachments.some((a) => a.kind === "image");
+    },
+    canSend() {
+      if (this.busy || this.hasParsingAttachment || this.hasImageAttachment) return false;
+      return !!this.draft.trim() || this.attachments.length > 0;
+    },
+    sendTitle() {
+      if (this.hasParsingAttachment) return "文档仍在解析中";
+      if (this.hasImageAttachment) return "图片暂未接入模型，请移除后发送";
+      return "发送";
+    },
     modeLabel() {
       return MODE_OPTIONS.find((o) => o.value === this.mode)?.label ?? this.mode;
     },
@@ -272,19 +289,13 @@ export default {
       const imageFiles = list.filter((f) => f.type.startsWith("image/"));
 
       for (const file of imageFiles) {
-        await new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onload = (ev) => {
-            this.attachments.push({
-              name: file.name,
-              kind: "image",
-              type: file.type,
-              data: ev.target.result,
-              status: "ok",
-            });
-            resolve();
-          };
-          reader.readAsDataURL(file);
+        this.attachments.push({
+          name: file.name,
+          kind: "image",
+          type: file.type,
+          data: "",
+          status: "error",
+          error: "图片暂未接入后端模型输入，请改传文档或文本。",
         });
       }
 
@@ -327,7 +338,7 @@ export default {
     send() {
       const t = this.draft.trim();
       if (!t && this.attachments.length === 0) return;
-      if (this.busy) return;
+      if (!this.canSend) return;
 
       const documents = this.attachments
         .filter((a) => a.kind === "document" && a.status === "ok" && a.doc)

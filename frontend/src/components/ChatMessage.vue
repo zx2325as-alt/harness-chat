@@ -29,6 +29,7 @@
             <img v-if="part.type === 'image_url'" :src="part.image_url.url" class="chat-img" alt="" />
           </template>
         </div>
+        <pre v-else-if="meta?.streaming" class="stream-plain">{{ textContent }}</pre>
         <div v-else v-html="renderedContent"></div>
       </div>
 
@@ -157,6 +158,13 @@ export default {
   line-height: 1.7;
   font-size: 15px;
   color: #e2e8f0;
+}
+.stream-plain {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+  color: inherit;
 }
 .msg.user .content {
   color: #f1f5f9;

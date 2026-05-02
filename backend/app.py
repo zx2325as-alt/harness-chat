@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request, UploadFile, File, Body
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import json
 import asyncio
+import math
+import re
 from pydantic import BaseModel, Field
 
 import redis
@@ -46,6 +48,7 @@ class ChatRequest(BaseModel):
 class StepOut(BaseModel):
     name: str
     status: str
+    step_id: Optional[str] = None
     provider: Optional[str] = None
     model: Optional[str] = None
     latency_ms: Optional[int] = None
@@ -86,20 +89,116 @@ def _content_to_text(content: Any) -> str:
     return str(content or "")
 
 
-def _documents_context(documents: Any, max_total_chars: int = 60_000) -> str:
+def _doc_query_terms(query: str) -> List[str]:
+    """查询词：英文/数字 token + 中文 2–4 字 n-gram，供轻量 BM25 打分。"""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    terms: List[str] = []
+    for tok in re.findall(r"[\w\u4e00-\u9fff]{2,}", q):
+        if len(tok) <= 32:
+            terms.append(tok)
+    for n in (2, 3, 4):
+        if len(q) >= n:
+            for i in range(0, min(len(q), 400) - n + 1):
+                g = q[i : i + n]
+                if re.search(r"[\u4e00-\u9fff]", g):
+                    terms.append(g)
+    out: List[str] = []
+    seen = set()
+    for t in terms:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:120]
+
+
+def _doc_bm25_scores(query: str, docs: List[str], *, k1: float = 1.2, b: float = 0.75) -> List[float]:
+    """无第三方依赖的 BM25；docs 为各 chunk 纯文本。"""
+    terms = _doc_query_terms(query)
+    if not terms:
+        return [0.0] * len(docs)
+    N = len(docs)
+    df: Dict[str, int] = {t: 0 for t in terms}
+    tfs: List[Dict[str, int]] = []
+    dl: List[int] = []
+    for d in docs:
+        low = (d or "").lower()
+        dl.append(len(low) or 1)
+        tf: Dict[str, int] = {t: 0 for t in terms}
+        for t in terms:
+            c = low.count(t)
+            if c:
+                tf[t] = c
+                df[t] += 1
+        tfs.append(tf)
+    avgdl = sum(dl) / max(N, 1)
+    scores = []
+    for i in range(N):
+        s = 0.0
+        denom_dl = k1 * (1 - b + b * dl[i] / avgdl)
+        for t in terms:
+            f = tfs[i].get(t, 0)
+            if not f:
+                continue
+            dft = df.get(t, 0)
+            idf = math.log(1.0 + (N - dft + 0.5) / (dft + 0.5))
+            s += idf * (f * (k1 + 1)) / (f + denom_dl)
+        scores.append(s)
+    return scores
+
+
+def _doc_score(query: str, text: str) -> int:
+    """保留旧接口：非零表示与查询有 token 命中（用于兜底）。"""
+    terms = _doc_query_terms(query)
+    if not terms:
+        return 0
+    t = (text or "").lower()
+    return sum(1 for tok in terms if tok in t)
+
+
+def _documents_context(documents: Any, query: str = "", max_total_chars: int = 60_000) -> str:
     if not isinstance(documents, list) or not documents:
         return ""
     pieces = ["【已上传文档内容】"]
     used = 0
+    ranked: List[Dict[str, Any]] = []
     for idx, doc in enumerate(documents, start=1):
         if not isinstance(doc, dict):
             continue
         name = doc.get("name") or f"文档{idx}"
-        content = str(doc.get("content") or "")
-        if not content:
-            chunks = doc.get("chunks") or []
-            if isinstance(chunks, list):
-                content = "\n\n".join(str(c.get("content", "")) for c in chunks if isinstance(c, dict))
+        chunks = doc.get("chunks") or []
+        if isinstance(chunks, list) and chunks:
+            for c in chunks:
+                if not isinstance(c, dict):
+                    continue
+                content = str(c.get("content") or "")
+                if content:
+                    ranked.append(
+                        {
+                            "name": name,
+                            "content": content,
+                            "score": 0,
+                            "chunk": c.get("index"),
+                        }
+                    )
+        else:
+            content = str(doc.get("content") or "")
+            if content:
+                ranked.append({"name": name, "content": content, "score": 0, "chunk": None})
+    if not ranked:
+        return ""
+    if query:
+        texts = [str(r.get("content") or "") for r in ranked]
+        bm = _doc_bm25_scores(query, texts)
+        for i, r in enumerate(ranked):
+            r["score"] = float(bm[i]) if i < len(bm) else 0.0
+        ranked.sort(key=lambda x: x.get("score", 0), reverse=True)
+    selected = [r for r in ranked if float(r.get("score", 0) or 0) > 0][:8] if query else []
+    if not selected:
+        selected = ranked[:8]
+    for idx, row in enumerate(selected, start=1):
+        content = str(row.get("content") or "")
         if not content:
             continue
         remain = max_total_chars - used
@@ -107,14 +206,15 @@ def _documents_context(documents: Any, max_total_chars: int = 60_000) -> str:
             break
         clipped = content[:remain]
         used += len(clipped)
-        pieces.append(f"\n【文档 {idx}: {name}】\n{clipped}")
+        chunk_label = f" · 片段 {row.get('chunk')}" if row.get("chunk") is not None else ""
+        pieces.append(f"\n【文档 {idx}: {row.get('name')}{chunk_label}】\n{clipped}")
     if len(pieces) == 1:
         return ""
     return "\n".join(pieces)
 
 
 def _augment_prompt(prompt: str, options: Dict[str, Any]) -> str:
-    docs_context = _documents_context(options.get("documents"))
+    docs_context = _documents_context(options.get("documents"), query=prompt)
     if not docs_context:
         return prompt
     return (
@@ -122,6 +222,61 @@ def _augment_prompt(prompt: str, options: Dict[str, Any]) -> str:
         "请优先基于上述文档回答；涉及文档信息时，尽量标注来自哪份文档或哪段内容。\n\n"
         f"【用户问题】\n{prompt}"
     )
+
+
+def _step_id_for(step: Dict[str, Any]) -> str:
+    name = str(step.get("name") or "step")
+    meta = step.get("meta") if isinstance(step.get("meta"), dict) else {}
+    if step.get("step_id"):
+        return str(step["step_id"])
+    if meta.get("step_id"):
+        return str(meta["step_id"])
+    pg = str(meta.get("phase_group") or meta.get("pipeline_phase") or "")
+    if name == "agent_iteration" and meta.get("i") is not None:
+        return f"{name}:{meta.get('i')}"
+    if name == "review_web_search" and meta.get("review_round") is not None:
+        return f"{name}:{pg}:{meta.get('review_round')}"
+    if name == "agent_web_search" and meta.get("query"):
+        return f"{name}:{meta.get('query')}"
+    return f"{name}:{pg}" if pg else name
+
+
+def _split_current_from_history(
+    messages: List[Dict[str, Any]], prompt: Any
+) -> Tuple[List[Dict[str, Any]], Any]:
+    """
+    历史 messages 不含「当前用户句」，避免与 harness 传入的 prompt 在适配器里重复拼接。
+    当前句优先取 req.prompt；否则取 messages 最后一条 user 并从历史中移除。
+    """
+    hist = [dict(m) for m in (messages or [])]
+    has_prompt = prompt not in (None, "", [], {})
+    if has_prompt:
+        cur_norm = _content_to_text(prompt).strip()
+        while hist and hist[-1].get("role") == "user":
+            last_norm = _content_to_text(hist[-1].get("content")).strip()
+            if cur_norm and last_norm == cur_norm:
+                hist.pop()
+            else:
+                break
+        return hist, prompt
+    if hist and hist[-1].get("role") == "user":
+        last = hist.pop()
+        return hist, last.get("content")
+    return hist, ""
+
+
+def _normalise_stream_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    if event.get("event") == "step" and isinstance(event.get("step"), dict):
+        step = dict(event["step"])
+        meta = dict(step.get("meta") or {})
+        sid = _step_id_for(step)
+        step["step_id"] = sid
+        meta["step_id"] = sid
+        if "parent_id" not in meta:
+            meta["parent_id"] = meta.get("phase_group") or meta.get("pipeline_phase") or ""
+        step["meta"] = meta
+        event = {**event, "step": step}
+    return event
 
 
 def create_app() -> FastAPI:
@@ -205,21 +360,18 @@ def create_app() -> FastAPI:
     async def chat(req: ChatRequest) -> Any:
         options = dict(req.options or {})
         options.setdefault("trace_id", new_trace_id())
-        
-        messages = [m.model_dump() for m in req.messages]
-        if req.prompt:
-            messages.append({"role": "user", "content": req.prompt})
-            
-        if not messages:
-            return {"error": "No prompt or messages provided"}
-            
-        last_prompt = _content_to_text(messages[-1]["content"] if messages else "")
+
+        raw_msgs = [m.model_dump() for m in req.messages]
+        hist, current = _split_current_from_history(raw_msgs, req.prompt)
+        last_prompt = _content_to_text(current)
         if not str(last_prompt).strip() and isinstance(options.get("documents"), list) and options.get("documents"):
             last_prompt = "请根据上传的文档回答问题。"
+        if not str(last_prompt).strip() and not hist:
+            return {"error": "No prompt or messages provided"}
         options["search_prompt_base"] = str(last_prompt)
         augmented = _augment_prompt(str(last_prompt), options)
 
-        result = await harness.run(augmented, messages=messages, mode=req.mode, options=options)
+        result = await harness.run(augmented, messages=hist, mode=req.mode, options=options)
         return result
 
     @app.post("/api/chat/stream")
@@ -231,9 +383,10 @@ def create_app() -> FastAPI:
         session_id = req.session_id
         redis_key = f"chat_session:{session_id}" if session_id else None
         
-        # 优先用 Redis 中的历史（非空才覆盖）；否则用请求体，避免 Redis 空列表抹掉首轮上下文
+        # 仅当前端明确选择服务端历史时才用 Redis 覆盖请求体，避免编辑/重生成后混入旧上下文。
         historical_messages = [m.model_dump() for m in req.messages]
-        if redis_client and redis_key:
+        prefer_server_history = bool(options.get("prefer_server_history"))
+        if prefer_server_history and redis_client and redis_key:
             try:
                 # 同步 Redis 会阻塞整个 asyncio 事件循环，导致 SSE 在首包发出前就卡死；放入线程并限时。
                 cached_msgs = await asyncio.wait_for(
@@ -244,15 +397,13 @@ def create_app() -> FastAPI:
                     historical_messages = [json.loads(m) for m in cached_msgs]
             except Exception as e:
                 print(f"Redis history skipped (timeout/error): {e}")
-            
-        # Prepare the current prompt
-        # req.prompt 可能是空的，如果前端把问题放在了 req.messages 的最后一条
-        current_prompt_content = req.prompt
-        if not current_prompt_content and req.messages:
-            current_prompt_content = req.messages[-1].content
-            
+
+        historical_messages, current_prompt_content = _split_current_from_history(
+            historical_messages, req.prompt
+        )
+
         current_user_msg = {"role": "user", "content": current_prompt_content}
-        
+
         last_prompt_str = _content_to_text(current_prompt_content)
         if not str(last_prompt_str).strip() and isinstance(options.get("documents"), list) and options.get("documents"):
             last_prompt_str = "请根据上传的文档回答问题。"
@@ -263,36 +414,112 @@ def create_app() -> FastAPI:
         options["search_prompt_base"] = str(last_prompt_str)
         augmented_prompt = _augment_prompt(str(last_prompt_str), options)
 
+        client_run_id = str(options.get("client_run_id") or "").strip()
+        stream_connect_attempt = int(options.get("stream_connect_attempt") or 0)
+        harness_options = {
+            k: v for k, v in options.items() if k not in ("client_run_id", "stream_connect_attempt")
+        }
+
         async def event_generator():
             final_answer = ""
+            stream_failed = False
+            queue: asyncio.Queue = asyncio.Queue()
+
+            async def _produce() -> None:
+                lock_key: Optional[str] = None
+                try:
+                    if redis_client and session_id and client_run_id and stream_connect_attempt == 0:
+                        lock_key = f"harness:sse_run:{session_id}:{client_run_id}"
+
+                        def _try_lock() -> bool:
+                            return bool(redis_client.set(lock_key, trace_id, nx=True, ex=1800))
+
+                        got = await asyncio.to_thread(_try_lock)
+                        if not got:
+                            await queue.put(
+                                {
+                                    "event": "error",
+                                    "error": "同一会话下该 client_run_id 已有进行中的流；请勿重复发起或稍后重试。",
+                                    "error_code": "STREAM_CLIENT_RUN_ACTIVE",
+                                    "trace_id": trace_id,
+                                }
+                            )
+                            return
+                    async for ev in harness.run_stream(
+                        augmented_prompt,
+                        messages=historical_messages,
+                        mode=req.mode,
+                        options=harness_options,
+                    ):
+                        await queue.put(ev)
+                except Exception as exc:
+                    await queue.put(
+                        {
+                            "event": "error",
+                            "error": str(exc),
+                            "error_code": "SERVER_STREAM_EXCEPTION",
+                            "trace_id": trace_id,
+                        }
+                    )
+                finally:
+                    if lock_key and redis_client:
+                        try:
+                            await asyncio.to_thread(redis_client.delete, lock_key)
+                        except Exception:
+                            pass
+                    await queue.put(None)
+
+            task = asyncio.create_task(_produce())
             try:
-                async for event in harness.run_stream(
-                    augmented_prompt, messages=historical_messages, mode=req.mode, options=options
-                ):
+                while True:
                     if await request.is_disconnected():
+                        task.cancel()
                         break
-                        
+
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=15)
+                    except asyncio.TimeoutError:
+                        yield f"data: {json.dumps({'event': 'heartbeat', 'trace_id': trace_id}, ensure_ascii=False)}\n\n"
+                        continue
+
+                    if event is None:
+                        break
+
+                    event = _normalise_stream_event(event)
+
                     # We need to capture the final content to store it in redis
                     if event.get("event") == "chunk":
                         data = event.get("data", {})
                         if "content" in data:
                             final_answer += data["content"]
+                    if event.get("event") == "error":
+                        stream_failed = True
                             
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    if stream_failed:
+                        break
                     
                 # If everything succeeded and we have a final answer, update Redis
-                if redis_client and redis_key and final_answer:
+                if not stream_failed and redis_client and redis_key and final_answer:
                     try:
-                        redis_client.rpush(redis_key, json.dumps(current_user_msg))
-                        redis_client.rpush(redis_key, json.dumps({"role": "assistant", "content": final_answer}))
-                        redis_client.expire(redis_key, 60 * 60 * 24 * 30)  # 30 days
+                        await asyncio.to_thread(redis_client.rpush, redis_key, json.dumps(current_user_msg))
+                        await asyncio.to_thread(
+                            redis_client.rpush,
+                            redis_key,
+                            json.dumps({"role": "assistant", "content": final_answer}),
+                        )
+                        await asyncio.to_thread(redis_client.expire, redis_key, 60 * 60 * 24 * 30)  # 30 days
                         yield f"data: {json.dumps({'event': 'history_stored', 'session_id': session_id}, ensure_ascii=False)}\n\n"
                     except Exception as e:
                         print(f"Failed to save to redis: {e}")
                         
-                yield "data: [DONE]\n\n"
+                if not stream_failed:
+                    yield "data: [DONE]\n\n"
             except Exception as e:
-                yield f"data: {json.dumps({'event': 'error', 'error': str(e)}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'event': 'error', 'error': str(e), 'error_code': 'SSE_GENERATOR_ERROR', 'trace_id': trace_id}, ensure_ascii=False)}\n\n"
+            finally:
+                if not task.done():
+                    task.cancel()
 
         return StreamingResponse(
             event_generator(),

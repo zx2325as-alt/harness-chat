@@ -236,8 +236,8 @@ class OpenAICompatAdapter(BaseAdapter):
                             line = line.strip()
                             if not line:
                                 continue
-                            if line.startswith("data: "):
-                                data_str = line[6:]
+                            if line.startswith("data:"):
+                                data_str = line[5:].strip()
                                 if data_str == "[DONE]":
                                     break
                                 try:
@@ -252,8 +252,8 @@ class OpenAICompatAdapter(BaseAdapter):
                                     
                                     if content or reasoning_content:
                                         yield {
-                                            "content": content,
-                                            "reasoning_content": reasoning_content
+                                            "content": content or "",
+                                            "reasoning_content": reasoning_content or "",
                                         }
                                 except json.JSONDecodeError:
                                     pass
