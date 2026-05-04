@@ -250,6 +250,160 @@ class DualTrackHarness:
     def _normalized_search_key(self, query: str) -> str:
         return normalize_text(query).lower()
 
+    def _messages_signature(self, messages: Optional[List[Dict[str, Any]]]) -> str:
+        if not messages:
+            return ""
+        rows = []
+        for msg in messages[-12:]:
+            role = str(msg.get("role") or "")
+            content = _msg_content_to_text(msg.get("content"))
+            rows.append({"role": role, "content": normalize_text(content)[:1200]})
+        raw = json.dumps(rows, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _documents_signature(self, documents: Any) -> str:
+        if not isinstance(documents, list) or not documents:
+            return ""
+        rows: List[Dict[str, Any]] = []
+        for doc in documents:
+            if not isinstance(doc, dict):
+                continue
+            row: Dict[str, Any] = {
+                "name": str(doc.get("name") or ""),
+                "ext": str(doc.get("ext") or ""),
+                "status": str(doc.get("status") or ""),
+                "client_file_id": str(doc.get("client_file_id") or ""),
+            }
+            chunks = doc.get("chunks")
+            if isinstance(chunks, list) and chunks:
+                ch_rows = []
+                for chunk in chunks[:24]:
+                    if not isinstance(chunk, dict):
+                        continue
+                    content = str(chunk.get("content") or "")
+                    ch_rows.append(
+                        {
+                            "index": chunk.get("index"),
+                            "hash": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16],
+                        }
+                    )
+                row["chunks"] = ch_rows
+            else:
+                content = str(doc.get("content") or "")
+                row["content_hash"] = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+            rows.append(row)
+        raw = json.dumps(rows, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+    def _attach_documents_to_prompt(self, prompt: str, options: Optional[Dict[str, Any]]) -> str:
+        block = str((options or {}).get("_documents_context_block") or "").strip()
+        if not block:
+            return prompt
+        return (
+            f"{block}\n\n"
+            "请优先基于上述文档回答；涉及文档信息时，尽量标注来自哪份文档或哪段内容。\n\n"
+            f"{prompt}"
+        )
+
+    def _build_refine_layer1_prompt(
+        self,
+        prompt: str,
+        instruction: str,
+        entry_block: str,
+        messages: Optional[List[Dict[str, Any]]],
+        *,
+        max_history_chars: int,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        question = self._attach_documents_to_prompt(prompt, options)
+        return _build_layer1_prompt(
+            question,
+            instruction,
+            entry_block,
+            messages,
+            max_history_chars=max_history_chars,
+        )
+
+    def _build_refine_layer2_prompt(
+        self,
+        question: str,
+        instruction: str,
+        draft_answer: str,
+        messages: Optional[List[Dict[str, Any]]],
+        *,
+        max_history_chars: int,
+        options: Optional[Dict[str, Any]] = None,
+        extra_review_context: str = "",
+    ) -> str:
+        prompt = _build_layer2_prompt(
+            self._attach_documents_to_prompt(question, options),
+            instruction,
+            draft_answer,
+            messages,
+            max_history_chars=max_history_chars,
+        )
+        scr = str(extra_review_context or "").strip()
+        if scr:
+            prompt += (
+                "\n\n【自检与不确定性（供审查参考，勿直接当作用户可见正文）】\n"
+                f"{scr}\n"
+            )
+        return prompt
+
+    def _build_refine_layer3_prompt(
+        self,
+        question: str,
+        instruction: str,
+        review_body: str,
+        *,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        return _build_layer3_prompt(
+            self._attach_documents_to_prompt(question, options),
+            instruction,
+            _clean_review_body(review_body),
+        )
+
+    def _build_refine_layer2_fallback_text(self, draft_answer: str, entry_block: str = "") -> str:
+        """审查层失败时，至少回退到 Layer1；若已有入口检索摘要则一并保留。"""
+        draft = str(draft_answer or "").strip()
+        entry = str(entry_block or "").strip()
+        if not entry:
+            return draft
+        return f"{draft}\n\n{entry}".strip()
+
+    def _fast_cache_scope(self, options: Dict[str, Any]) -> str:
+        return json.dumps(
+            {
+                "track": str(options.get("_runtime_track") or "fast"),
+                "search_mode": str(options.get("search_mode") or options.get("search") or "auto").lower(),
+                "documents": str(options.get("_documents_signature") or self._documents_signature(options.get("documents"))),
+                "history": str(options.get("_history_signature") or ""),
+                "upgrade_track": bool(options.get("upgrade_track")),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _should_force_relevance_filter_sync(self, analysis: Dict[str, Any], options: Dict[str, Any]) -> bool:
+        if bool(options.get("relevance_filter_sync", False)):
+            return True
+        if analysis.get("high_risk_domain"):
+            return True
+        if analysis.get("entity_confusion_risk"):
+            return True
+        if analysis.get("numeric_sensitive"):
+            return True
+        if analysis.get("source_sensitive"):
+            return True
+        if isinstance(options.get("documents"), list) and options.get("documents"):
+            return True
+        if str(analysis.get("type") or "").lower() == "document_qa":
+            return True
+        if str(analysis.get("search_intent") or "").lower() in ("required", "freshness_required"):
+            return True
+        return False
+
     def _session_search_cache_key(self, session_id: str, query: str) -> str:
         digest = hashlib.sha256(self._normalized_search_key(query).encode("utf-8")).hexdigest()
         return f"harness:searchkb:{session_id}:{digest}"
@@ -336,6 +490,8 @@ class DualTrackHarness:
 
         should_search, search_reason = self.should_search(prompt, analysis, options)
         search_mandatory = self._search_mandatory(analysis, options)
+        if self._should_force_relevance_filter_sync(analysis, options):
+            options["relevance_filter_sync"] = True
         if speculative_search_task:
             if should_search:
                 try:
@@ -639,7 +795,7 @@ class DualTrackHarness:
         return re.sub(r"\s+", " ", (p or "").strip().lower())
 
     def _fast_cache_key_source(self, options: Dict[str, Any], augmented_prompt: str) -> str:
-        """与联网摘要无关的稳定键：优先原始用户面（search_prompt_base），否则入口钉死的身份串。"""
+        """缓存键分为正文相似度键 + 作用域键，作用域需隔离文档/历史/搜索模式/轨道。"""
         opts = options or {}
         return str(opts.get("_fast_cache_identity") or opts.get("search_prompt_base") or augmented_prompt or "").strip()
 
@@ -649,10 +805,11 @@ class DualTrackHarness:
             return None
         key_src = self._fast_cache_key_source(options, augmented_prompt)
         norm = self._norm_cache_prompt(key_src)
+        scope = self._fast_cache_scope(options)
         pref = str(fcfg.get("key_prefix") or "harness:fast:v1:")
         thresh = float(fcfg.get("similarity_threshold", 0.82))
         max_scan = int(fcfg.get("max_scan_keys", 400))
-        key = pref + hashlib.sha256(norm.encode("utf-8")).hexdigest()
+        key = pref + hashlib.sha256(f"{scope}\n{norm}".encode("utf-8")).hexdigest()
         zkey = pref + "zset"
 
         def _sync() -> Optional[str]:
@@ -666,6 +823,9 @@ class DualTrackHarness:
                 try:
                     o = json.loads(row)
                     n2 = str(o.get("n") or "")
+                    s2 = str(o.get("s") or "")
+                    if s2 != scope:
+                        continue
                     r = semantic_similarity(norm, n2)
                     if r > best_r:
                         best_r = r
@@ -687,10 +847,11 @@ class DualTrackHarness:
             return
         key_src = self._fast_cache_key_source(options, augmented_prompt)
         norm = self._norm_cache_prompt(key_src)
+        scope = self._fast_cache_scope(options)
         pref = str(fcfg.get("key_prefix") or "harness:fast:v1:")
         ttl = int(fcfg.get("ttl_sec", 864000))
-        key = pref + hashlib.sha256(norm.encode("utf-8")).hexdigest()
-        row = json.dumps({"n": norm, "a": answer}, ensure_ascii=False)
+        key = pref + hashlib.sha256(f"{scope}\n{norm}".encode("utf-8")).hexdigest()
+        row = json.dumps({"s": scope, "n": norm, "a": answer}, ensure_ascii=False)
         zkey = pref + "zset"
 
         def _sync() -> None:
@@ -1443,7 +1604,8 @@ class DualTrackHarness:
                 if role not in ("user", "assistant"):
                     continue
                 thread_msgs.append({"role": role, "content": _msg_content_to_text(m.get("content"))})
-        conv: List[Dict[str, Any]] = [{"role": "system", "content": sys_content}] + thread_msgs + [{"role": "user", "content": prompt}]
+        agent_prompt = self._attach_documents_to_prompt(prompt, options)
+        conv: List[Dict[str, Any]] = [{"role": "system", "content": sys_content}] + thread_msgs + [{"role": "user", "content": agent_prompt}]
         options.setdefault("_agent_loop_ctx", {"last_query": "", "last_ok": False, "all_queries": []})
 
         yield {
@@ -1856,6 +2018,8 @@ class DualTrackHarness:
 
     async def run_stream(self, prompt: str, mode: str = "auto", options: Optional[Dict[str, Any]] = None, messages: Optional[List[Dict[str, Any]]] = None) -> AsyncGenerator[Dict[str, Any], None]:
         options = options or {}
+        options.setdefault("_history_signature", self._messages_signature(messages))
+        options.setdefault("_documents_signature", self._documents_signature(options.get("documents")))
         if "_fast_cache_identity" not in options:
             options["_fast_cache_identity"] = str(options.get("search_prompt_base") or prompt or "").strip()
         trace_id = options.get("trace_id") or new_trace_id()
@@ -1882,6 +2046,7 @@ class DualTrackHarness:
         should_search = runtime["should_search"]
         search_reason = runtime["search_reason"]
         search_mandatory = runtime["search_mandatory"]
+        options["_runtime_track"] = chosen_track
 
         step_analyze = Step(
             name="complexity_analyze",
@@ -1946,7 +2111,8 @@ class DualTrackHarness:
             return
 
         if chosen_track == "fast":
-            cached = await self._try_fast_cache_hit(options, prompt)
+            prompt_for_answer = self._attach_documents_to_prompt(prompt, options)
+            cached = await self._try_fast_cache_hit(options, prompt_for_answer)
             if cached:
                 yield {
                     "event": "step",
@@ -1981,11 +2147,11 @@ class DualTrackHarness:
             candidates = route.get("candidates") or [route.get("selected")]
             yield {"event": "stream_start", "track": "fast", "trace_id": trace_id}
             buf: List[str] = []
-            async for s_event in self._stream_with_fallback(candidates, prompt, options, messages=messages):
+            async for s_event in self._stream_with_fallback(candidates, prompt_for_answer, options, messages=messages):
                 yield s_event
                 if s_event.get("event") == "chunk":
                     buf.append(str((s_event.get("data") or {}).get("content") or ""))
-            await self._store_fast_cache_answer(options, prompt, "".join(buf))
+            await self._store_fast_cache_answer(options, prompt_for_answer, "".join(buf))
             return
 
         # refine track
@@ -2070,12 +2236,13 @@ class DualTrackHarness:
             l1_stream_meta["model"] = "user_draft"
             l1_stream_meta["provider"] = "local"
         else:
-            l1_prompt = _build_layer1_prompt(
+            l1_prompt = self._build_refine_layer1_prompt(
                 prompt,
                 l1.get("instruction", ""),
                 entry_block,
                 messages,
                 max_history_chars=history_chars,
+                options=options,
             )
             l1_buf: List[str] = []
             async for s_event in self._stream_with_fallback(l1_candidates, l1_prompt, self._layer_opts(hcfg, "layer1", options), messages=None):
@@ -2134,12 +2301,13 @@ class DualTrackHarness:
                 "meta": _pg({"phase": "审查层 · 核对与必要时动作"}, "refine", "审查层：核对初稿，必要时触发联网核查…"),
             },
         }
-        l2_prompt = _build_layer2_prompt(
+        l2_prompt = self._build_refine_layer2_prompt(
             prompt,
             l2.get("instruction", ""),
             r1_content,
             messages,
             max_history_chars=history_chars,
+            options=options,
         )
 
         l2_candidates = refine_models.get("review") or [default_model]
@@ -2147,6 +2315,7 @@ class DualTrackHarness:
             l2_candidates, l2_prompt, self._layer_opts(hcfg, "layer2", options), messages=None
         )
         if not r2.success:
+            fallback_text = self._build_refine_layer2_fallback_text(r1_content, entry_block)
             step_l2 = Step(
                 name="refine_layer2_review",
                 status="error",
@@ -2159,7 +2328,26 @@ class DualTrackHarness:
             )
             steps.append(step_l2)
             yield {"event": "step", "step": step_l2.to_dict()}
-            yield {"event": "error", "error": "Layer 2 failed."}
+            yield {"event": "status", "phase": "fallback", "message": "审查层失败，已回退到初稿结果…"}
+            yield {
+                "event": "step",
+                "step": Step(
+                    name="refine_degrade_to_layer1",
+                    status="ok",
+                    output=fallback_text,
+                    meta=_pg(
+                        {
+                            **_tag("review"),
+                            "reason": "layer2_failed",
+                            "has_entry_search_summary": bool(str(entry_block or "").strip()),
+                        },
+                        "refine",
+                        "审查层失败，已回退到 Layer1 草稿；若已有入口联网摘要则一并保留。",
+                    ),
+                ).to_dict(),
+            }
+            async for s_event in self._emit_text_chunks(fallback_text, options):
+                yield s_event
             return
 
         review_body = (r2.content or "").strip()
@@ -2274,7 +2462,12 @@ class DualTrackHarness:
                 "meta": _pg({"phase": "润色层 · 流式成文"}, "refine", "润色层：按审查结论流式生成最终答复…"),
             },
         }
-        l3_prompt = _build_layer3_prompt(prompt, l3.get("instruction", ""), _clean_review_body(review_body))
+        l3_prompt = self._build_refine_layer3_prompt(
+            prompt,
+            l3.get("instruction", ""),
+            review_body,
+            options=options,
+        )
         l3_candidates = refine_models.get("polish") or [default_model]
         
         yield {"event": "stream_start", "track": "refine", "trace_id": trace_id}
@@ -2300,6 +2493,10 @@ class DualTrackHarness:
 
     async def run(self, prompt: str, mode: str = "auto", options: Optional[Dict[str, Any]] = None, messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         options = options or {}
+        options.setdefault("_history_signature", self._messages_signature(messages))
+        options.setdefault("_documents_signature", self._documents_signature(options.get("documents")))
+        if "_fast_cache_identity" not in options:
+            options["_fast_cache_identity"] = str(options.get("search_prompt_base") or prompt or "").strip()
         trace_id = options.get("trace_id") or new_trace_id()
         steps: List[Step] = []
         _tag = self._make_tagger()
@@ -2331,6 +2528,7 @@ class DualTrackHarness:
                 "intended_track": "agent",
                 "fallback_reason": analysis.get("fallback_reason") or "sync_api_no_agent_loop",
             }
+        options["_runtime_track"] = chosen_track
 
         steps.append(
             Step(
@@ -2378,7 +2576,8 @@ class DualTrackHarness:
                 }
 
         if chosen_track == "fast":
-            cached = await self._try_fast_cache_hit(options, prompt)
+            prompt_for_answer = self._attach_documents_to_prompt(prompt, options)
+            cached = await self._try_fast_cache_hit(options, prompt_for_answer)
             if cached:
                 steps.append(Step(name="fast_answer_cache", status="ok", meta={"chars": len(cached)}))
                 return {
@@ -2391,7 +2590,7 @@ class DualTrackHarness:
             steps.append(Step(name="fast_route", status="ok", meta=route))
 
             candidates = route.get("candidates") or [route.get("selected")]
-            res, attempts = await self._ask_with_fallback(candidates, prompt, options, messages=messages)
+            res, attempts = await self._ask_with_fallback(candidates, prompt_for_answer, options, messages=messages)
             steps.append(
                 Step(
                     name="fast_ask",
@@ -2405,7 +2604,7 @@ class DualTrackHarness:
                 )
             )
             if res.success:
-                await self._store_fast_cache_answer(options, prompt, res.content or "")
+                await self._store_fast_cache_answer(options, prompt_for_answer, res.content or "")
             return {
                 "trace_id": trace_id,
                 "track": "fast",
@@ -2478,12 +2677,13 @@ class DualTrackHarness:
             a1: List[Dict[str, Any]] = []
             l1_prompt = draft_text
         else:
-            l1_prompt = _build_layer1_prompt(
+            l1_prompt = self._build_refine_layer1_prompt(
                 prompt,
                 l1.get("instruction", ""),
                 entry_block,
                 messages,
                 max_history_chars=history_chars,
+                options=options,
             )
             r1, a1 = await self._ask_with_fallback(
                 l1_candidates, l1_prompt, self._layer_opts(hcfg, "layer1", options), messages=None
@@ -2511,18 +2711,20 @@ class DualTrackHarness:
             }
 
         # Layer 2（含可选联网核查，与流式接口逻辑对齐）
-        l2_prompt = _build_layer2_prompt(
+        l2_prompt = self._build_refine_layer2_prompt(
             prompt,
             l2.get("instruction", ""),
             r1.content or "",
             messages,
             max_history_chars=history_chars,
+            options=options,
         )
         l2_candidates = refine_models.get("review") or [default_model]
         r2, a2 = await self._ask_with_fallback(
             l2_candidates, l2_prompt, self._layer_opts(hcfg, "layer2", options), messages=None
         )
         if not r2.success:
+            fallback_text = self._build_refine_layer2_fallback_text(r1.content or "", entry_block)
             steps.append(
                 Step(
                     name="refine_layer2_review",
@@ -2539,14 +2741,21 @@ class DualTrackHarness:
                 Step(
                     name="refine_degrade_to_layer1",
                     status="ok",
-                    meta={"reason": "layer2_failed"},
-                    output=r1.content,
+                    meta={
+                        **_tag("review"),
+                        "reason": "layer2_failed",
+                        "has_entry_search_summary": bool(str(entry_block or "").strip()),
+                    },
+                    output=fallback_text,
                 )
             )
             return {
                 "trace_id": trace_id,
                 "track": "refine",
-                "final": r1.to_dict(),
+                "final": {
+                    **r1.to_dict(),
+                    "content": fallback_text,
+                },
                 "steps": [s.to_dict() for s in steps],
             }
 
@@ -2609,7 +2818,12 @@ class DualTrackHarness:
         )
 
         # Layer 3
-        l3_prompt = _build_layer3_prompt(prompt, l3.get("instruction", ""), _clean_review_body(review_body))
+        l3_prompt = self._build_refine_layer3_prompt(
+            prompt,
+            l3.get("instruction", ""),
+            review_body,
+            options=options,
+        )
         l3_candidates = refine_models.get("polish") or [default_model]
         r3, a3 = await self._ask_with_fallback(
             l3_candidates, l3_prompt, self._layer_opts(hcfg, "layer3", options), messages=None

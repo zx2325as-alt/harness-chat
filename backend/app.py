@@ -41,7 +41,10 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None  # Added session_id for Redis tracking
     prompt: Any = Field(default="", description="The new user message")
     messages: List[Message] = Field(default_factory=list, description="Historical conversation messages")
-    mode: str = Field(default="auto", description="auto | fast | refine | agent（agent 仅流式推荐；同步接口会降级为 refine）")
+    mode: str = Field(
+        default="auto",
+        description="auto | fast | refine | agent（当前真 Agent 循环仅在 /api/chat/stream 提供；/api/chat 选择 agent 时会自动降级为 refine）",
+    )
     options: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -228,16 +231,9 @@ def _int_option(options: Dict[str, Any], key: str, default: int, *, minimum: int
     return max(minimum, min(maximum, value))
 
 
-def _augment_prompt(prompt: str, options: Dict[str, Any]) -> str:
+def _prepare_documents_context_block(prompt: str, options: Dict[str, Any]) -> str:
     doc_budget = _int_option(options, "doc_context_chars", 40_000, minimum=2_000, maximum=60_000)
-    docs_context = _documents_context(options.get("documents"), query=prompt, max_total_chars=doc_budget)
-    if not docs_context:
-        return prompt
-    return (
-        f"{docs_context}\n\n"
-        "请优先基于上述文档回答；涉及文档信息时，尽量标注来自哪份文档或哪段内容。\n\n"
-        f"【用户问题】\n{prompt}"
-    )
+    return _documents_context(options.get("documents"), query=prompt, max_total_chars=doc_budget)
 
 
 def _ensure_non_empty_prompt(last_prompt: str, hist: List[Dict[str, Any]]) -> None:
@@ -254,7 +250,7 @@ def _capture_stream_text(final_answer: str, event: Dict[str, Any]) -> Tuple[str,
         data = event.get("data", {})
         if "content" in data:
             final_answer += str(data["content"])
-    return final_answer, evt == "error"
+    return final_answer, evt == "error_terminal"
 
 
 def _init_redis_client(cfg: Dict[str, Any]) -> Optional[redis.Redis]:
@@ -555,9 +551,8 @@ def create_app() -> FastAPI:
         _ensure_non_empty_prompt(str(last_prompt), hist)
         options["search_prompt_base"] = str(last_prompt)
         options["session_id"] = req.session_id or ""
-        augmented = _augment_prompt(str(last_prompt), options)
-
-        result = await harness.run(augmented, messages=hist, mode=req.mode, options=options)
+        options["_documents_context_block"] = _prepare_documents_context_block(str(last_prompt), options)
+        result = await harness.run(str(last_prompt), messages=hist, mode=req.mode, options=options)
         return result
 
     @app.post("/api/chat/stream")
@@ -600,7 +595,7 @@ def create_app() -> FastAPI:
 
         options["search_prompt_base"] = str(last_prompt_str)
         options["session_id"] = session_id or ""
-        augmented_prompt = _augment_prompt(str(last_prompt_str), options)
+        options["_documents_context_block"] = _prepare_documents_context_block(str(last_prompt_str), options)
 
         client_run_id = str(options.get("client_run_id") or "").strip()
         stream_connect_attempt = _int_option(options, "stream_connect_attempt", 0, minimum=0, maximum=20)
@@ -613,6 +608,7 @@ def create_app() -> FastAPI:
             final_answer = ""
             reset_pending = False
             stream_failed = False
+            terminal_error: Optional[Dict[str, Any]] = None
             queue: asyncio.Queue = asyncio.Queue()
 
             async def _produce() -> None:
@@ -636,7 +632,7 @@ def create_app() -> FastAPI:
                             )
                             return
                     async for ev in harness.run_stream(
-                        augmented_prompt,
+                        str(last_prompt_str),
                         messages=historical_messages,
                         mode=req.mode,
                         options=harness_options,
@@ -684,9 +680,18 @@ def create_app() -> FastAPI:
                         reset_pending = True
                     elif event.get("event") == "chunk" and (event.get("data") or {}).get("content"):
                         reset_pending = False
-                    if event_failed:
+                    if event.get("event") == "error":
                         stream_failed = True
-                            
+                        terminal_error = {
+                            "event": "error_terminal",
+                            "error": str(event.get("error") or "服务端流式处理失败"),
+                            "error_code": str(event.get("error_code") or "STREAM_ERROR"),
+                            "trace_id": str(event.get("trace_id") or trace_id),
+                            "reset_pending": bool(reset_pending),
+                        }
+                    elif event_failed:
+                        stream_failed = True
+
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                     if stream_failed:
                         break
@@ -705,11 +710,21 @@ def create_app() -> FastAPI:
                         yield f"data: {json.dumps({'event': 'history_stored', 'session_id': session_id}, ensure_ascii=False)}\n\n"
                     except Exception as e:
                         print(f"Failed to save to redis: {e}")
-                        
-                if not stream_failed:
-                    yield "data: [DONE]\n\n"
+                if stream_failed and terminal_error:
+                    yield f"data: {json.dumps(terminal_error, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
             except Exception as e:
-                yield f"data: {json.dumps({'event': 'error', 'error': str(e), 'error_code': 'SSE_GENERATOR_ERROR', 'trace_id': trace_id}, ensure_ascii=False)}\n\n"
+                err_event = {
+                    "event": "error",
+                    "error": str(e),
+                    "error_code": "SSE_GENERATOR_ERROR",
+                    "trace_id": trace_id,
+                }
+                yield f"data: {json.dumps(err_event, ensure_ascii=False)}\n\n"
+                yield (
+                    f"data: {json.dumps({'event': 'error_terminal', 'error': str(e), 'error_code': 'SSE_GENERATOR_ERROR', 'trace_id': trace_id, 'reset_pending': bool(reset_pending)}, ensure_ascii=False)}\n\n"
+                )
+                yield "data: [DONE]\n\n"
             finally:
                 if not task.done():
                     task.cancel()

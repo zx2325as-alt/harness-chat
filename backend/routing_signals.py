@@ -66,6 +66,65 @@ FRESHNESS_PHRASES = (
 MEDICAL_KW = ("症状", "诊断", "处方", "用药", "治疗", "疾病", "医院", "临床")
 LEGAL_KW = ("法律依据", "诉讼", "合同效力", "律师", "违法", "刑法", "民法", "合规")
 FINANCE_KW = ("投资建议", "买入", "卖出", "股票推荐", "理财建议", "基金", "杠杆", "融资融券")
+ENTITY_CONFUSION_KW = (
+    "是不是同一个",
+    "是不是一个人",
+    "是不是一家",
+    "是否同一",
+    "区别",
+    "对比",
+    "vs",
+    "对照",
+    "还是",
+)
+NUMERIC_SENSITIVE_KW = (
+    "多少",
+    "数字",
+    "比例",
+    "百分比",
+    "营收",
+    "收入",
+    "利润",
+    "市值",
+    "排名",
+    "票房",
+    "用户数",
+    "下载量",
+    "销量",
+)
+SOURCE_SENSITIVE_KW = (
+    "来源",
+    "出处",
+    "引用",
+    "官网",
+    "官方",
+    "权威",
+    "证据",
+    "依据",
+    "数据源",
+    "原文",
+    "链接",
+)
+ENTITY_JOINER_KW = ("和", "与", "跟")
+ENTITY_WH_KW = ("谁", "哪位", "哪个", "哪家", "哪个人", "哪个公司")
+NUMERIC_METRIC_KW = (
+    "营收",
+    "收入",
+    "利润",
+    "市值",
+    "排名",
+    "票房",
+    "用户数",
+    "下载量",
+    "销量",
+    "股价",
+    "汇率",
+    "百分比",
+    "比例",
+    "数量",
+    "数据",
+)
+NUMERIC_WEAK_QUERY_KW = ("几", "多少", "多大", "多高", "多低")
 
 
 def _norm_si(v: str) -> str:
@@ -95,6 +154,44 @@ def detect_high_risk_domain(prompt: str) -> Tuple[bool, List[str]]:
         if k in t:
             hits.append(f"finance:{k}")
     return bool(hits), hits[:8]
+
+
+def detect_search_sensitivity(prompt: str) -> Dict[str, Any]:
+    t = (prompt or "").strip()
+    low = t.lower()
+    entity_hits: List[str] = []
+    numeric_hits: List[str] = []
+    source_hits: List[str] = []
+    strong_entity_hits = [k for k in ENTITY_CONFUSION_KW if ((k in low) if k == "vs" else (k in t))]
+    if strong_entity_hits:
+        entity_hits.extend(strong_entity_hits)
+    elif any(word in t for word in ENTITY_WH_KW) and any(token in t for token in ENTITY_JOINER_KW + ("还是",)):
+        entity_hits.append("wh_compare")
+    elif any(joiner in t for joiner in ENTITY_JOINER_KW) and any(token in t for token in ("同一个", "同一", "区别", "对比")):
+        entity_hits.append("joiner_compare")
+
+    strong_numeric_hits = [k for k in NUMERIC_SENSITIVE_KW if k in t]
+    if strong_numeric_hits:
+        numeric_hits.extend(strong_numeric_hits)
+    elif any(k in t for k in NUMERIC_WEAK_QUERY_KW) and any(metric in t for metric in NUMERIC_METRIC_KW):
+        numeric_hits.append("weak_query+metric")
+    elif re.search(r"\d", t) and any(metric in t for metric in NUMERIC_METRIC_KW):
+        numeric_hits.append("number+metric")
+
+    for k in NUMERIC_METRIC_KW:
+        if k in t and k not in numeric_hits:
+            numeric_hits.append(k)
+    for k in SOURCE_SENSITIVE_KW:
+        if k in t:
+            source_hits.append(k)
+    return {
+        "entity_confusion_risk": bool(entity_hits),
+        "entity_confusion_hits": entity_hits[:8],
+        "numeric_sensitive": bool(numeric_hits),
+        "numeric_sensitive_hits": numeric_hits[:8],
+        "source_sensitive": bool(source_hits),
+        "source_sensitive_hits": source_hits[:8],
+    }
 
 
 def derive_user_signals(prompt: str, options: Dict[str, Any]) -> Dict[str, Any]:
@@ -164,8 +261,10 @@ def merge_signals_into_analysis(
     out["_routing_signals"] = sig2
     p = (user_prompt or str(analysis.get("search_prompt_base") or "")).strip()
     hr, hits = detect_high_risk_domain(p)
+    sensitivity = detect_search_sensitivity(p)
     out["high_risk_domain"] = hr
     out["high_risk_hits"] = hits
+    out.update(sensitivity)
     return out
 
 

@@ -100,6 +100,35 @@ export function createResumeContext(userMsg, documents, searchMode) {
   return { userMsg, documents, searchMode };
 }
 
+export function snapshotSessionState(session) {
+  if (!session) return null;
+  return {
+    messages: JSON.parse(JSON.stringify(session.messages || [])),
+    stepRuns: JSON.parse(JSON.stringify(session.stepRuns || [])),
+    useServerHistoryOnly: Boolean(session.useServerHistoryOnly),
+  };
+}
+
+export function restoreSessionState(session, snapshot) {
+  if (!session || !snapshot) return;
+  session.messages = snapshot.messages;
+  session.stepRuns = snapshot.stepRuns;
+  session.useServerHistoryOnly = snapshot.useServerHistoryOnly;
+}
+
+export function removeSessionLocally(sessions, currentSessionId, id, createSession) {
+  const nextSessions = Array.isArray(sessions) ? sessions.filter((s) => s.id !== id) : [];
+  let nextCurrentSessionId = currentSessionId;
+  if (nextSessions.length === 0) {
+    const newSession = createSession();
+    nextSessions.unshift(newSession);
+    nextCurrentSessionId = newSession.id;
+  } else if (currentSessionId === id) {
+    nextCurrentSessionId = nextSessions[0].id;
+  }
+  return { sessions: nextSessions, currentSessionId: nextCurrentSessionId };
+}
+
 export function createStreamContext() {
   return {
     buffer: "",
@@ -110,6 +139,15 @@ export function createStreamContext() {
     lastErrorEvent: null,
     modelErrors: [],
     contentResetCount: 0,
+  };
+}
+
+export function buildSseParseTerminalEvent(dataStr) {
+  return {
+    event: "error_terminal",
+    error: "SSE 事件解析失败，已终止当前响应。",
+    error_code: "SSE_PARSE_ERROR",
+    raw_preview: String(dataStr || "").slice(0, 200),
   };
 }
 

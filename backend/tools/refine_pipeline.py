@@ -25,7 +25,7 @@ async def stream_refine_from_draft(
     meta_extra: 写入各 step.meta，用于区分 agent 工具调用 / 兜底等。
     extra_review_context: 可选自检文本，仅注入审查层 prompt，不进入最终用户可见草稿。
     """
-    from harness import Step, _clean_review_body, _pg  # 运行时导入，避免与 harness 顶层循环依赖
+    from harness import Step, _clean_review_body, _int_budget, _pg  # 运行时导入，避免与 harness 顶层循环依赖
 
     extra_meta = dict(meta_extra or {})
     chain = hcfg.get("refine_chain") or {}
@@ -34,15 +34,17 @@ async def stream_refine_from_draft(
     routing = hcfg.get("routing") or {}
     default_model = routing.get("default_model", "gpt-5.5")
     refine_models = analysis.get("refine_models") or {}
-    l2_prompt = (
-        f"{l2.get('instruction','').strip()}\n\n【原始问题】\n{question.strip()}\n\n【初稿答案】\n{draft_text.strip()}\n"
+    history_chars = _int_budget(options, "history_context_chars", 4000, minimum=800, maximum=12000)
+    review_search_chars = _int_budget(options, "review_search_context_chars", 6000, minimum=1500, maximum=12000)
+    l2_prompt = harness._build_refine_layer2_prompt(
+        question,
+        l2.get("instruction", ""),
+        draft_text,
+        messages,
+        max_history_chars=history_chars,
+        options=options,
+        extra_review_context=extra_review_context,
     )
-    scr = (extra_review_context or "").strip()
-    if scr:
-        l2_prompt += (
-            "\n\n【自检与不确定性（供审查参考，勿直接当作用户可见正文）】\n"
-            f"{scr}\n"
-        )
     l2_candidates = refine_models.get("review") or [default_model]
     opts_l2 = {**options, "temperature": float(l2.get("temperature", 0.1))}
     r2, a2 = await harness._ask_with_fallback(l2_candidates, l2_prompt, opts_l2, messages=None)
@@ -69,7 +71,28 @@ async def stream_refine_from_draft(
     )
     yield {"event": "step", "step": step_l2.to_dict()}
     if not r2.success:
-        yield {"event": "error", "error": "审查层失败"}
+        fallback_text = harness._build_refine_layer2_fallback_text(draft_text, "")
+        yield {"event": "status", "phase": "fallback", "message": "审查层失败，已回退到草稿结果…"}
+        yield {
+            "event": "step",
+            "step": Step(
+                name="refine_degrade_to_layer1",
+                status="ok",
+                output=fallback_text,
+                meta=_pg(
+                    {
+                        **extra_meta,
+                        "reason": "layer2_failed",
+                        "from_agent": True,
+                        "pipeline_phase": "review",
+                    },
+                    "polishing",
+                    "Agent 审查层失败，已回退到草稿结果继续输出。",
+                ),
+            ).to_dict(),
+        }
+        async for s_event in harness._emit_text_chunks(fallback_text, options):
+            yield s_event
         return
     review_body = _clean_review_body(r2.content or "")
     extra_ctx = ""
@@ -109,7 +132,7 @@ async def stream_refine_from_draft(
         else:
             overrides = harness._track_search_overrides("refine")
             sr = await harness.perform_web_search(vq, {**options, **{k: v for k, v in overrides.items() if v is not None}})
-        snip = (sr.get("context") or "")[:8000]
+        snip = (sr.get("context") or "")[:review_search_chars]
         rc = len(sr.get("sources") or [])
         yield {
             "event": "step",
@@ -150,8 +173,11 @@ async def stream_refine_from_draft(
             review_body = _clean_review_body(r2b.content)
         else:
             break
-    l3_prompt = (
-        f"{l3.get('instruction','').strip()}\n\n【原始问题】\n{question.strip()}\n\n【审查层答案】\n{review_body.strip()}\n"
+    l3_prompt = harness._build_refine_layer3_prompt(
+        question,
+        l3.get("instruction", ""),
+        review_body,
+        options=options,
     )
     l3_candidates = refine_models.get("polish") or [default_model]
     opts_l3 = {**options, "temperature": float(l3.get("temperature", 0.3))}

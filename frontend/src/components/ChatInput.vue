@@ -34,6 +34,7 @@
               type="button"
               class="dd-trigger"
               :disabled="uiBusy"
+              :title="modeHint"
               aria-haspopup="listbox"
               :aria-expanded="openMenu === 'mode'"
               @click.stop="toggleMenu('mode')"
@@ -150,7 +151,7 @@ import { isSendableComposerState } from "../chatShared.js";
 
 const MODE_OPTIONS = [
   { value: "auto", label: "自动" },
-  { value: "agent", label: "Agent 轨" },
+  { value: "agent", label: "Agent 轨（仅流式真 Agent）" },
   { value: "refine", label: "精化轨" },
   { value: "fast", label: "快速轨" },
 ];
@@ -295,6 +296,9 @@ export default {
     modeLabel() {
       return MODE_OPTIONS.find((o) => o.value === this.mode)?.label ?? this.mode;
     },
+    modeHint() {
+      return "Agent 真循环仅在流式接口可用；同步 /api/chat 即使选择 Agent 也会降级为 Refine。";
+    },
     searchLabel() {
       return SEARCH_OPTIONS.find((o) => o.value === this.searchMode)?.label ?? this.searchMode;
     },
@@ -399,6 +403,30 @@ export default {
           .map((att) => this.attachmentSignature(att.file))
       );
     },
+    documentPayloadSignature(doc) {
+      if (!doc || typeof doc !== "object") return "";
+      const chunks = Array.isArray(doc.chunks)
+        ? doc.chunks.slice(0, 24).map((chunk) => ({
+            index: chunk?.index ?? "",
+            content: String(chunk?.content || "").slice(0, 120),
+          }))
+        : [];
+      return JSON.stringify({
+        name: String(doc.name || ""),
+        ext: String(doc.ext || ""),
+        status: String(doc.status || ""),
+        content: String(doc.content || "").slice(0, 500),
+        chunks,
+      });
+    },
+    existingDocumentPayloadSignatures() {
+      return new Set(
+        this.attachments
+          .filter((att) => att?.kind === "document" && att?.doc)
+          .map((att) => this.documentPayloadSignature(att.doc))
+          .filter(Boolean)
+      );
+    },
     async extractApiError(res) {
       try {
         const data = await res.json();
@@ -462,8 +490,28 @@ export default {
       await Promise.all(workers);
     },
     appendFolderDocuments(documents) {
+      const existingDocSigs = this.existingDocumentPayloadSignatures();
+      const selectedDocSigs = new Set();
+      let remainingSlots = Math.max(0, MAX_ATTACHMENT_FILES - this.currentDocumentCount());
       (documents || []).forEach((doc) => {
         if (!doc || !doc.name) return;
+        const docSig = this.documentPayloadSignature(doc);
+        if (docSig && (existingDocSigs.has(docSig) || selectedDocSigs.has(docSig))) {
+          this.createLocalErrorAttachment(
+            { name: doc.name, type: "" },
+            "该文件已在附件列表中，无需重复导入。"
+          );
+          return;
+        }
+        if (remainingSlots <= 0) {
+          this.createLocalErrorAttachment(
+            { name: doc.name, type: "" },
+            `导入文件数量超过限制，当前最多支持 ${MAX_ATTACHMENT_FILES} 个文档。`
+          );
+          return;
+        }
+        remainingSlots -= 1;
+        if (docSig) selectedDocSigs.add(docSig);
         this.attachments.push({
           id: this.newAttachmentId(),
           name: doc.name,
@@ -478,6 +526,14 @@ export default {
     },
     async readLocalFolder() {
       if (this.uiBusy) return;
+      const remainingSlots = Math.max(0, MAX_ATTACHMENT_FILES - this.currentDocumentCount());
+      if (remainingSlots <= 0) {
+        this.createLocalErrorAttachment(
+          { name: "本地文件夹", type: "" },
+          `导入文件数量超过限制，当前最多支持 ${MAX_ATTACHMENT_FILES} 个文档。`
+        );
+        return;
+      }
       const folderPath = window.prompt("请输入服务端本地文件夹路径", "");
       if (folderPath == null) return;
       const normalizedPath = String(folderPath).trim();
@@ -491,7 +547,7 @@ export default {
           body: JSON.stringify({
             folder_path: normalizedPath,
             recursive,
-            max_files: 50,
+            max_files: remainingSlots,
           }),
         });
         if (!res.ok) {

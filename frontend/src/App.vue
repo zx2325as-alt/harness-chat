@@ -24,10 +24,10 @@
     <div class="app-body">
       <aside class="sidebar" v-if="view === 'chat'">
         <div class="sidebar-actions">
-          <button class="new-chat-btn" :disabled="busy" @click="createNewSession">
+          <button class="new-chat-btn" :disabled="interactionBusy" @click="createNewSession">
             <span class="icon">+</span> 新建对话
           </button>
-          <button type="button" class="clear-ctx-btn" :disabled="busy" @click="clearSessionContext">清空上下文</button>
+          <button type="button" class="clear-ctx-btn" :disabled="interactionBusy" @click="clearSessionContext">清空上下文</button>
         </div>
         <div class="session-list">
           <div 
@@ -38,7 +38,7 @@
             @click="selectSession(s.id)"
           >
             <div class="session-title">{{ getSessionTitle(s) }}</div>
-            <button class="delete-btn" :disabled="busy" @click.stop="deleteSession(s.id)">×</button>
+            <button class="delete-btn" :disabled="interactionBusy" @click.stop="deleteSession(s.id)">×</button>
           </div>
         </div>
       </aside>
@@ -62,7 +62,7 @@
             </div>
             <ChatInput
               ref="chatInput"
-              :busy="busy"
+              :busy="interactionBusy"
               :mode="mode"
               @update:mode="mode = $event"
               @send="onSend"
@@ -106,6 +106,7 @@ import { API_BASE } from "./apiBase.js";
 import { sendFeedback } from "./feedbackApi.js";
 import {
   buildStreamErrorDetail,
+  buildSseParseTerminalEvent,
   buildStreamInterruptedMessage,
   buildStreamRequestPayload,
   clipHistoryMessages,
@@ -119,6 +120,9 @@ import {
   getSessionTitle as deriveSessionTitle,
   getRunTitle as deriveRunTitle,
   normalizePayload as normalizeChatPayload,
+  removeSessionLocally,
+  restoreSessionState as restoreSessionStateHelper,
+  snapshotSessionState as snapshotSessionStateHelper,
   shouldIncludeHistoryMessage,
   splitSseFrames,
   sseReconnectDelayMs,
@@ -151,11 +155,15 @@ export default {
       chatBanner: "",
       /** 服务端 Redis 已持久化本轮后，后续请求可省略 messages 体积 */
       _saveSessionsTimer: null,
+      _saveSessionsPromise: null,
+      _saveSessionsQueued: false,
+      _lastPersistedSessionsPayload: "",
       _scrollBottomPending: false,
       _panelResize: null,
       _streamIdleTimer: null,
       _dwellTimer: null,
       _lastChunkAt: 0,
+      _sessionTxnDepth: 0,
     };
   },
   computed: {
@@ -166,6 +174,9 @@ export default {
     },
     hideRightPanel() {
       return this.view !== "chat" || !this.showStepsPanel;
+    },
+    interactionBusy() {
+      return this.busy || this._sessionTxnDepth > 0;
     },
     currentSession() {
       return this.sessions.find(s => s.id === this.currentSessionId) || null;
@@ -216,40 +227,83 @@ export default {
       const loaded = await loadSessionsState();
       this.sessions = loaded.sessions;
       if (this.sessions.length === 0) {
+        if ((loaded.parseFailures || []).length >= 2) {
+          this.chatBanner = "本地历史加载失败，已自动创建新会话；原有本地存储数据可能已损坏。";
+        }
         this.createNewSession();
       } else {
         const preferredId = loaded.currentSessionId;
         this.currentSessionId =
           this.sessions.find((s) => s.id === preferredId)?.id || this.sessions[0].id;
         this.sessions.forEach((s) => this.syncStepRunsWithMessages(s));
+        if ((loaded.parseFailures || []).length > 0 && loaded.recoveredFromSource === "localStorage") {
+          this.chatBanner = "检测到 IndexedDB 会话数据损坏，已自动回退并恢复本地历史。";
+        }
       }
     },
-    saveSessions() {
-      const payload = JSON.stringify({
+    _buildSessionsPersistPayload() {
+      return JSON.stringify({
         currentSessionId: this.currentSessionId || "",
-        sessions: this.sessions,
+        sessions: (this.sessions || []).map((session) => ({
+          ...session,
+          // 仅保留运行期标志，避免刷新后粘住“只用服务端历史”状态。
+          useServerHistoryOnly: false,
+        })),
       });
-      const persist = async () => {
-        try {
-          await persistSessionsState(payload, async () => {
+    },
+    async saveSessions() {
+      const persistOnce = async (payload) => {
+        await persistSessionsState(payload, async () => {
+          let retryPayload = payload;
+          for (let i = 0; i < 12; i += 1) {
+            const beforePayload = this._buildSessionsPersistPayload();
             this._pruneSessionsForQuota();
-            try {
-              localStorage.setItem(
-                "harness_sessions",
-                JSON.stringify({
-                  currentSessionId: this.currentSessionId || "",
-                  sessions: this.sessions,
-                })
-              );
-            } catch (e2) {
-              console.error("Failed to save sessions after prune", e2);
+            retryPayload = this._buildSessionsPersistPayload();
+            if (retryPayload === beforePayload) {
+              throw new Error("Session persistence quota fallback exhausted");
             }
-          });
-        } catch (e) {
-          console.error("Failed to save sessions", e);
-        }
+            try {
+              await persistSessionsState(retryPayload);
+              this._lastPersistedSessionsPayload = retryPayload;
+              return;
+            } catch (e) {
+              if (!(e && e.name === "QuotaExceededError")) {
+                throw e;
+              }
+            }
+          }
+          throw new Error("Session persistence quota fallback exhausted");
+        });
       };
-      persist().catch((e) => console.error("saveSessions persist", e));
+      let payload = this._buildSessionsPersistPayload();
+      if (!this._saveSessionsPromise && payload === this._lastPersistedSessionsPayload) return;
+      if (this._saveSessionsPromise) {
+        this._saveSessionsQueued = true;
+        return this._saveSessionsPromise;
+      }
+      this._saveSessionsPromise = (async () => {
+        while (payload) {
+          this._saveSessionsQueued = false;
+          try {
+            await persistOnce(payload);
+            this._lastPersistedSessionsPayload = payload;
+          } catch (e) {
+            console.error("Failed to save sessions", e);
+            const msg = String(e && e.message ? e.message : e);
+            this.chatBanner = msg.includes("quota fallback exhausted")
+              ? "本地会话已尽力裁剪，但仍无法完整保存；建议手动清理部分旧会话后重试。"
+              : "本地会话保存失败，本次改动可能不会在刷新后保留。";
+          }
+          if (!this._saveSessionsQueued) break;
+          payload = this._buildSessionsPersistPayload();
+          if (payload === this._lastPersistedSessionsPayload) break;
+        }
+      })()
+        .catch((e) => console.error("saveSessions persist", e))
+        .finally(() => {
+          this._saveSessionsPromise = null;
+        });
+      return this._saveSessionsPromise;
     },
     _pruneSessionsForQuota() {
       const pruned = pruneSessionsForQuota(this.sessions, this.currentSessionId);
@@ -260,7 +314,7 @@ export default {
       if (this._saveSessionsTimer) clearTimeout(this._saveSessionsTimer);
       this._saveSessionsTimer = setTimeout(() => {
         this._saveSessionsTimer = null;
-        this.saveSessions();
+        void this.saveSessions();
       }, 80);
     },
     flushSaveSessions() {
@@ -268,7 +322,7 @@ export default {
         clearTimeout(this._saveSessionsTimer);
         this._saveSessionsTimer = null;
       }
-      this.saveSessions();
+      void this.saveSessions();
     },
     scheduleScrollBottom() {
       if (this._scrollBottomPending) return;
@@ -279,32 +333,59 @@ export default {
       });
     },
     createNewSession() {
-      if (this.busy) return;
-      const newSession = {
+      if (this.interactionBusy) return;
+      const newSession = this._makeBlankSession();
+      this.sessions.unshift(newSession);
+      this.currentSessionId = newSession.id;
+      this.scheduleSaveSessions();
+    },
+    selectSession(id) {
+      if (this.interactionBusy) return;
+      this.currentSessionId = id;
+      this.scheduleSaveSessions();
+      this.scrollToBottom();
+    },
+    _makeBlankSession() {
+      return {
         id: createSessionId(),
         messages: [],
         stepRuns: [],
         useServerHistoryOnly: false,
       };
-      this.sessions.unshift(newSession);
-      this.currentSessionId = newSession.id;
-      this.saveSessions();
     },
-    selectSession(id) {
-      if (this.busy) return;
-      this.currentSessionId = id;
-      this.saveSessions();
-      this.scrollToBottom();
-    },
-    deleteSession(id) {
-      if (this.busy) return;
-      this.sessions = this.sessions.filter(s => s.id !== id);
-      if (this.sessions.length === 0) {
-        this.createNewSession();
-      } else if (this.currentSessionId === id) {
-        this.currentSessionId = this.sessions[0].id;
+    async _runSessionTransaction(work) {
+      this._sessionTxnDepth += 1;
+      try {
+        return await work();
+      } finally {
+        this._sessionTxnDepth = Math.max(0, this._sessionTxnDepth - 1);
       }
-      this.saveSessions();
+    },
+    async deleteSession(id) {
+      if (this.interactionBusy) return;
+      await this._runSessionTransaction(async () => {
+        const exists = this.sessions.find((s) => s.id === id);
+        if (!exists) return;
+        const snapshotSessions = JSON.parse(JSON.stringify(this.sessions || []));
+        const snapshotCurrentSessionId = this.currentSessionId;
+        const next = removeSessionLocally(
+          this.sessions,
+          this.currentSessionId,
+          id,
+          () => this._makeBlankSession()
+        );
+        this.sessions = next.sessions;
+        this.currentSessionId = next.currentSessionId;
+        const clearResult = await this.clearServerHistory(id);
+        if (clearResult && clearResult.ok === false) {
+          this.sessions = snapshotSessions;
+          this.currentSessionId = snapshotCurrentSessionId;
+          this.chatBanner = "服务端历史清理失败，已取消删除，避免前后端会话语义不一致。";
+          this.flushSaveSessions();
+          return;
+        }
+        this.scheduleSaveSessions();
+      });
     },
     getSessionTitle(session) {
       return deriveSessionTitle(session);
@@ -340,7 +421,7 @@ export default {
       const run = createStepRunEntry(userMsg, documents, searchMode);
       session.stepRuns.push(run);
       this.activeRunId = run.id;
-      this.saveSessions();
+      this.scheduleSaveSessions();
       return run;
     },
     syncStepRunsWithMessages(session) {
@@ -369,18 +450,10 @@ export default {
       this.syncStepRunsWithMessages(session);
     },
     snapshotSessionState(session) {
-      if (!session) return null;
-      return {
-        messages: JSON.parse(JSON.stringify(session.messages || [])),
-        stepRuns: JSON.parse(JSON.stringify(session.stepRuns || [])),
-        useServerHistoryOnly: Boolean(session.useServerHistoryOnly),
-      };
+      return snapshotSessionStateHelper(session);
     },
     restoreSessionState(session, snapshot) {
-      if (!session || !snapshot) return;
-      session.messages = snapshot.messages;
-      session.stepRuns = snapshot.stepRuns;
-      session.useServerHistoryOnly = snapshot.useServerHistoryOnly;
+      restoreSessionStateHelper(session, snapshot);
       this.syncStepRunsWithMessages(session);
     },
     /** 同一步 name 可能多次出现（如审查多轮联网），用签名区分，避免互相覆盖 */
@@ -400,7 +473,7 @@ export default {
     _userContentToPrompt(content) {
       return contentToPrompt(content);
     },
-    /** 供 API 的历史条：不含当前用户句；若 useServerHistoryOnly 则发空数组由 Redis 补全 */
+    /** 供 API 的历史条：不含当前用户句。 */
     buildHistoryForApi(session, lastUser, pendingId) {
       const uid = lastUser && lastUser.id;
       const rows = (session?.messages || []).filter((m) => shouldIncludeHistoryMessage(m, uid, pendingId));
@@ -485,13 +558,15 @@ export default {
         if (session) session.useServerHistoryOnly = false;
         this.chatBanner = "服务端历史缺失，已回退为携带本地上下文请求。";
       } else if (event.event === "error") {
+        ctx.lastErrorEvent = event;
+        run.phaseMessage = event.error || "服务端返回错误";
+        this.bumpStepUi();
+      } else if (event.event === "error_terminal") {
         ctx.streamFailed = true;
         ctx.lastErrorEvent = event;
         run.status = "error";
-        run.phaseMessage = event.error || "服务端返回错误";
+        run.phaseMessage = event.error || "服务端流式处理失败";
         this.bumpStepUi();
-        this.flushSaveSessions();
-        throw new Error(event.error_code ? `${event.error} (${event.error_code})` : event.error);
       }
     },
     async _pumpChatSseReader(reader, decoder, ctx, bundle) {
@@ -505,7 +580,11 @@ export default {
           event = JSON.parse(dataStr);
         } catch (e) {
           console.error("SSE parse error", e, dataStr);
-          return false;
+          const terminalEvent = buildSseParseTerminalEvent(dataStr);
+          ctx.lastErrorEvent = terminalEvent;
+          ctx.streamFailed = true;
+          await this._applyStreamSseEvent(terminalEvent, ctx, bundle);
+          return true;
         }
         await this._applyStreamSseEvent(event, ctx, bundle);
         return !!(ctx.receivedDone || ctx.streamFailed);
@@ -584,21 +663,23 @@ export default {
       }
     },
     async clearSessionContext() {
-      if (this.busy || !this.currentSession) return;
-      const session = this.currentSession;
-      const sessionId = session.id;
-      const snapshot = this.snapshotSessionState(session);
-      session.messages = [];
-      session.stepRuns = [];
-      session.useServerHistoryOnly = false;
-      this.chatBanner = "";
-      const clearResult = await this.clearServerHistory(sessionId);
-      if (clearResult && clearResult.ok === false) {
-        this.restoreSessionState(session, snapshot);
-        this.chatBanner = "服务端历史清理失败，已恢复当前会话，避免前后端上下文不一致。";
-      }
-      this.saveSessions();
-      sendFeedback("clear_context", { session_id: sessionId });
+      if (this.interactionBusy || !this.currentSession) return;
+      await this._runSessionTransaction(async () => {
+        const session = this.currentSession;
+        const sessionId = session.id;
+        const snapshot = this.snapshotSessionState(session);
+        session.messages = [];
+        session.stepRuns = [];
+        session.useServerHistoryOnly = false;
+        this.chatBanner = "";
+        const clearResult = await this.clearServerHistory(sessionId);
+        if (clearResult && clearResult.ok === false) {
+          this.restoreSessionState(session, snapshot);
+          this.chatBanner = "服务端历史清理失败，已恢复当前会话，避免前后端上下文不一致。";
+        }
+        this.flushSaveSessions();
+        sendFeedback("clear_context", { session_id: sessionId });
+      });
     },
     onMessageCopy(msg, detail) {
       sendFeedback("copy_answer", {
@@ -609,7 +690,7 @@ export default {
     },
     async onRetryFromMessage(msg) {
       const ctx = msg && msg.meta && msg.meta.resumeContext;
-      if (!ctx || this.busy) return;
+      if (!ctx || this.interactionBusy) return;
       if (!ctx.userMsg) {
         this.chatBanner = "无法重试：缺少原始用户问题。";
         return;
@@ -617,12 +698,12 @@ export default {
       const session = this.currentSession;
       if (session && msg && msg.id) {
         this.removeAssistantMessageById(session, msg.id);
-        this.saveSessions();
+        this.scheduleSaveSessions();
       }
       await this._triggerStream({ ...ctx, upgradeTrack: false, session });
     },
     async onSend(payload) {
-      if (!payload || this.busy) return;
+      if (!payload || this.interactionBusy) return;
       if (!this.currentSession) this.createNewSession();
       if (!this.currentSession.messages) this.currentSession.messages = [];
 
@@ -638,7 +719,7 @@ export default {
       );
       session.messages.push(userMsg);
       this.scrollToBottom();
-      this.saveSessions();
+      this.scheduleSaveSessions();
 
       await this._triggerStream({
         documents: userMsg.meta.documents,
@@ -677,6 +758,9 @@ export default {
       const promptBody = this._userContentToPrompt(lastUser && lastUser.content);
       const ctx = createStreamContext();
       const { modelErrors } = ctx;
+      const preferServerHistory = Boolean(session.useServerHistoryOnly);
+      session.useServerHistoryOnly = false;
+      this.scheduleSaveSessions();
 
       try {
         const history = this.buildHistoryForApi(session, lastUser, pending.id);
@@ -726,7 +810,7 @@ export default {
             documents,
             searchMode,
             upgradeTrack,
-            preferServerHistory: session.useServerHistoryOnly,
+            preferServerHistory,
             clientRunId: run.id,
             streamConnectAttempt: attempt,
           });
@@ -820,6 +904,14 @@ export default {
         if (lastConnectError && !ctx.receivedDone && !ctx.streamFailed && ctx.finalContent.length === 0) {
           throw lastConnectError;
         }
+        if (ctx.streamFailed) {
+          const terminalError = ctx.lastErrorEvent || {};
+          throw new Error(
+            terminalError.error_code
+              ? `${terminalError.error || "服务端流式处理失败"} (${terminalError.error_code})`
+              : (terminalError.error || "服务端流式处理失败")
+          );
+        }
 
         ctx.finalMeta.model_chain = this._computeModelChainFromRun(run) || ctx.finalMeta.model_chain;
         this.setPendingTerminal(pending, { ...ctx.finalMeta, success: true });
@@ -883,11 +975,13 @@ export default {
       }
     },
     async onEditMessage(msg) {
-      if (this.busy || !this.currentSession) return;
-      const session = this.currentSession;
-      const sessionId = session.id;
-      const idx = session.messages.findIndex((m) => m.id === msg.id);
-      if (idx >= 0) {
+      if (this.interactionBusy || !this.currentSession) return;
+      let prefillPayload = null;
+      await this._runSessionTransaction(async () => {
+        const session = this.currentSession;
+        const sessionId = session.id;
+        const idx = session.messages.findIndex((m) => m.id === msg.id);
+        if (idx < 0) return;
         const snapshot = this.snapshotSessionState(session);
         let text = "";
         const images = [];
@@ -905,25 +999,28 @@ export default {
         if (clearResult && clearResult.ok === false) {
           this.restoreSessionState(session, snapshot);
           this.chatBanner = "服务端历史清理失败，已恢复当前会话，避免前后端上下文不一致。";
-          this.saveSessions();
+          this.flushSaveSessions();
           return;
         }
-        this.saveSessions();
-        if (this.$refs.chatInput && this.$refs.chatInput.prefillFromUserEdit) {
-          this.$refs.chatInput.prefillFromUserEdit({
-            text,
-            images,
-            documents: (msg.meta && msg.meta.documents) || [],
-          });
-        }
+        this.flushSaveSessions();
+        prefillPayload = {
+          text,
+          images,
+          documents: (msg.meta && msg.meta.documents) || [],
+        };
+      });
+      if (prefillPayload && this.$refs.chatInput && this.$refs.chatInput.prefillFromUserEdit) {
+        this.$refs.chatInput.prefillFromUserEdit(prefillPayload);
       }
     },
     async onRegenerateMessage(msg) {
-      if (this.busy || !this.currentSession) return;
-      const session = this.currentSession;
-      const sessionId = session.id;
-      const idx = session.messages.findIndex((m) => m.id === msg.id);
-      if (idx >= 0) {
+      if (this.interactionBusy || !this.currentSession) return;
+      let rerunContext = null;
+      await this._runSessionTransaction(async () => {
+        const session = this.currentSession;
+        const sessionId = session.id;
+        const idx = session.messages.findIndex((m) => m.id === msg.id);
+        if (idx < 0) return;
         const snapshot = this.snapshotSessionState(session);
         const lastUser = session.messages.slice(0, idx).reverse().find((m) => m.role === "user");
         if (!lastUser) {
@@ -935,18 +1032,21 @@ export default {
         if (clearResult && clearResult.ok === false) {
           this.restoreSessionState(session, snapshot);
           this.chatBanner = "服务端历史清理失败，已恢复当前会话，避免前后端上下文不一致。";
-          this.saveSessions();
+          this.flushSaveSessions();
           return;
         }
-        this.saveSessions();
+        this.flushSaveSessions();
         sendFeedback("regenerate", { session_id: sessionId, message_id: msg.id });
-        await this._triggerStream({
+        rerunContext = {
           userMsg: lastUser,
           documents: lastUser?.meta?.documents || [],
           searchMode: lastUser?.meta?.searchMode || "auto",
           session,
           upgradeTrack: true,
-        });
+        };
+      });
+      if (rerunContext) {
+        await this._triggerStream(rerunContext);
       }
     },
   },
