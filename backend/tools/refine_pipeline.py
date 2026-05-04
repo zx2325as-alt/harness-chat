@@ -25,7 +25,7 @@ async def stream_refine_from_draft(
     meta_extra: 写入各 step.meta，用于区分 agent 工具调用 / 兜底等。
     extra_review_context: 可选自检文本，仅注入审查层 prompt，不进入最终用户可见草稿。
     """
-    from harness import Step, _pg  # 运行时导入，避免与 harness 顶层循环依赖
+    from harness import Step, _clean_review_body, _pg  # 运行时导入，避免与 harness 顶层循环依赖
 
     extra_meta = dict(meta_extra or {})
     chain = hcfg.get("refine_chain") or {}
@@ -71,7 +71,7 @@ async def stream_refine_from_draft(
     if not r2.success:
         yield {"event": "error", "error": "审查层失败"}
         return
-    review_body = r2.content or ""
+    review_body = _clean_review_body(r2.content or "")
     extra_ctx = ""
     review_snip_loop = 0
     for _round in range(3):
@@ -107,7 +107,8 @@ async def stream_refine_from_draft(
                 "failure_code": vfc,
             }
         else:
-            sr = await harness.perform_web_search(vq, options)
+            overrides = harness._track_search_overrides("refine")
+            sr = await harness.perform_web_search(vq, {**options, **{k: v for k, v in overrides.items() if v is not None}})
         snip = (sr.get("context") or "")[:8000]
         rc = len(sr.get("sources") or [])
         yield {
@@ -146,7 +147,7 @@ async def stream_refine_from_draft(
         )
         r2b, _ = await harness._ask_with_fallback(l2_candidates, retry_prompt, opts_l2, messages=None)
         if r2b.success:
-            review_body = r2b.content
+            review_body = _clean_review_body(r2b.content)
         else:
             break
     l3_prompt = (

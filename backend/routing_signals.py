@@ -180,9 +180,26 @@ def reasoning_keyword_boost(prompt: str) -> Tuple[bool, str]:
         return True, "math_symbols"
     if re.search(r"\$[^$]+\$|\\\(|\\\)|\\\[|\\\]", t):
         return True, "latex"
+    if "```" in t:
+        return True, "code_block"
     logic_kw = ("证明", "推导", "如果", "那么", "充要条件", "归纳法", "反证法", "蕴含", "当且仅当")
     if any(k in t for k in logic_kw):
         return True, "logic_keywords"
+    debug_kw = (
+        "debug",
+        "traceback",
+        "stack trace",
+        "报错",
+        "报什么错",
+        "报异常",
+        "异常",
+        "错误日志",
+        "修复bug",
+        "定位问题",
+    )
+    low = t.lower()
+    if any(k in low for k in debug_kw):
+        return True, "debug_keywords"
     if re.search(r"\d+\s*[\+\-\*/]\s*\d+", t):
         return True, "arithmetic_expr"
     return False, ""

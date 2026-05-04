@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, AsyncGenerator
+from typing import Any, Dict, Optional, AsyncGenerator, List
 
 import httpx
 import asyncio
 
+from semantic_utils import is_probably_english
 from utils import Timer, env_get
 
 
 import json
+
+_SHARED_LIMITS = httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=60.0)
+_shared_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_shared_client() -> httpx.AsyncClient:
+    global _shared_client
+    if _shared_client is None or _shared_client.is_closed:
+        _shared_client = httpx.AsyncClient(limits=_SHARED_LIMITS)
+    return _shared_client
 
 @dataclass
 class AskResult:
@@ -60,6 +71,18 @@ def _openai_chat_completions_url(base_url: str) -> str:
     if not u.endswith("/v1"):
         u = u + "/v1"
     return u + "/chat/completions"
+
+
+def _system_language_message(prompt: str, messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, str]:
+    probe = str(prompt or "").strip()
+    if not probe and messages:
+        for msg in reversed(messages):
+            probe = str(msg.get("content") or "").strip()
+            if probe:
+                break
+    if is_probably_english(probe):
+        return {"role": "system", "content": "Please answer in the same language as the user, defaulting to English."}
+    return {"role": "system", "content": "请使用与用户相同的语言回答；若用户主要使用中文，则默认用中文回答。"}
 
 
 class OpenAICompatAdapter(BaseAdapter):
@@ -116,52 +139,52 @@ class OpenAICompatAdapter(BaseAdapter):
         last_error = None
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(timeout=timeout_s) as client:
-                    req_messages = [{"role": "system", "content": "请始终使用中文进行回答。"}]
+                client = _get_shared_client()
+                req_messages = [_system_language_message(prompt, messages)]
+                
+                if messages:
+                    # Append the historical messages directly
+                    req_messages.extend(messages)
                     
-                    if messages:
-                        # Append the historical messages directly
-                        req_messages.extend(messages)
-                        
-                    # Always append the current prompt as the latest user message
-                    if prompt:
-                        req_messages.append({"role": "user", "content": prompt})
-                        
-                    body: Dict[str, Any] = {
-                        "model": model,
-                        "messages": req_messages,
-                    }
-                    mlow = str(model).lower()
-                    if not (mlow.startswith("o1") or mlow.startswith("o3")):
-                        body["temperature"] = float(options.get("temperature", 0.2))
-                    r = await client.post(url, headers=headers, json=body)
-                    r.raise_for_status()
-                    data = r.json()
-                    content = (
-                        data.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content", "")
-                        or ""
-                    )
-                    if isinstance(content, list):
-                        # 少数兼容实现返回多段 content
-                        parts: list[str] = []
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                parts.append(str(block.get("text", "")))
-                        content = "\n".join(parts)
-                    content = str(content).strip()
-                    usage = data.get("usage") or {}
-                    return AskResult(
-                        success=True,
-                        content=content,
-                        provider="openai_compat",
-                        model=str(model),
-                        latency_ms=t.elapsed_ms(),
-                        tokens_in=int(usage.get("prompt_tokens") or 0),
-                        tokens_out=int(usage.get("completion_tokens") or 0),
-                        raw={"id": data.get("id")},
-                    )
+                # Always append the current prompt as the latest user message
+                if prompt:
+                    req_messages.append({"role": "user", "content": prompt})
+                    
+                body: Dict[str, Any] = {
+                    "model": model,
+                    "messages": req_messages,
+                }
+                mlow = str(model).lower()
+                if not (mlow.startswith("o1") or mlow.startswith("o3")):
+                    body["temperature"] = float(options.get("temperature", 0.2))
+                r = await client.post(url, headers=headers, json=body, timeout=timeout_s)
+                r.raise_for_status()
+                data = r.json()
+                content = (
+                    data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    or ""
+                )
+                if isinstance(content, list):
+                    # 少数兼容实现返回多段 content
+                    parts: list[str] = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            parts.append(str(block.get("text", "")))
+                    content = "\n".join(parts)
+                content = str(content).strip()
+                usage = data.get("usage") or {}
+                return AskResult(
+                    success=True,
+                    content=content,
+                    provider="openai_compat",
+                    model=str(model),
+                    latency_ms=t.elapsed_ms(),
+                    tokens_in=int(usage.get("prompt_tokens") or 0),
+                    tokens_out=int(usage.get("completion_tokens") or 0),
+                    raw={"id": data.get("id")},
+                )
             except Exception as e:
                 last_error = str(e)
                 # Retry on connection errors or server errors, but not on auth errors (except occasionally some proxies flake with 401)
@@ -207,7 +230,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 if k and v is not None:
                     headers[str(k)] = str(v)
 
-        req_messages = [{"role": "system", "content": "请始终使用中文进行回答。"}]
+        req_messages = [_system_language_message(prompt, messages)]
         if messages:
             req_messages.extend(messages)
             
@@ -223,40 +246,40 @@ class OpenAICompatAdapter(BaseAdapter):
         if not (mlow.startswith("o1") or mlow.startswith("o3")):
             body["temperature"] = float(options.get("temperature", 0.2))
             
-        timeout_s = float(self.cfg.get("timeout_s", 60))
-        max_retries = 3
+        timeout_s = float(options.get("request_timeout_s", self.cfg.get("timeout_s", 60)))
+        max_retries = max(1, int(options.get("max_retries", self.cfg.get("max_retries", 3))))
         last_error = None
         for attempt in range(max_retries):
             try:
                 # We don't retry extensively on stream, just let it fail if it fails immediately
-                async with httpx.AsyncClient(timeout=timeout_s) as client:
-                    async with client.stream("POST", url, headers=headers, json=body) as response:
-                        response.raise_for_status()
-                        async for line in response.aiter_lines():
-                            line = line.strip()
-                            if not line:
-                                continue
-                            if line.startswith("data:"):
-                                data_str = line[5:].strip()
-                                if data_str == "[DONE]":
-                                    break
-                                try:
-                                    data = json.loads(data_str)
-                                    delta = data.get("choices", [{}])[0].get("delta", {})
-                                    
-                                    # Standard text delta
-                                    content = delta.get("content", "")
-                                    
-                                    # Handle Reasoning/Think models (like DeepSeek) that might return reasoning_content
-                                    reasoning_content = delta.get("reasoning_content", "")
-                                    
-                                    if content or reasoning_content:
-                                        yield {
-                                            "content": content or "",
-                                            "reasoning_content": reasoning_content or "",
-                                        }
-                                except json.JSONDecodeError:
-                                    pass
+                client = _get_shared_client()
+                async with client.stream("POST", url, headers=headers, json=body, timeout=timeout_s) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.startswith("data:"):
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                data = json.loads(data_str)
+                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                
+                                # Standard text delta
+                                content = delta.get("content", "")
+                                
+                                # Handle Reasoning/Think models (like DeepSeek) that might return reasoning_content
+                                reasoning_content = delta.get("reasoning_content", "")
+                                
+                                if content or reasoning_content:
+                                    yield {
+                                        "content": content or "",
+                                        "reasoning_content": reasoning_content or "",
+                                    }
+                            except json.JSONDecodeError:
+                                pass
                 # 如果成功执行完流，跳出重试循环
                 break
             except Exception as e:

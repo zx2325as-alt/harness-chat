@@ -105,10 +105,27 @@ import ConfigView from "./components/ConfigView.vue";
 import { API_BASE } from "./apiBase.js";
 import { sendFeedback } from "./feedbackApi.js";
 import {
-  idbSessionsSupported,
-  loadSessionsJsonFromIdb,
-  saveSessionsJsonToIdb,
-} from "./idbSessions.js";
+  buildStreamErrorDetail,
+  buildStreamInterruptedMessage,
+  buildStreamRequestPayload,
+  clipHistoryMessages,
+  computeModelChain,
+  createPendingAssistant,
+  createResumeContext,
+  createSessionId,
+  createStepRun as createStepRunEntry,
+  createStreamContext,
+  createUserMessage,
+  getSessionTitle as deriveSessionTitle,
+  getRunTitle as deriveRunTitle,
+  normalizePayload as normalizeChatPayload,
+  shouldIncludeHistoryMessage,
+  splitSseFrames,
+  sseReconnectDelayMs,
+  stepSignature as getStepSignature,
+  userContentToPrompt as contentToPrompt,
+} from "./chatShared.js";
+import { loadSessionsState, persistSessionsState, pruneSessionsForQuota } from "./sessionPersistence.js";
 
 /** SSE 在这么长时间内完全无事件则客户端主动断开（有 step/status 等即会刷新） */
 const CHAT_STREAM_IDLE_MS = 180000;
@@ -182,6 +199,7 @@ export default {
   beforeUnmount() {
     if (this._dwellTimer) clearInterval(this._dwellTimer);
     if (this._streamIdleTimer) clearInterval(this._streamIdleTimer);
+    if (this._saveSessionsTimer) clearTimeout(this._saveSessionsTimer);
     this._detachPanelResize();
   },
   watch: {
@@ -195,107 +213,48 @@ export default {
   },
   methods: {
     async loadSessionsFromStorage() {
-      let raw = null;
-      try {
-        if (await idbSessionsSupported()) {
-          raw = await loadSessionsJsonFromIdb();
-        }
-      } catch (e) {
-        console.warn("IndexedDB load skipped:", e);
-      }
-      if (!raw) {
-        try {
-          raw = localStorage.getItem("harness_sessions");
-        } catch (_) {
-          /* ignore */
-        }
-      }
-      if (raw) {
-        try {
-          this.sessions = JSON.parse(raw);
-        } catch (e) {
-          console.error("Failed to parse sessions", e);
-          this.sessions = [];
-        }
-        try {
-          if (await idbSessionsSupported()) {
-            await saveSessionsJsonToIdb(raw);
-            try {
-              localStorage.setItem("harness_sessions_idb", "1");
-              localStorage.removeItem("harness_sessions");
-            } catch (_) {
-              /* ignore */
-            }
-          }
-        } catch (e) {
-          console.warn("Migrate sessions to IDB failed:", e);
-        }
-      }
+      const loaded = await loadSessionsState();
+      this.sessions = loaded.sessions;
       if (this.sessions.length === 0) {
         this.createNewSession();
       } else {
-        this.currentSessionId = this.sessions[0].id;
+        const preferredId = loaded.currentSessionId;
+        this.currentSessionId =
+          this.sessions.find((s) => s.id === preferredId)?.id || this.sessions[0].id;
+        this.sessions.forEach((s) => this.syncStepRunsWithMessages(s));
       }
-      this.sessions.forEach((s) => {
-        if (!s.stepRuns) s.stepRuns = [];
-        if (s.useServerHistoryOnly == null) s.useServerHistoryOnly = false;
-      });
     },
     saveSessions() {
-      const payload = JSON.stringify(this.sessions);
+      const payload = JSON.stringify({
+        currentSessionId: this.currentSessionId || "",
+        sessions: this.sessions,
+      });
       const persist = async () => {
         try {
-          if (await idbSessionsSupported()) {
-            await saveSessionsJsonToIdb(payload);
-            try {
-              localStorage.setItem("harness_sessions_idb", "1");
-              localStorage.removeItem("harness_sessions");
-            } catch (_) {
-              /* ignore */
-            }
-            return;
-          }
-        } catch (e) {
-          console.warn("IndexedDB save failed, fallback localStorage:", e);
-        }
-        try {
-          localStorage.setItem("harness_sessions", payload);
-        } catch (e) {
-          if (e && e.name === "QuotaExceededError") {
+          await persistSessionsState(payload, async () => {
             this._pruneSessionsForQuota();
             try {
-              localStorage.setItem("harness_sessions", JSON.stringify(this.sessions));
+              localStorage.setItem(
+                "harness_sessions",
+                JSON.stringify({
+                  currentSessionId: this.currentSessionId || "",
+                  sessions: this.sessions,
+                })
+              );
             } catch (e2) {
               console.error("Failed to save sessions after prune", e2);
             }
-          } else {
-            console.error("Failed to save sessions", e);
-          }
+          });
+        } catch (e) {
+          console.error("Failed to save sessions", e);
         }
       };
       persist().catch((e) => console.error("saveSessions persist", e));
     },
     _pruneSessionsForQuota() {
-      while (this.sessions.length > 1) {
-        const rm = this.sessions.pop();
-        if (rm && rm.id === this.currentSessionId && this.sessions[0]) {
-          this.currentSessionId = this.sessions[0].id;
-        }
-      }
-      const s = this.sessions[0];
-      if (s && s.messages && s.messages.length > 40) {
-        s.messages = s.messages.slice(-40);
-      }
-      if (s && s.stepRuns && s.stepRuns.length > 15) {
-        s.stepRuns = s.stepRuns.slice(-15);
-      }
-    },
-    newSessionId() {
-      try {
-        return crypto.randomUUID();
-      } catch (_) {
-        return `session-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-      }
+      const pruned = pruneSessionsForQuota(this.sessions, this.currentSessionId);
+      this.sessions = pruned.sessions;
+      this.currentSessionId = pruned.currentSessionId;
     },
     scheduleSaveSessions() {
       if (this._saveSessionsTimer) clearTimeout(this._saveSessionsTimer);
@@ -322,7 +281,7 @@ export default {
     createNewSession() {
       if (this.busy) return;
       const newSession = {
-        id: this.newSessionId(),
+        id: createSessionId(),
         messages: [],
         stepRuns: [],
         useServerHistoryOnly: false,
@@ -334,6 +293,7 @@ export default {
     selectSession(id) {
       if (this.busy) return;
       this.currentSessionId = id;
+      this.saveSessions();
       this.scrollToBottom();
     },
     deleteSession(id) {
@@ -347,21 +307,7 @@ export default {
       this.saveSessions();
     },
     getSessionTitle(session) {
-      if (!session || !session.messages) return '新对话';
-      const userMsg = session.messages.find(m => m.role === 'user');
-      if (userMsg && userMsg.content) {
-        let title = userMsg.content;
-        if (typeof title === 'string') {
-           return title.substring(0, 15) + (title.length > 15 ? '...' : '');
-        } else if (Array.isArray(title)) {
-           const textPart = title.find(t => t.type === 'text');
-           if (textPart && textPart.text) {
-              return textPart.text.substring(0, 15) + '...';
-           }
-           return '[多模态消息]';
-        }
-      }
-      return '新对话';
+      return deriveSessionTitle(session);
     },
     async loadConfig() {
       this.configLoading = true;
@@ -383,49 +329,63 @@ export default {
       });
     },
     normalizePayload(payload) {
-      if (payload && typeof payload === "object" && !Array.isArray(payload) && Object.prototype.hasOwnProperty.call(payload, "content")) {
-        return payload;
-      }
-      return { content: payload, documents: [], searchMode: "auto" };
+      return normalizeChatPayload(payload);
     },
     getRunTitle(content) {
-      if (typeof content === "string") return content.substring(0, 28) || "新请求";
-      if (Array.isArray(content)) {
-        const text = content.find((p) => p.type === "text")?.text || "";
-        return text.substring(0, 28) || "多模态请求";
-      }
-      return "新请求";
+      return deriveRunTitle(content);
     },
     createStepRun(userMsg, documents = [], searchMode = "auto", session = this.currentSession) {
       if (!session) return null;
       if (!session.stepRuns) session.stepRuns = [];
-      const run = {
-        id: `run-${Date.now()}`,
-        title: this.getRunTitle(userMsg.content),
-        createdAt: new Date().toISOString(),
-        traceId: "",
-        track: "",
-        status: "running",
-        steps: [],
-        documents: documents.map((d) => ({ name: d.name, status: d.status, meta: d.meta })),
-        searchMode,
-        phaseMessage: "",
-        phase: "",
-      };
+      const run = createStepRunEntry(userMsg, documents, searchMode);
       session.stepRuns.push(run);
       this.activeRunId = run.id;
       this.saveSessions();
       return run;
     },
+    syncStepRunsWithMessages(session) {
+      if (!session) return;
+      const validRunIds = new Set(
+        (session.messages || [])
+          .filter((m) => m.role === "assistant" && m.meta?.runId)
+          .map((m) => m.meta.runId)
+      );
+      session.stepRuns = (session.stepRuns || []).filter((run) => validRunIds.has(run.id));
+      if (this.activeRunId && !validRunIds.has(this.activeRunId)) {
+        this.activeRunId = "";
+      }
+    },
+    removeMessageRangeFromSession(session, startIdx) {
+      if (!session || startIdx < 0) return;
+      session.messages.splice(startIdx);
+      session.useServerHistoryOnly = false;
+      this.syncStepRunsWithMessages(session);
+    },
+    removeAssistantMessageById(session, messageId) {
+      if (!session || !messageId) return;
+      const idx = session.messages.findIndex((m) => m.id === messageId);
+      if (idx < 0) return;
+      session.messages.splice(idx, 1);
+      this.syncStepRunsWithMessages(session);
+    },
+    snapshotSessionState(session) {
+      if (!session) return null;
+      return {
+        messages: JSON.parse(JSON.stringify(session.messages || [])),
+        stepRuns: JSON.parse(JSON.stringify(session.stepRuns || [])),
+        useServerHistoryOnly: Boolean(session.useServerHistoryOnly),
+      };
+    },
+    restoreSessionState(session, snapshot) {
+      if (!session || !snapshot) return;
+      session.messages = snapshot.messages;
+      session.stepRuns = snapshot.stepRuns;
+      session.useServerHistoryOnly = snapshot.useServerHistoryOnly;
+      this.syncStepRunsWithMessages(session);
+    },
     /** 同一步 name 可能多次出现（如审查多轮联网），用签名区分，避免互相覆盖 */
     stepSignature(step) {
-      const n = step.name || "";
-      const m = step.meta || {};
-      if (step.step_id) return step.step_id;
-      if (m.step_id) return m.step_id;
-      if (n === "review_web_search" && m.review_round != null) return `${n}#r${m.review_round}`;
-      if (n === "agent_iteration" && m.i != null) return `${n}#${m.i}`;
-      return n;
+      return getStepSignature(step);
     },
     upsertStep(run, step) {
       const sig = this.stepSignature(step);
@@ -438,24 +398,14 @@ export default {
       this.stepUiTick += 1;
     },
     _userContentToPrompt(content) {
-      if (typeof content === "string") return content;
-      if (Array.isArray(content)) return content;
-      return String(content ?? "");
+      return contentToPrompt(content);
     },
     /** 供 API 的历史条：不含当前用户句；若 useServerHistoryOnly 则发空数组由 Redis 补全 */
     buildHistoryForApi(session, lastUser, pendingId) {
       const uid = lastUser && lastUser.id;
-      const rows = (session?.messages || []).filter(
-        (m) =>
-          (m.role === "user" || m.role === "assistant") &&
-          !m.meta?.pending &&
-          !m.meta?.error &&
-          m.id !== pendingId &&
-          (!uid || m.id !== uid)
-      );
+      const rows = (session?.messages || []).filter((m) => shouldIncludeHistoryMessage(m, uid, pendingId));
       const mapped = rows.map((m) => ({ role: m.role, content: m.content }));
-      if (session?.useServerHistoryOnly) return [];
-      return mapped;
+      return clipHistoryMessages(mapped);
     },
     setPendingTerminal(pending, meta = {}) {
       pending.meta = {
@@ -466,25 +416,10 @@ export default {
       };
     },
     _computeModelChainFromRun(run) {
-      const labels = {
-        refine_layer1_draft: "初稿",
-        refine_layer2_review: "审查",
-        refine_layer3_polish: "润色",
-        agent_iteration: "Agent",
-        fast_route: "快轨",
-      };
-      const parts = [];
-      (run.steps || []).forEach((s) => {
-        if (s.status === "ok" && s.model) {
-          const lb = labels[s.name] || s.name;
-          parts.push(`${lb}:${s.model}`);
-        }
-      });
-      return parts.length ? parts.join(" → ") : "";
+      return computeModelChain(run);
     },
     _sseReconnectDelayMs(attemptIdx) {
-      const base = 700 * Math.pow(2, attemptIdx);
-      return Math.min(32000, base + Math.random() * 500);
+      return sseReconnectDelayMs(attemptIdx);
     },
     async _applyStreamSseEvent(event, ctx, bundle) {
       const { run, pending, session } = bundle;
@@ -539,8 +474,16 @@ export default {
           pending.content = ctx.finalContent;
           this.scheduleScrollBottom();
         }
+      } else if (event.event === "content_reset") {
+        ctx.finalContent = "";
+        ctx.contentResetCount += 1;
+        pending.content = "";
+        this.scheduleScrollBottom();
       } else if (event.event === "history_stored") {
         if (session) session.useServerHistoryOnly = true;
+      } else if (event.event === "history_miss") {
+        if (session) session.useServerHistoryOnly = false;
+        this.chatBanner = "服务端历史缺失，已回退为携带本地上下文请求。";
       } else if (event.event === "error") {
         ctx.streamFailed = true;
         ctx.lastErrorEvent = event;
@@ -587,8 +530,8 @@ export default {
           return false;
         }
         ctx.buffer += decoder.decode(chunk.value, { stream: true });
-        const frames = ctx.buffer.split("\n\n");
-        ctx.buffer = frames.pop() || "";
+        const { frames, rest } = splitSseFrames(ctx.buffer);
+        ctx.buffer = rest;
         for (const frame of frames) {
           const dataLines = frame
             .split("\n")
@@ -626,24 +569,36 @@ export default {
       this._panelResize = null;
     },
     async clearServerHistory(sessionId) {
-      if (!sessionId) return;
+      if (!sessionId) return { ok: true, cleared: false, reason: "no_session" };
       try {
-        await fetch(`${API_BASE}/api/session/${encodeURIComponent(sessionId)}/history`, {
+        const res = await fetch(`${API_BASE}/api/session/${encodeURIComponent(sessionId)}/history`, {
           method: "DELETE",
         });
-      } catch (_) {
-        /* ignore */
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.ok === false) {
+          throw new Error(data.error || `HTTP ${res.status}`);
+        }
+        return data;
+      } catch (e) {
+        return { ok: false, cleared: false, error: String(e?.message || e) };
       }
     },
     async clearSessionContext() {
       if (this.busy || !this.currentSession) return;
-      this.currentSession.messages = [];
-      this.currentSession.stepRuns = [];
-      this.currentSession.useServerHistoryOnly = false;
+      const session = this.currentSession;
+      const sessionId = session.id;
+      const snapshot = this.snapshotSessionState(session);
+      session.messages = [];
+      session.stepRuns = [];
+      session.useServerHistoryOnly = false;
       this.chatBanner = "";
-      await this.clearServerHistory(this.currentSession.id);
+      const clearResult = await this.clearServerHistory(sessionId);
+      if (clearResult && clearResult.ok === false) {
+        this.restoreSessionState(session, snapshot);
+        this.chatBanner = "服务端历史清理失败，已恢复当前会话，避免前后端上下文不一致。";
+      }
       this.saveSessions();
-      sendFeedback("clear_context", { session_id: this.currentSession.id });
+      sendFeedback("clear_context", { session_id: sessionId });
     },
     onMessageCopy(msg, detail) {
       sendFeedback("copy_answer", {
@@ -652,10 +607,19 @@ export default {
         ...(detail || {}),
       });
     },
-    onRetryFromMessage(msg) {
+    async onRetryFromMessage(msg) {
       const ctx = msg && msg.meta && msg.meta.resumeContext;
       if (!ctx || this.busy) return;
-      this._triggerStream({ ...ctx, upgradeTrack: false });
+      if (!ctx.userMsg) {
+        this.chatBanner = "无法重试：缺少原始用户问题。";
+        return;
+      }
+      const session = this.currentSession;
+      if (session && msg && msg.id) {
+        this.removeAssistantMessageById(session, msg.id);
+        this.saveSessions();
+      }
+      await this._triggerStream({ ...ctx, upgradeTrack: false, session });
     },
     async onSend(payload) {
       if (!payload || this.busy) return;
@@ -663,34 +627,40 @@ export default {
       if (!this.currentSession.messages) this.currentSession.messages = [];
 
       const normalized = this.normalizePayload(payload);
-      const userMsg = {
-        id: `u-${Date.now()}`,
-        role: "user",
-        content: normalized.content,
-        meta: {
-          documents: normalized.documents || [],
-          searchMode: normalized.searchMode || "auto",
-        },
-      };
-      this.currentSession.messages.push(userMsg);
+      const text = typeof normalized.content === "string" ? normalized.content.trim() : normalized.content;
+      const documents = (normalized.documents || []).filter((d) => d && d.status === "ok");
+      if ((!text || text.length === 0) && documents.length === 0) return;
+      const session = this.currentSession;
+      const userMsg = createUserMessage(
+        normalized.content,
+        documents,
+        normalized.searchMode || "auto"
+      );
+      session.messages.push(userMsg);
       this.scrollToBottom();
       this.saveSessions();
 
       await this._triggerStream({
         documents: userMsg.meta.documents,
         searchMode: userMsg.meta.searchMode,
+        session,
         userMsg,
         upgradeTrack: false,
       });
     },
     async _triggerStream(context = null) {
-      const session = this.currentSession;
+      const session = context?.session || this.currentSession;
       if (!session) return;
       this.busy = true;
       this.abortController = new AbortController();
       this.chatBanner = "";
 
       const lastUser = context?.userMsg || [...session.messages].reverse().find((m) => m.role === "user");
+      if (!lastUser) {
+        this.busy = false;
+        this.chatBanner = "无法继续：当前会话中缺少用户消息。";
+        return;
+      }
       const documents = context?.documents || lastUser?.meta?.documents || [];
       const searchMode = context?.searchMode || lastUser?.meta?.searchMode || "auto";
       const upgradeTrack = Boolean(context?.upgradeTrack);
@@ -700,45 +670,17 @@ export default {
         return;
       }
 
-      const pending = {
-        id: `a-pending-${Date.now()}`,
-        role: "assistant",
-        content: "处理中…",
-        meta: { pending: true, runId: run.id },
-      };
+      const pending = createPendingAssistant(run.id);
       session.messages.push(pending);
       this.scrollToBottom();
 
       const promptBody = this._userContentToPrompt(lastUser && lastUser.content);
-      const modelErrors = [];
+      const ctx = createStreamContext();
+      const { modelErrors } = ctx;
 
       try {
         const history = this.buildHistoryForApi(session, lastUser, pending.id);
-        const reqBody = JSON.stringify({
-          session_id: session.id,
-          prompt: promptBody,
-          messages: history,
-          mode: this.mode,
-          options: {
-            documents,
-            search_mode: searchMode,
-            stream_slice_chars: 24,
-            upgrade_track: upgradeTrack,
-            prefer_server_history: Boolean(session.useServerHistoryOnly),
-            client_run_id: run.id,
-            stream_connect_attempt: attempt,
-          },
-        });
 
-        const ctx = {
-          buffer: "",
-          receivedDone: false,
-          streamFailed: false,
-          finalContent: "",
-          finalMeta: { track: "", provider: "", model: "", success: true, latency_ms: 0, model_chain: "" },
-          lastErrorEvent: null,
-          modelErrors,
-        };
         const bundle = { run, pending, session, lastUser, documents, searchMode };
         const MAX_SSE_CONNECTS = 8;
 
@@ -756,11 +698,10 @@ export default {
         for (let attempt = 0; attempt < MAX_SSE_CONNECTS && !ctx.receivedDone && !ctx.streamFailed; attempt++) {
           if (attempt > 0) {
             if (ctx.finalContent.length > 0) {
-              pending.content +=
-                "\n\n[流传输中断；为避免重复生成，已停止自动重连。请点击「重试」或重新发送。]";
+              pending.content += buildStreamInterruptedMessage();
               this.setPendingTerminal(pending, {
                 stopped: true,
-                resumeContext: { userMsg: lastUser, documents, searchMode },
+                resumeContext: createResumeContext(lastUser, documents, searchMode),
                 stop_reason: "stream_interrupted_after_content",
               });
               run.status = "stopped";
@@ -776,6 +717,19 @@ export default {
             await new Promise((r) => setTimeout(r, waitMs));
             ctx.buffer = "";
           }
+
+          const reqBody = buildStreamRequestPayload({
+            sessionId: session.id,
+            prompt: promptBody,
+            history,
+            mode: this.mode,
+            documents,
+            searchMode,
+            upgradeTrack,
+            preferServerHistory: session.useServerHistoryOnly,
+            clientRunId: run.id,
+            streamConnectAttempt: attempt,
+          });
 
           let res;
           try {
@@ -799,6 +753,16 @@ export default {
             continue;
           }
 
+          const contentType = String(res.headers.get("content-type") || "").toLowerCase();
+          if (!contentType.includes("text/event-stream")) {
+            const bodyText = await res.text().catch(() => "");
+            lastConnectError = new Error(
+              `接口未返回 SSE 数据流（content-type=${contentType || "unknown"}）: ${bodyText.slice(0, 200)}`
+            );
+            if (attempt === MAX_SSE_CONNECTS - 1) throw lastConnectError;
+            continue;
+          }
+
           const reader = res.body && res.body.getReader();
           if (!reader) {
             lastConnectError = new Error("响应无可读流");
@@ -811,11 +775,10 @@ export default {
             const completed = await this._pumpChatSseReader(reader, decoder, ctx, bundle);
             if (ctx.receivedDone || ctx.streamFailed) break;
             if (!completed && ctx.finalContent.length > 0) {
-              pending.content +=
-                "\n\n[流传输中断；为避免重复生成，已停止自动重连。请点击「重试」或重新发送。]";
+              pending.content += buildStreamInterruptedMessage();
               this.setPendingTerminal(pending, {
                 stopped: true,
-                resumeContext: { userMsg: lastUser, documents, searchMode },
+                resumeContext: createResumeContext(lastUser, documents, searchMode),
                 stop_reason: "stream_interrupted_after_content",
               });
               run.status = "stopped";
@@ -832,11 +795,10 @@ export default {
             lastConnectError = readErr;
             if (readErr && readErr.name === "AbortError") throw readErr;
             if (ctx.finalContent.length > 0) {
-              pending.content +=
-                "\n\n[流传输中断；为避免重复生成，已停止自动重连。请点击「重试」或重新发送。]";
+              pending.content += buildStreamInterruptedMessage();
               this.setPendingTerminal(pending, {
                 stopped: true,
-                resumeContext: { userMsg: lastUser, documents, searchMode },
+                resumeContext: createResumeContext(lastUser, documents, searchMode),
                 stop_reason: "stream_read_error_after_content",
               });
               run.status = "stopped";
@@ -879,11 +841,7 @@ export default {
           this.setPendingTerminal(pending, {
             stopped: true,
             stop_reason: idle ? "client_idle_timeout" : "user_abort",
-            resumeContext: {
-              userMsg: lastUser,
-              documents,
-              searchMode,
-            },
+            resumeContext: createResumeContext(lastUser, documents, searchMode),
           });
           run.status = "stopped";
           run.phaseMessage = idle ? "长时间无服务端推送" : "用户已中断";
@@ -891,22 +849,17 @@ export default {
           this.flushSaveSessions();
         } else {
           const errText = String(e && e.message ? e.message : e);
-          const detail = [
-            `请求失败：${errText}`,
-            "",
-            "排查信息：",
-            `- 轨道：${run.track || "未知"}`,
-            `- 阶段：${run.phaseMessage || run.phase || "未知"}`,
-            `- Trace：${run.traceId || "无"}`,
-            ctx.lastErrorEvent?.error_code ? `- 错误码：${ctx.lastErrorEvent.error_code}` : "",
-            modelErrors.length ? `- 模型错误：${modelErrors.join("；")}` : "",
-          ].filter(Boolean).join("\n");
-          pending.content = detail;
+          pending.content = buildStreamErrorDetail({
+            errorText: errText,
+            run,
+            lastErrorEvent: ctx.lastErrorEvent,
+            modelErrors,
+          });
           this.setPendingTerminal(pending, {
             error: true,
             success: false,
             error_message: errText,
-            resumeContext: { userMsg: lastUser, documents, searchMode },
+            resumeContext: createResumeContext(lastUser, documents, searchMode),
           });
           run.status = "error";
           run.phaseMessage = errText;
@@ -929,10 +882,13 @@ export default {
         this.abortController.abort();
       }
     },
-    onEditMessage(msg) {
+    async onEditMessage(msg) {
       if (this.busy || !this.currentSession) return;
-      const idx = this.currentSession.messages.findIndex((m) => m.id === msg.id);
+      const session = this.currentSession;
+      const sessionId = session.id;
+      const idx = session.messages.findIndex((m) => m.id === msg.id);
       if (idx >= 0) {
+        const snapshot = this.snapshotSessionState(session);
         let text = "";
         const images = [];
         if (typeof msg.content === "string") text = msg.content;
@@ -944,9 +900,14 @@ export default {
             }
           });
         }
-        this.currentSession.messages.splice(idx);
-        this.currentSession.useServerHistoryOnly = false;
-        this.clearServerHistory(this.currentSession.id);
+        this.removeMessageRangeFromSession(session, idx);
+        const clearResult = await this.clearServerHistory(sessionId);
+        if (clearResult && clearResult.ok === false) {
+          this.restoreSessionState(session, snapshot);
+          this.chatBanner = "服务端历史清理失败，已恢复当前会话，避免前后端上下文不一致。";
+          this.saveSessions();
+          return;
+        }
         this.saveSessions();
         if (this.$refs.chatInput && this.$refs.chatInput.prefillFromUserEdit) {
           this.$refs.chatInput.prefillFromUserEdit({
@@ -957,20 +918,33 @@ export default {
         }
       }
     },
-    onRegenerateMessage(msg) {
+    async onRegenerateMessage(msg) {
       if (this.busy || !this.currentSession) return;
-      const idx = this.currentSession.messages.findIndex((m) => m.id === msg.id);
+      const session = this.currentSession;
+      const sessionId = session.id;
+      const idx = session.messages.findIndex((m) => m.id === msg.id);
       if (idx >= 0) {
-        const lastUser = this.currentSession.messages.slice(0, idx).reverse().find((m) => m.role === "user");
-        this.currentSession.messages.splice(idx);
-        this.currentSession.useServerHistoryOnly = false;
-        this.clearServerHistory(this.currentSession.id);
+        const snapshot = this.snapshotSessionState(session);
+        const lastUser = session.messages.slice(0, idx).reverse().find((m) => m.role === "user");
+        if (!lastUser) {
+          this.chatBanner = "无法重新生成：缺少对应的用户消息。";
+          return;
+        }
+        this.removeMessageRangeFromSession(session, idx);
+        const clearResult = await this.clearServerHistory(sessionId);
+        if (clearResult && clearResult.ok === false) {
+          this.restoreSessionState(session, snapshot);
+          this.chatBanner = "服务端历史清理失败，已恢复当前会话，避免前后端上下文不一致。";
+          this.saveSessions();
+          return;
+        }
         this.saveSessions();
-        sendFeedback("regenerate", { session_id: this.currentSession.id, message_id: msg.id });
-        this._triggerStream({
+        sendFeedback("regenerate", { session_id: sessionId, message_id: msg.id });
+        await this._triggerStream({
           userMsg: lastUser,
           documents: lastUser?.meta?.documents || [],
           searchMode: lastUser?.meta?.searchMode || "auto",
+          session,
           upgradeTrack: true,
         });
       }

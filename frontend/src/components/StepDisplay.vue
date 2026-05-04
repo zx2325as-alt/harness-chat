@@ -356,9 +356,6 @@ export default {
       return table[n] || "other";
     },
     groupedPhases(run) {
-      const cacheKey = `${run?.id || "x"}:${this.renderTick}:${(run?.steps || []).length}`;
-      if (!this._groupedPhaseCache) this._groupedPhaseCache = {};
-      if (this._groupedPhaseCache[cacheKey]) return this._groupedPhaseCache[cacheKey];
       const order = ["intake", "search", "fast", "reasoning", "refine", "polishing", "other"];
       const titles = {
         intake: "分析与调度",
@@ -379,9 +376,7 @@ export default {
         const k = buckets[g] !== undefined ? g : "other";
         buckets[k].push({ step, globalIdx });
       });
-      const phases = order.filter((k) => buckets[k].length).map((k) => ({ key: k, title: titles[k], steps: buckets[k] }));
-      this._groupedPhaseCache = { [cacheKey]: phases };
-      return phases;
+      return order.filter((k) => buckets[k].length).map((k) => ({ key: k, title: titles[k], steps: buckets[k] }));
     },
     _flattenStepsForPipe(stepsWrap) {
       const flat = [];

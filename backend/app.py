@@ -1,37 +1,37 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request, UploadFile, File, Body
+from fastapi import FastAPI, Request, UploadFile, File, Body, HTTPException, Form
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import json
 import asyncio
 import math
 import re
+import hashlib
 from pydantic import BaseModel, Field
 
 import redis
 
 from harness import DualTrackHarness
-from document_extract import extract_document
-from utils import load_yaml, new_trace_id
+from document_extract import SUPPORTED_DOCUMENT_EXTS, detect_document_ext, extract_document
+from local_docs import load_folder_documents
+from semantic_utils import batch_semantic_similarity
+from utils import load_yaml, new_trace_id, env_get
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(ROOT, "config.yaml")
 
 
-# Initialize Redis connection
-# Note: For production, parameters should come from config.yaml or env vars.
-# For now, we assume a local redis instance.
-try:
-    redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
-    redis_client.ping()
-except Exception as e:
-    print(f"Warning: Failed to connect to Redis ({e}). Sessions will not be persisted.")
-    redis_client = None
+redis_client = None
+ALLOWED_DOCUMENT_EXTS = set(SUPPORTED_DOCUMENT_EXTS)
+DEFAULT_MAX_UPLOAD_FILES = 6
+DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+DEFAULT_REDIS_HISTORY_ITEMS = 40
 
 class Message(BaseModel):
     role: str
@@ -194,6 +194,13 @@ def _documents_context(documents: Any, query: str = "", max_total_chars: int = 6
         for i, r in enumerate(ranked):
             r["score"] = float(bm[i]) if i < len(bm) else 0.0
         ranked.sort(key=lambda x: x.get("score", 0), reverse=True)
+        top_n = ranked[:20]
+        emb_scores = batch_semantic_similarity(query, [str(r.get("content") or "")[:2000] for r in top_n])
+        for idx, row in enumerate(top_n):
+            row["embedding_score"] = float(emb_scores[idx]) if idx < len(emb_scores) else 0.0
+            row["score"] = row.get("score", 0.0) * 0.55 + row.get("embedding_score", 0.0) * 0.45
+        top_n.sort(key=lambda x: x.get("score", 0), reverse=True)
+        ranked = top_n + ranked[20:]
     selected = [r for r in ranked if float(r.get("score", 0) or 0) > 0][:8] if query else []
     if not selected:
         selected = ranked[:8]
@@ -213,8 +220,17 @@ def _documents_context(documents: Any, query: str = "", max_total_chars: int = 6
     return "\n".join(pieces)
 
 
+def _int_option(options: Dict[str, Any], key: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(options.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 def _augment_prompt(prompt: str, options: Dict[str, Any]) -> str:
-    docs_context = _documents_context(options.get("documents"), query=prompt)
+    doc_budget = _int_option(options, "doc_context_chars", 40_000, minimum=2_000, maximum=60_000)
+    docs_context = _documents_context(options.get("documents"), query=prompt, max_total_chars=doc_budget)
     if not docs_context:
         return prompt
     return (
@@ -222,6 +238,111 @@ def _augment_prompt(prompt: str, options: Dict[str, Any]) -> str:
         "请优先基于上述文档回答；涉及文档信息时，尽量标注来自哪份文档或哪段内容。\n\n"
         f"【用户问题】\n{prompt}"
     )
+
+
+def _ensure_non_empty_prompt(last_prompt: str, hist: List[Dict[str, Any]]) -> None:
+    if str(last_prompt).strip() or hist:
+        return
+    raise HTTPException(status_code=400, detail="No prompt or messages provided")
+
+
+def _capture_stream_text(final_answer: str, event: Dict[str, Any]) -> Tuple[str, bool]:
+    evt = str(event.get("event") or "")
+    if evt == "content_reset":
+        return "", False
+    if evt == "chunk":
+        data = event.get("data", {})
+        if "content" in data:
+            final_answer += str(data["content"])
+    return final_answer, evt == "error"
+
+
+def _init_redis_client(cfg: Dict[str, Any]) -> Optional[redis.Redis]:
+    redis_cfg = ((cfg.get("server") or {}).get("redis") or {})
+    host = str(redis_cfg.get("host") or env_get("REDIS_HOST", "localhost"))
+    port = int(redis_cfg.get("port") or env_get("REDIS_PORT", "6379") or 6379)
+    db = int(redis_cfg.get("db") or env_get("REDIS_DB", "0") or 0)
+    password = redis_cfg.get("password") or env_get("REDIS_PASSWORD")
+    enabled = bool(redis_cfg.get("enabled", True))
+    if not enabled:
+        return None
+    try:
+        client = redis.Redis(host=host, port=port, db=db, password=password, decode_responses=True)
+        client.ping()
+        return client
+    except Exception as e:
+        print(f"Warning: Failed to connect to Redis ({e}). Sessions will not be persisted.")
+        return None
+
+
+def _validate_upload_name(filename: str) -> str:
+    ext = detect_document_ext(filename)
+    if ext not in ALLOWED_DOCUMENT_EXTS:
+        raise HTTPException(status_code=400, detail=f"暂不支持的文件格式：.{ext or 'unknown'}")
+    return ext
+
+
+async def _read_upload_file_limited(upload: UploadFile, max_bytes: int) -> bytes:
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(status_code=413, detail=f"文件过大：{upload.filename or '未命名文件'}")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _redis_history_limit(cfg: Dict[str, Any]) -> int:
+    server_cfg = cfg.get("server") or {}
+    return _int_option(
+        server_cfg,
+        "session_history_items",
+        DEFAULT_REDIS_HISTORY_ITEMS,
+        minimum=10,
+        maximum=200,
+    )
+
+
+def _store_history(redis_conn: redis.Redis, key: str, user_msg: Dict[str, Any], answer: str, max_items: int) -> None:
+    payload_user = json.dumps(user_msg, ensure_ascii=False)
+    payload_assistant = json.dumps({"role": "assistant", "content": answer}, ensure_ascii=False)
+    pipe = redis_conn.pipeline()
+    pipe.rpush(key, payload_user, payload_assistant)
+    pipe.ltrim(key, -max_items, -1)
+    pipe.expire(key, 60 * 60 * 24 * 30)
+    pipe.execute()
+
+
+def _document_cache_key(data: bytes) -> str:
+    return "harness:docparse:" + hashlib.sha256(data).hexdigest()
+
+
+def _load_document_cache(redis_conn: Optional[redis.Redis], data: bytes) -> Optional[Dict[str, Any]]:
+    if not redis_conn:
+        return None
+    try:
+        raw = redis_conn.get(_document_cache_key(data))
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def _store_document_cache(redis_conn: Optional[redis.Redis], data: bytes, doc: Dict[str, Any]) -> None:
+    if not redis_conn:
+        return
+    try:
+        redis_conn.set(_document_cache_key(data), json.dumps(doc, ensure_ascii=False), ex=3600)
+    except Exception:
+        pass
+
+
+def _append_feedback_line(log_path: str, line: str) -> None:
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 
 def _step_id_for(step: Dict[str, Any]) -> str:
@@ -280,7 +401,9 @@ def _normalise_stream_event(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def create_app() -> FastAPI:
+    global redis_client
     cfg = load_yaml(CONFIG_PATH)
+    redis_client = _init_redis_client(cfg)
     app = FastAPI(title="Harness Chat (Dual-Track)", version="0.1.0")
 
     cors = (cfg.get("server") or {}).get("cors_allow_origins") or ["*"]
@@ -295,17 +418,73 @@ def create_app() -> FastAPI:
     harness = DualTrackHarness(cfg, redis_client=redis_client)
 
     @app.post("/api/documents/parse")
-    async def parse_documents(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
+    async def parse_documents(
+        files: List[UploadFile] = File(...),
+        client_file_ids: Optional[List[str]] = Form(None),
+    ) -> Dict[str, Any]:
+        max_files = _int_option(cfg.get("server") or {}, "upload_max_files", DEFAULT_MAX_UPLOAD_FILES, minimum=1, maximum=20)
+        max_file_bytes = _int_option(
+            cfg.get("server") or {},
+            "upload_max_file_bytes",
+            DEFAULT_MAX_UPLOAD_BYTES,
+            minimum=256 * 1024,
+            maximum=50 * 1024 * 1024,
+        )
+        if len(files) > max_files:
+            raise HTTPException(status_code=400, detail=f"上传文件数量超过限制：最多 {max_files} 个")
         documents = []
-        for f in files:
-            data = await f.read()
+        ids = list(client_file_ids or [])
+        for idx, f in enumerate(files):
             name = f.filename or "未命名文件"
+            _validate_upload_name(name)
+            data = await _read_upload_file_limited(f, max_file_bytes)
+            client_file_id = ids[idx] if idx < len(ids) else None
+            cached_doc = _load_document_cache(redis_client, data)
+            if cached_doc:
+                doc = dict(cached_doc)
+                if client_file_id:
+                    doc["client_file_id"] = client_file_id
+                documents.append(doc)
+                continue
 
             def _sync_extract() -> Dict[str, Any]:
-                return extract_document(name, data).to_dict()
+                doc = extract_document(name, data).to_dict()
+                _store_document_cache(redis_client, data, doc)
+                if client_file_id:
+                    doc["client_file_id"] = client_file_id
+                return doc
 
             documents.append(await asyncio.to_thread(_sync_extract))
         return {"documents": documents}
+
+    @app.post("/api/documents/parse_folder")
+    async def parse_folder(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        """
+        读取服务器本地文件夹内所有支持格式的文档。
+        payload:
+          folder_path: str          必填，绝对或相对路径
+          recursive:   bool = True  是否递归子目录
+          max_files:   int  = 50    最多文件数
+        """
+        folder_path = str(payload.get("folder_path") or "").strip()
+        if not folder_path:
+            raise HTTPException(status_code=400, detail="folder_path 不能为空")
+
+        recursive = bool(payload.get("recursive", True))
+        max_files = min(int(payload.get("max_files", 50)), 200)
+
+        try:
+            result = await load_folder_documents(
+                folder_path,
+                recursive=recursive,
+                max_files=max_files,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"文件夹读取失败：{e}")
+
+        return result
 
     @app.get("/api/health")
     async def health() -> Dict[str, Any]:
@@ -333,9 +512,16 @@ def create_app() -> FastAPI:
             ensure_ascii=False,
         )
         try:
+            if redis_client:
+                stream_payload = {
+                    "event": ev,
+                    "session_id": str(payload.get("session_id") or ""),
+                    "trace_id": str(payload.get("trace_id") or ""),
+                    "meta": json.dumps(meta, ensure_ascii=False),
+                }
+                await asyncio.to_thread(redis_client.xadd, "harness:feedback", stream_payload, maxlen=5000, approximate=True)
             log_path = os.path.join(ROOT, "feedback.log")
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            await asyncio.to_thread(_append_feedback_line, log_path, line)
         except Exception as e:
             return {"ok": False, "error": str(e)}
         return {"ok": True}
@@ -366,9 +552,9 @@ def create_app() -> FastAPI:
         last_prompt = _content_to_text(current)
         if not str(last_prompt).strip() and isinstance(options.get("documents"), list) and options.get("documents"):
             last_prompt = "请根据上传的文档回答问题。"
-        if not str(last_prompt).strip() and not hist:
-            return {"error": "No prompt or messages provided"}
+        _ensure_non_empty_prompt(str(last_prompt), hist)
         options["search_prompt_base"] = str(last_prompt)
+        options["session_id"] = req.session_id or ""
         augmented = _augment_prompt(str(last_prompt), options)
 
         result = await harness.run(augmented, messages=hist, mode=req.mode, options=options)
@@ -386,6 +572,7 @@ def create_app() -> FastAPI:
         # 仅当前端明确选择服务端历史时才用 Redis 覆盖请求体，避免编辑/重生成后混入旧上下文。
         historical_messages = [m.model_dump() for m in req.messages]
         prefer_server_history = bool(options.get("prefer_server_history"))
+        history_cache_hit = False
         if prefer_server_history and redis_client and redis_key:
             try:
                 # 同步 Redis 会阻塞整个 asyncio 事件循环，导致 SSE 在首包发出前就卡死；放入线程并限时。
@@ -395,6 +582,7 @@ def create_app() -> FastAPI:
                 )
                 if cached_msgs:
                     historical_messages = [json.loads(m) for m in cached_msgs]
+                    history_cache_hit = True
             except Exception as e:
                 print(f"Redis history skipped (timeout/error): {e}")
 
@@ -408,20 +596,22 @@ def create_app() -> FastAPI:
         if not str(last_prompt_str).strip() and isinstance(options.get("documents"), list) and options.get("documents"):
             last_prompt_str = "请根据上传的文档回答问题。"
 
-        if not str(last_prompt_str).strip():
-            return {"error": "No prompt or messages provided"}
+        _ensure_non_empty_prompt(str(last_prompt_str), historical_messages)
 
         options["search_prompt_base"] = str(last_prompt_str)
+        options["session_id"] = session_id or ""
         augmented_prompt = _augment_prompt(str(last_prompt_str), options)
 
         client_run_id = str(options.get("client_run_id") or "").strip()
-        stream_connect_attempt = int(options.get("stream_connect_attempt") or 0)
+        stream_connect_attempt = _int_option(options, "stream_connect_attempt", 0, minimum=0, maximum=20)
         harness_options = {
             k: v for k, v in options.items() if k not in ("client_run_id", "stream_connect_attempt")
         }
+        redis_history_items = _redis_history_limit(cfg)
 
         async def event_generator():
             final_answer = ""
+            reset_pending = False
             stream_failed = False
             queue: asyncio.Queue = asyncio.Queue()
 
@@ -471,6 +661,8 @@ def create_app() -> FastAPI:
 
             task = asyncio.create_task(_produce())
             try:
+                if prefer_server_history and redis_key and redis_client and not history_cache_hit:
+                    yield f"data: {json.dumps({'event': 'history_miss', 'session_id': session_id, 'trace_id': trace_id}, ensure_ascii=False)}\n\n"
                 while True:
                     if await request.is_disconnected():
                         task.cancel()
@@ -487,12 +679,12 @@ def create_app() -> FastAPI:
 
                     event = _normalise_stream_event(event)
 
-                    # We need to capture the final content to store it in redis
-                    if event.get("event") == "chunk":
-                        data = event.get("data", {})
-                        if "content" in data:
-                            final_answer += data["content"]
-                    if event.get("event") == "error":
+                    final_answer, event_failed = _capture_stream_text(final_answer, event)
+                    if event.get("event") == "content_reset":
+                        reset_pending = True
+                    elif event.get("event") == "chunk" and (event.get("data") or {}).get("content"):
+                        reset_pending = False
+                    if event_failed:
                         stream_failed = True
                             
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -500,15 +692,16 @@ def create_app() -> FastAPI:
                         break
                     
                 # If everything succeeded and we have a final answer, update Redis
-                if not stream_failed and redis_client and redis_key and final_answer:
+                if not stream_failed and redis_client and redis_key and final_answer and not reset_pending:
                     try:
-                        await asyncio.to_thread(redis_client.rpush, redis_key, json.dumps(current_user_msg))
                         await asyncio.to_thread(
-                            redis_client.rpush,
+                            _store_history,
+                            redis_client,
                             redis_key,
-                            json.dumps({"role": "assistant", "content": final_answer}),
+                            current_user_msg,
+                            final_answer,
+                            redis_history_items,
                         )
-                        await asyncio.to_thread(redis_client.expire, redis_key, 60 * 60 * 24 * 30)  # 30 days
                         yield f"data: {json.dumps({'event': 'history_stored', 'session_id': session_id}, ensure_ascii=False)}\n\n"
                     except Exception as e:
                         print(f"Failed to save to redis: {e}")
@@ -535,4 +728,3 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
-

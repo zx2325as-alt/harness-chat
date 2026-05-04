@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+import hashlib
+import json
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -12,6 +14,7 @@ TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
 class SearchService:
     def __init__(self, cfg: Dict[str, Any]):
+        self.cfg = cfg
         h = (cfg.get("harness") or {}).get("search") or {}
         self._search_cfg = h
         self.provider = str(h.get("provider", "tavily")).strip().lower()
@@ -50,7 +53,34 @@ class SearchService:
             )
         return context, sources
 
-    async def _tavily_search(self, query: str) -> Dict[str, Any]:
+    def _resolve_search_depth(self, override: Optional[str] = None) -> str:
+        depth = str(override or self.search_depth or "basic").strip().lower()
+        return depth if depth in ("basic", "advanced", "fast", "ultra-fast") else "basic"
+
+    def _resolve_max_results(self, override: Optional[int] = None) -> int:
+        try:
+            value = int(override if override is not None else self.max_results)
+        except (TypeError, ValueError):
+            value = self.max_results
+        return max(1, min(20, value))
+
+    def _session_cache_key(self, session_id: str, query: str) -> str:
+        norm = (query or "").strip().lower()
+        digest = hashlib.sha256(norm.encode("utf-8")).hexdigest()
+        return f"harness:searchkb:{session_id}:{digest}"
+
+    async def _load_session_cache(self, session_id: str, query: str) -> Optional[Dict[str, Any]]:
+        redis_client = getattr(self.cfg, "get", None) and None
+        redis_client = None
+        return None
+
+    async def _tavily_search(
+        self,
+        query: str,
+        *,
+        override_search_depth: Optional[str] = None,
+        override_max_results: Optional[int] = None,
+    ) -> Dict[str, Any]:
         api_key = self._api_key()
         if not api_key:
             return {
@@ -70,10 +100,8 @@ class SearchService:
         body: Dict[str, Any] = {
             "api_key": api_key,
             "query": q,
-            "search_depth": self.search_depth
-            if self.search_depth in ("basic", "advanced", "fast", "ultra-fast")
-            else "basic",
-            "max_results": max(1, min(20, self.max_results)),
+            "search_depth": self._resolve_search_depth(override_search_depth),
+            "max_results": self._resolve_max_results(override_max_results),
             "topic": self.topic if self.topic in ("general", "news", "finance") else "general",
             "include_answer": self.include_answer,
         }
@@ -171,7 +199,7 @@ class SearchService:
                 "raw_status": None,
             }
 
-    async def _duckduckgo_search(self, query: str) -> Dict[str, Any]:
+    async def _duckduckgo_search(self, query: str, *, override_max_results: Optional[int] = None) -> Dict[str, Any]:
         from duckduckgo_search import DDGS
 
         t0 = time.perf_counter()
@@ -184,7 +212,7 @@ class SearchService:
                         region="wt-wt",
                         safesearch="moderate",
                         timelimit=None,
-                        max_results=max(1, min(15, self.max_results)),
+                        max_results=max(1, min(15, self._resolve_max_results(override_max_results))),
                     )
                 )
 
@@ -229,7 +257,13 @@ class SearchService:
                 "provider": "duckduckgo",
             }
 
-    async def search(self, query: str) -> Dict[str, Any]:
+    async def search(
+        self,
+        query: str,
+        *,
+        override_max_results: Optional[int] = None,
+        override_search_depth: Optional[str] = None,
+    ) -> Dict[str, Any]:
         query = (query or "").strip()
         if not query:
             return {
@@ -246,7 +280,7 @@ class SearchService:
         attempts: List[Dict[str, Any]] = []
 
         if self.provider == "duckduckgo":
-            r = await self._duckduckgo_search(query)
+            r = await self._duckduckgo_search(query, override_max_results=override_max_results)
             attempts.append(
                 {
                     "provider": "duckduckgo",
@@ -269,7 +303,11 @@ class SearchService:
                 }
             return self._finalize_result(r, attempts)
 
-        r = await self._tavily_search(query)
+        r = await self._tavily_search(
+            query,
+            override_search_depth=override_search_depth,
+            override_max_results=override_max_results,
+        )
         attempts.append(
             {
                 "provider": "tavily",
@@ -284,7 +322,7 @@ class SearchService:
             return self._finalize_result(r, attempts)
 
         if self.fallback == "duckduckgo":
-            r2 = await self._duckduckgo_search(query)
+            r2 = await self._duckduckgo_search(query, override_max_results=override_max_results)
             attempts.append(
                 {
                     "provider": "duckduckgo",

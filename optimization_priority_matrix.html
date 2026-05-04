@@ -1,0 +1,367 @@
+
+<style>
+h2.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+.tabs{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}
+.tab{padding:6px 14px;font-size:12px;border:0.5px solid var(--color-border-secondary);border-radius:var(--border-radius-md);cursor:pointer;background:var(--color-background-secondary);color:var(--color-text-secondary);white-space:nowrap}
+.tab.active{background:var(--color-text-primary);color:var(--color-background-primary);border-color:var(--color-text-primary)}
+.panel{display:none}.panel.active{display:block}
+.item{display:flex;gap:12px;padding:10px 0;border-bottom:0.5px solid var(--color-border-tertiary);align-items:flex-start}
+.item:last-child{border-bottom:none}
+.item-num{font-size:11px;color:var(--color-text-tertiary);min-width:22px;padding-top:2px;font-weight:500}
+.item-body{flex:1}
+.item-title{font-size:13px;font-weight:500;color:var(--color-text-primary);margin:0 0 3px}
+.item-desc{font-size:12px;color:var(--color-text-secondary);line-height:1.6;margin:0}
+.item-tags{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+.tag{font-size:10px;padding:2px 7px;border-radius:var(--border-radius-md);font-weight:500}
+.t-perf{background:var(--color-background-info);color:var(--color-text-info)}
+.t-qual{background:var(--color-background-success);color:var(--color-text-success)}
+.t-func{background:var(--color-background-warning);color:var(--color-text-warning)}
+.t-high{background:var(--color-background-danger);color:var(--color-text-danger)}
+.item-meta{font-size:11px;color:var(--color-text-tertiary);min-width:60px;text-align:right;padding-top:2px}
+.legend{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;font-size:11px}
+.legend-item{display:flex;align-items:center;gap:5px;color:var(--color-text-secondary)}
+.lc{width:10px;height:10px;border-radius:2px}
+.section-title{font-size:13px;font-weight:500;color:var(--color-text-primary);margin:12px 0 8px;padding-bottom:6px;border-bottom:0.5px solid var(--color-border-tertiary)}
+</style>
+<h2 class="sr-only">Optimization opportunities for Harness Chat, organized by category: performance, quality, functionality, and configuration</h2>
+
+<div class="legend">
+  <span class="legend-item"><span class="lc t-high"></span>极高收益</span>
+  <span class="legend-item"><span class="lc t-perf"></span>性能/延迟</span>
+  <span class="legend-item"><span class="lc t-qual"></span>输出质量</span>
+  <span class="legend-item"><span class="lc t-func"></span>功能增强</span>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="show('perf')">性能 &amp; 延迟 (9)</div>
+  <div class="tab" onclick="show('quality')">输出质量 (10)</div>
+  <div class="tab" onclick="show('func')">功能增强 (7)</div>
+  <div class="tab" onclick="show('config')">配置调参 (8)</div>
+</div>
+
+<div id="perf" class="panel active">
+  <div class="item">
+    <div class="item-num">P1</div>
+    <div class="item-body">
+      <p class="item-title">分析器 + 预检索并行化（投机执行）</p>
+      <p class="item-desc">目前流程是串行：先等分析器返回（最多 25s），再决定是否搜索，再搜索（最多 28s）。可以同时启动 analyze_complexity 和搜索，分析器返回后若不需要搜索则取消搜索任务。大多数需要搜索的 query 可节省 10-25 秒首包时间。</p>
+      <div class="item-tags"><span class="tag t-high">极高收益</span><span class="tag t-perf">延迟</span></div>
+    </div>
+    <div class="item-meta">节省 ~15s</div>
+  </div>
+  <div class="item">
+    <div class="item-num">P2</div>
+    <div class="item-body">
+      <p class="item-title">快速缓存相似度：SequenceMatcher → embedding</p>
+      <p class="item-desc">_try_fast_cache_hit 用字符级编辑距离做语义匹配，similarity_threshold=0.9 要求近似完全一致才命中。「帮我写个排序」和「Python 排序怎么写」会被判不相似。改用 sentence-transformers（paraphrase-multilingual-MiniLM-L12-v2，本地免费），余弦相似度 0.85 即可命中，缓存命中率从约 5% 提升至 40%+，命中后整条链路直接返回。</p>
+      <div class="item-tags"><span class="tag t-high">极高收益</span><span class="tag t-perf">延迟</span></div>
+    </div>
+    <div class="item-meta">命中率 +40%</div>
+  </div>
+  <div class="item">
+    <div class="item-num">P3</div>
+    <div class="item-body">
+      <p class="item-title">搜索结果会话级缓存（去重复查）</p>
+      <p class="item-desc">Agent 轨多轮迭代中同一 query 可能被多次调用，Refine 轨 Layer2 审查层也可能对 Layer1 已搜过的内容再次搜索。在 perform_web_search 加一个请求级 dict 缓存（key=normalize(query)，TTL=本次请求生命周期），完全相同的 query 在同一会话内复用结果，避免重复消耗 Tavily 配额和 10-15s 延迟。</p>
+      <div class="item-tags"><span class="tag t-perf">延迟</span><span class="tag t-func">节省 API 调用</span></div>
+    </div>
+    <div class="item-meta">节省 ~15s/次</div>
+  </div>
+  <div class="item">
+    <div class="item-num">P4</div>
+    <div class="item-body">
+      <p class="item-title">Fast 轨 + 分析器并发：投机 Fast 流</p>
+      <p class="item-desc">当分析器置信度历史上对「短问题」总是返回 fast 时，可以同时启动分析器和 fast 模型调用，如果分析器确认 fast 则直接使用已进行中的流；如果分析器返回 refine/agent 则取消 fast 流改换路径。对日常问答类查询可减少 20-25s 整体延迟。</p>
+      <div class="item-tags"><span class="tag t-perf">延迟</span></div>
+    </div>
+    <div class="item-meta">节省 ~20s</div>
+  </div>
+  <div class="item">
+    <div class="item-num">P5</div>
+    <div class="item-body">
+      <p class="item-title">stream_slice_chars 从 8 调大到 64-128</p>
+      <p class="item-desc">_stream_with_fallback 和 _emit_text_chunks 每 8 个字符 yield 一次并 await asyncio.sleep(0)，对于输出 2000 字的回复需要 yield 250 次，每次都触发事件循环调度。改为 64-128 字符每片，在不影响流式体验的前提下减少协程切换开销约 75%，对 CPU 密集的 refine 轨有明显收益。</p>
+      <div class="item-tags"><span class="tag t-perf">吞吐量</span></div>
+    </div>
+    <div class="item-meta">CPU -75%</div>
+  </div>
+  <div class="item">
+    <div class="item-num">P6</div>
+    <div class="item-body">
+      <p class="item-title">相关性过滤改为「展示后异步重排」</p>
+      <p class="item-desc">filter_sources_by_relevance 在搜索完成后、生成前同步调用小模型过滤，增加 1-3s 阻塞。改为：先用原始结果生成，同时后台异步过滤，等下次用户发消息时若有新查询则使用上次过滤后的缓存。或者干脆把过滤集成到 Layer2 审查层 prompt 里让审查模型自己判断哪些来源可信，省掉单独的过滤 LLM 调用。</p>
+      <div class="item-tags"><span class="tag t-perf">延迟</span><span class="tag t-qual">质量</span></div>
+    </div>
+    <div class="item-meta">节省 ~2s</div>
+  </div>
+  <div class="item">
+    <div class="item-num">P7</div>
+    <div class="item-body">
+      <p class="item-title">文档提取结果按内容 hash 缓存</p>
+      <p class="item-desc">/api/documents/parse 每次调用都重新提取，若用户刷新页面后重传同一文件会重做 PDF/DOCX 解析。在 extract_document 前计算 SHA256，Redis 里缓存提取结果（TTL=1小时）。对大 PDF（80页）可省去 0.5-2s 解析时间。</p>
+      <div class="item-tags"><span class="tag t-perf">延迟</span></div>
+    </div>
+    <div class="item-meta">省 1-2s</div>
+  </div>
+  <div class="item">
+    <div class="item-num">P8</div>
+    <div class="item-body">
+      <p class="item-title">httpx 连接池参数调优</p>
+      <p class="item-desc">_SHARED_LIMITS 设置 max_connections=20，Refine 轨三层并发（L1+L2+L3 各自可能 fallback）加上搜索并发，实际峰值可能超过 20 导致连接等待。个人使用建议调到 max_connections=50, max_keepalive_connections=20；同时 keepalive_expiry=30s 对长时间无操作的会话可能导致连接重建，调到 60s 更合理。</p>
+      <div class="item-tags"><span class="tag t-perf">并发</span></div>
+    </div>
+    <div class="item-meta">连接等待 -50%</div>
+  </div>
+  <div class="item">
+    <div class="item-num">P9</div>
+    <div class="item-body">
+      <p class="item-title">分析器结果按 prompt 指纹缓存（短期）</p>
+      <p class="item-desc">analyze_complexity 每次都调用 LLM（25s 超时），对于完全相同或高度相似的 prompt，可以用 norm_cache_prompt 作为 key，Redis 缓存分析结果 TTL=300s。重复发送同一问题（如前端重试）时直接命中，跳过整个分析层开销。</p>
+      <div class="item-tags"><span class="tag t-perf">延迟</span></div>
+    </div>
+    <div class="item-meta">节省 ~5s</div>
+  </div>
+</div>
+
+<div id="quality" class="panel">
+  <div class="item">
+    <div class="item-num">Q1</div>
+    <div class="item-body">
+      <p class="item-title">BM25 文档检索升级：混合 embedding 重排</p>
+      <p class="item-desc">当前 _doc_bm25_scores 纯词频匹配，对同义词、近义词、跨语言表达无效（「删除文件」≠「移除档案」）。在 BM25 初筛后用本地 embedding 模型（sentence-transformers）对 top-20 chunk 做余弦相似度重排，选 top-8 送入上下文。对文档 QA 场景答案准确率提升显著。</p>
+      <div class="item-tags"><span class="tag t-high">极高收益</span><span class="tag t-qual">文档 QA</span></div>
+    </div>
+    <div class="item-meta">准确率 +30%</div>
+  </div>
+  <div class="item">
+    <div class="item-num">Q2</div>
+    <div class="item-body">
+      <p class="item-title">Layer3 润色层接收审查层输出截断 + 去元语言</p>
+      <p class="item-desc">审查层（Layer2）输出包含自我批评语言（「初稿存在以下问题：1. 缺少…」「修正后答案：」），这些元语言直接进入 Layer3 后润色层会在最终答案里保留批改痕迹。在 _build_layer3_prompt 里加一步正则清洗：剥除「问题清单」「初稿问题」等审查元块，只把「修正版答案」部分传给 Layer3。</p>
+      <div class="item-tags"><span class="tag t-high">极高收益</span><span class="tag t-qual">最终答案质量</span></div>
+    </div>
+    <div class="item-meta">用户体验 +</div>
+  </div>
+  <div class="item">
+    <div class="item-num">Q3</div>
+    <div class="item-body">
+      <p class="item-title">agent_self_check 与 Layer2 review 合并</p>
+      <p class="item-desc">_agent_self_check_block 单独调用一个推理模型做自检，然后把结果作为 extra_review_context 注入 Layer2。这是两次串行 LLM 调用。可以直接在 Layer2 的 prompt 里加一段：「请先列出你自己对初稿的不确定之处，然后给出修正版答案」，将自检和审查合并为一次调用，对高复杂度任务节省 1 次推理时间。</p>
+      <div class="item-tags"><span class="tag t-qual">质量</span><span class="tag t-perf">延迟</span></div>
+    </div>
+    <div class="item-meta">节省 1 次 LLM</div>
+  </div>
+  <div class="item">
+    <div class="item-num">Q4</div>
+    <div class="item-body">
+      <p class="item-title">Agent 历史窗口从 16 轮扩展到动态计算</p>
+      <p class="item-desc">_run_agent_stream 硬截取 messages[-16:]，对于复杂多轮对话会丢失早期关键上下文。应按 token 估算（每条 len(content)//4），动态选尽可能多的历史，直到总量接近模型上下文限制的 70%（给推理过程留空间）。</p>
+      <div class="item-tags"><span class="tag t-qual">上下文利用率</span></div>
+    </div>
+    <div class="item-meta">上下文 +</div>
+  </div>
+  <div class="item">
+    <div class="item-num">Q5</div>
+    <div class="item-body">
+      <p class="item-title">搜索词增强：扩展通用模式</p>
+      <p class="item-desc">build_search_query 增强规则只覆盖东京地名和天气类。应扩展：股票/汇率类自动加「实时 今日」；技术版本类（Vue、React、Python + 版本号）加当前年份；人名类自动去掉敬称后缀防止 Tavily 搜不到；英文 query 时避免追加中文词（目前可能把「2026年」加到英文 query 里导致搜索引擎不理解）。</p>
+      <div class="item-tags"><span class="tag t-qual">检索质量</span></div>
+    </div>
+    <div class="item-meta">检索覆盖 +</div>
+  </div>
+  <div class="item">
+    <div class="item-num">Q6</div>
+    <div class="item-body">
+      <p class="item-title">_analyzer_fallback_timeout 只靠长度判断，改为多特征</p>
+      <p class="item-desc">当分析器超时时，仅用 len(prompt)>200 决定 fast/refine 太粗糙。应补充：是否含代码块（``` 检测 → reasoning）、是否含问号数量（多个问题 → refine）、是否含明确「写一篇」「详细分析」等 refine 关键词（直接映射）。超时降级的准确率从约 60% 提升到 80%+。</p>
+      <div class="item-tags"><span class="tag t-qual">路由准确率</span></div>
+    </div>
+    <div class="item-meta">路由准确 +20%</div>
+  </div>
+  <div class="item">
+    <div class="item-num">Q7</div>
+    <div class="item-body">
+      <p class="item-title">reasoning_keyword_boost 扩展：代码块检测</p>
+      <p class="item-desc">routing_signals.py 的 reasoning_keyword_boost 只检测数学符号和逻辑词，遗漏了代码相关的复杂推理。应加入：检测是否含代码块（``` 包裹），检测是否含「debug」「报错」「traceback」等，这类 query 应路由到 reasoning 轨使用 claude-sonnet-4-6-thinking 等更强的推理模型。</p>
+      <div class="item-tags"><span class="tag t-qual">路由准确率</span></div>
+    </div>
+    <div class="item-meta">代码任务 +</div>
+  </div>
+  <div class="item">
+    <div class="item-num">Q8</div>
+    <div class="item-body">
+      <p class="item-title">Agent 重复搜索查询检测</p>
+      <p class="item-desc">Agent 迭代中已有 _agent_loop_ctx.last_query 记录上次查询，但只记录最后一条。若 Agent 在第 1 轮搜「A」，第 2 轮搜「B」，第 3 轮再搜「A」，不会被检测到重复。改用 set 记录所有历史查询，对语义相似（n-gram 重叠 > 70%）的新查询注入提示让 Agent 换角度，避免无效循环浪费迭代次数。</p>
+      <div class="item-tags"><span class="tag t-qual">Agent 效率</span></div>
+    </div>
+    <div class="item-meta">迭代效率 +</div>
+  </div>
+  <div class="item">
+    <div class="item-num">Q9</div>
+    <div class="item-body">
+      <p class="item-title">Layer1 Draft 引入来源感知 prompt</p>
+      <p class="item-desc">当有搜索结果注入时（entry_block 非空），Layer1 的 instruction 仍是通用「覆盖全面」指令，没有告知模型「你有参考资料，请充分利用」。应在 _build_layer1_prompt 里检测 entry_block 是否为空，非空时追加：「以下搜索摘要为本次信息来源，请优先引用，标注序号，勿超出摘要范围臆测」。</p>
+      <div class="item-tags"><span class="tag t-qual">引用准确性</span></div>
+    </div>
+    <div class="item-meta">引用质量 +</div>
+  </div>
+  <div class="item">
+    <div class="item-num">Q10</div>
+    <div class="item-body">
+      <p class="item-title">系统语言指令从硬编码中文改为动态检测</p>
+      <p class="item-desc">model_adapters.py 的 req_messages 固定插入 「请始终使用中文进行回答」。若用户用英文提问，模型虽然会努力回中文，但有时会产生语言混用（代码注释变成中文等）。应检测 prompt 主要语言（正则匹配中文字符占比 < 20% 则判断为英文），动态切换系统提示语言，或完全去掉这条让模型自适应。</p>
+      <div class="item-tags"><span class="tag t-qual">多语言体验</span></div>
+    </div>
+    <div class="item-meta">英文 QA +</div>
+  </div>
+</div>
+
+<div id="func" class="panel">
+  <div class="item">
+    <div class="item-num">F1</div>
+    <div class="item-body">
+      <p class="item-title">多查询并行搜索（Query Decomposition）</p>
+      <p class="item-desc">对于复杂 query（如「比较 A 和 B 的最新发展」），当前只发一次搜索请求。可让分析器在 search_query 字段返回数组，harness 对多个 sub-query 并行调用 perform_web_search（asyncio.gather），合并去重后的 sources 送入上下文。效果等价于手动多次搜索，但对用户透明。</p>
+      <div class="item-tags"><span class="tag t-func">功能</span><span class="tag t-qual">检索覆盖</span></div>
+    </div>
+    <div class="item-meta">覆盖率 +50%</div>
+  </div>
+  <div class="item">
+    <div class="item-num">F2</div>
+    <div class="item-body">
+      <p class="item-title">快速缓存 LRU 改为 Redis Sorted Set</p>
+      <p class="item-desc">_try_fast_cache_hit 每次扫描最多 400 条 LRU List，O(n) 复杂度。改用 Redis ZSET（score=timestamp），新增时 ZADD，扫描时 ZREVRANGE，淘汰时 ZREMRANGEBYRANK。比 LRANGE+逐条 JSON parse 快 3-5x。配合 embedding 相似度改造后，查找流程变为：先哈希精确命中 → 再 ZSET 近似扫描（向量距离）。</p>
+      <div class="item-tags"><span class="tag t-func">缓存</span><span class="tag t-perf">性能</span></div>
+    </div>
+    <div class="item-meta">查找 3-5x 快</div>
+  </div>
+  <div class="item">
+    <div class="item-num">F3</div>
+    <div class="item-body">
+      <p class="item-title">会话连续性：跨 turn 知识积累</p>
+      <p class="item-desc">目前每轮搜索结果相互独立，第 3 轮提问若与第 1 轮相关但措辞不同，仍会重新搜索。可在 Redis 会话 key 里维护一个 search_knowledge_base（按 query 归档摘要），新 turn 搜索前先检索会话级知识库，命中则直接复用或追加而非全量重搜。</p>
+      <div class="item-tags"><span class="tag t-func">功能</span></div>
+    </div>
+    <div class="item-meta">会话体验 +</div>
+  </div>
+  <div class="item">
+    <div class="item-num">F4</div>
+    <div class="item-body">
+      <p class="item-title">Refine 轨可选「仅 Layer2+3」（跳过 Draft）</p>
+      <p class="item-desc">refine_pipeline.py 已有 stream_refine_from_draft 支持从给定草稿直接进 Review，但正常 Refine 轨总是从 Layer1 Draft 开始。可以加一个 skip_draft=True 选项：当用户已有内容（如「帮我改进这段文字：...」）直接把用户输入作为 draft，跳过 Layer1，节省一次 LLM 调用且不损失质量（用户自己的内容就是最好的 draft）。</p>
+      <div class="item-tags"><span class="tag t-func">功能</span><span class="tag t-perf">延迟</span></div>
+    </div>
+    <div class="item-meta">省 1 次 LLM</div>
+  </div>
+  <div class="item">
+    <div class="item-num">F5</div>
+    <div class="item-body">
+      <p class="item-title">feedback.log 转为结构化 Redis Stream</p>
+      <p class="item-desc">当前反馈写入文本文件，无法做统计。改用 Redis XADD 写入 Stream，可以后续用 XREAD 做离线分析：哪类 query 被复制/重生成最多（说明质量不满意），哪类模型组合的 refine 被「再生成」率低（说明质量好），用于调参参考。</p>
+      <div class="item-tags"><span class="tag t-func">可观测性</span></div>
+    </div>
+    <div class="item-meta">可分析 +</div>
+  </div>
+  <div class="item">
+    <div class="item-num">F6</div>
+    <div class="item-body">
+      <p class="item-title">ollama 本地模型隐私路由恢复或清理</p>
+      <p class="item-desc">analyzer_prompt 里描述了 ollama-llama3 用于隐私场景，但代码被注释。分析器偶尔会正确判断出 privacy_local，但 route_fast_model 没有处理这个 type，会 fallback 到 gpt-5.5（正好是要避免的云端模型）。要么恢复 ollama 支持（5 行代码），要么从 analyzer_prompt 删掉相关段落，现在是两边都不完整的半成品。</p>
+      <div class="item-tags"><span class="tag t-func">隐私</span><span class="tag t-high">逻辑 bug</span></div>
+    </div>
+    <div class="item-meta">逻辑修复</div>
+  </div>
+  <div class="item">
+    <div class="item-num">F7</div>
+    <div class="item-body">
+      <p class="item-title">content_reset 事件完整性保障</p>
+      <p class="item-desc">_capture_stream_text 收到 content_reset 时把 final_answer 清空，但 Redis 历史仍会等流结束后存储（此时 final_answer="" ）。若 content_reset 在流中途触发（如模型重生成），会导致 Redis 存入空字符串替换掉本次回答。应在收到 content_reset 时设置 reset_flag，等到下一个 model_end 或 [DONE] 再判断是否该存储（以 reset 后积累的内容为准）。</p>
+      <div class="item-tags"><span class="tag t-func">正确性</span><span class="tag t-high">逻辑 bug</span></div>
+    </div>
+    <div class="item-meta">历史存储修复</div>
+  </div>
+</div>
+
+<div id="config" class="panel">
+  <div class="item">
+    <div class="item-num">C1</div>
+    <div class="item-body">
+      <p class="item-title">analyzer_total_timeout_s: 48 → 20</p>
+      <p class="item-desc">当前总超时 48 秒，意味着即使分析器卡住，用户要等最多 48 秒才能看到 fallback 处理开始。对个人使用场景，分析器模型（gpt-5.5）通常 3-8s 返回，analyzer_request_timeout_s=25 已经够用，total_timeout_s 建议改为 20s，减少极端情况下的等待。</p>
+      <div class="item-tags"><span class="tag t-perf">超时配置</span></div>
+    </div>
+    <div class="item-meta">最差等待 -28s</div>
+  </div>
+  <div class="item">
+    <div class="item-num">C2</div>
+    <div class="item-body">
+      <p class="item-title">Layer1 temperature: 0.4 → 0.2</p>
+      <p class="item-desc">Draft 层的目标是「广覆盖」，但 temperature=0.4 会引入较多随机性，导致 Draft 有时包含不相关发散内容让 Layer2 要纠正的点变多，增加审查层 token 消耗。降到 0.2 可在保持覆盖度的同时减少无关发散，Layer2 审查负担降低约 20%，最终 Layer3 polish 更流畅。</p>
+      <div class="item-tags"><span class="tag t-qual">输出质量</span></div>
+    </div>
+    <div class="item-meta">审查负担 -20%</div>
+  </div>
+  <div class="item">
+    <div class="item-num">C3</div>
+    <div class="item-body">
+      <p class="item-title">fast_answer_cache.similarity_threshold: 0.9 → 0.82（配合 embedding）</p>
+      <p class="item-desc">SequenceMatcher 下 0.9 意味着几乎完全一样才命中。改为 embedding 余弦相似度后，0.82 对应语义高度相同但措辞不同的句子，0.75 对应同主题不同角度。建议从 0.82 起用，观察一周误命中率，若无明显偏差可降到 0.78。</p>
+      <div class="item-tags"><span class="tag t-perf">缓存命中</span></div>
+    </div>
+    <div class="item-meta">命中率 +40%</div>
+  </div>
+  <div class="item">
+    <div class="item-num">C4</div>
+    <div class="item-body">
+      <p class="item-title">agent.max_iterations: 5 → 动态 3-8</p>
+      <p class="item-desc">对「今天天气」类简单 web_search 任务，5 轮上限是浪费（通常 2 轮就能结束）；对「帮我深度研究 X 并写报告」类任务，5 轮又可能不够（会被迫 fallback 到 compile_agent_fallback_draft 拼接草稿）。应按 complexity 动态分配：low=3，high=8，并在 config.yaml 里配置映射表。</p>
+      <div class="item-tags"><span class="tag t-qual">Agent 质量</span></div>
+    </div>
+    <div class="item-meta">适配性 +</div>
+  </div>
+  <div class="item">
+    <div class="item-num">C5</div>
+    <div class="item-body">
+      <p class="item-title">search.max_results: 8 → 按轨道动态调整</p>
+      <p class="item-desc">Fast 轨需要的是快速摘要，4-5 条足够；Refine 轨 Layer2 审查可能需要更多来源，10-12 条更合适；Agent 轨每轮搜索结果会注入 conv，过多会撑爆上下文，4-6 条为宜。按 chosen_track 分别传入 override_max_results 参数到 SearchService.search。</p>
+      <div class="item-tags"><span class="tag t-qual">检索效率</span></div>
+    </div>
+    <div class="item-meta">质量/成本均衡</div>
+  </div>
+  <div class="item">
+    <div class="item-num">C6</div>
+    <div class="item-body">
+      <p class="item-title">refine_chain.layer2.instruction 加「禁止输出问题清单格式」约束</p>
+      <p class="item-desc">Layer2 的 instruction 要求输出「1)初稿问题清单 2)修正版答案 3)仍不确定处」，导致 Layer3 收到的输入包含带编号的元信息。如果 Layer3 polish 不够强力，最终答案里会保留「以下是修正后的答案：」等痕迹。在 layer2 instruction 末尾加：「请将修正版答案作为独立段落输出，勿在正文中包含元批注或问题编号」。</p>
+      <div class="item-tags"><span class="tag t-qual">最终答案质量</span></div>
+    </div>
+    <div class="item-meta">输出更干净</div>
+  </div>
+  <div class="item">
+    <div class="item-num">C7</div>
+    <div class="item-body">
+      <p class="item-title">Tavily search_depth: basic → 按需 advanced</p>
+      <p class="item-desc">basic 模式检索速度快但内容浅，适合 Fast 轨；Refine 轨和 Agent 轨的搜索用 advanced 可以获得更深入的内容摘要，对需要事实核查的任务效果明显（Tavily advanced 会实际爬取页面而非只用摘要索引）。按 chosen_track 传入 override_search_depth。</p>
+      <div class="item-tags"><span class="tag t-qual">检索深度</span></div>
+    </div>
+    <div class="item-meta">Refine/Agent +</div>
+  </div>
+  <div class="item">
+    <div class="item-num">C8</div>
+    <div class="item-body">
+      <p class="item-title">doc_context_chars 从默认 24000 调高到 40000</p>
+      <p class="item-desc">_augment_prompt 的 doc_context_chars 默认 24000 字符，若文档较大（BM25 选出的 8 个 chunk 各 6000 字）只能用约 4 个 chunk。现代大模型（claude-sonnet-4-6、gpt-5.5）上下文窗口都在 100K token 以上，提高到 40000 字符（约 25K token）可以纳入更多文档内容，对文档 QA 的召回率有明显提升，同时还在模型上下文安全范围内。</p>
+      <div class="item-tags"><span class="tag t-qual">文档 QA</span></div>
+    </div>
+    <div class="item-meta">召回率 +</div>
+  </div>
+</div>
+
+<script>
+function show(id) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  event.target.classList.add('active');
+}
+</script>

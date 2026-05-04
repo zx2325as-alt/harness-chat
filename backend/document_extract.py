@@ -12,6 +12,87 @@ CHUNK_SIZE = 6_000
 MAX_PDF_PAGES = 80
 MAX_SHEET_ROWS = 2_000
 
+TEXT_DOCUMENT_EXTS = {
+    "txt",
+    "md",
+    "markdown",
+    "json",
+    "yaml",
+    "yml",
+    "toml",
+    "ini",
+    "cfg",
+    "conf",
+    "env",
+    "log",
+    "xml",
+    "html",
+    "htm",
+    "css",
+    "scss",
+    "less",
+    "js",
+    "mjs",
+    "cjs",
+    "jsx",
+    "ts",
+    "tsx",
+    "py",
+    "java",
+    "kt",
+    "kts",
+    "scala",
+    "go",
+    "rs",
+    "c",
+    "cc",
+    "cpp",
+    "cxx",
+    "h",
+    "hh",
+    "hpp",
+    "cs",
+    "php",
+    "rb",
+    "swift",
+    "sh",
+    "bash",
+    "zsh",
+    "ps1",
+    "sql",
+    "r",
+    "lua",
+    "pl",
+    "pm",
+    "proto",
+    "properties",
+    "gradle",
+    "vue",
+    "svelte",
+    "dart",
+}
+SPECIAL_TEXT_FILENAMES = {
+    "dockerfile",
+    "makefile",
+    "jenkinsfile",
+    ".env",
+    ".gitignore",
+    ".npmrc",
+    ".yarnrc",
+    ".editorconfig",
+    ".prettierrc",
+    ".eslintrc",
+    "cmakelists.txt",
+}
+SUPPORTED_DOCUMENT_EXTS = TEXT_DOCUMENT_EXTS | {
+    "csv",
+    "pdf",
+    "doc",
+    "docx",
+    "xls",
+    "xlsx",
+} | SPECIAL_TEXT_FILENAMES
+
 
 @dataclass
 class ExtractedDocument:
@@ -47,6 +128,14 @@ def _decode_text(data: bytes) -> str:
         except UnicodeDecodeError:
             continue
     return data.decode("utf-8", errors="ignore")
+
+
+def detect_document_ext(filename: str) -> str:
+    name = os.path.basename(filename or "").strip()
+    lower_name = name.lower()
+    if lower_name in SPECIAL_TEXT_FILENAMES:
+        return lower_name
+    return os.path.splitext(lower_name)[1].lower().lstrip(".")
 
 
 def _extract_pdf(data: bytes) -> str:
@@ -134,9 +223,9 @@ def _extract_csv(data: bytes) -> str:
 
 def extract_document(filename: str, data: bytes) -> ExtractedDocument:
     name = filename or "未命名文件"
-    ext = os.path.splitext(name)[1].lower().lstrip(".")
+    ext = detect_document_ext(name)
     try:
-        if ext in {"txt", "md", "markdown", "json", "csv"}:
+        if ext in TEXT_DOCUMENT_EXTS or ext in SPECIAL_TEXT_FILENAMES or ext == "csv":
             content = _extract_csv(data) if ext == "csv" else _decode_text(data)
         elif ext == "pdf":
             content = _extract_pdf(data)

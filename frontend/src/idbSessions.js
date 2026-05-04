@@ -6,6 +6,7 @@ const DB_NAME = "harness_chat_sessions_v1";
 const DB_VER = 1;
 const STORE = "kv";
 const KEY_SESSIONS = "sessions_json";
+let supportPromise = null;
 
 function openDb() {
   return new Promise((resolve, reject) => {
@@ -26,12 +27,12 @@ function openDb() {
 }
 
 export async function idbSessionsSupported() {
-  try {
-    await openDb();
-    return true;
-  } catch {
-    return false;
+  if (!supportPromise) {
+    supportPromise = openDb()
+      .then(() => true)
+      .catch(() => false);
   }
+  return supportPromise;
 }
 
 /** @returns {Promise<string|null>} JSON 字符串或 null */

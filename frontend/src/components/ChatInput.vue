@@ -2,9 +2,10 @@
   <div class="wrap">
     <div class="composer">
       <div v-if="attachments.length > 0" class="att-row">
-        <div class="att-item" v-for="(att, idx) in attachments" :key="idx">
+        <div class="att-item" v-for="(att, idx) in attachments" :key="att.id || idx" :title="attachmentTitle(att)">
           <span class="att-name">{{ att.name }}</span>
           <span class="att-status" :class="att.status">{{ statusLabel(att.status) }}</span>
+          <span v-if="att.error" class="att-error">{{ att.error }}</span>
           <button
             v-if="att.status === 'error' && att.kind === 'document' && att.file"
             type="button"
@@ -19,7 +20,7 @@
 
       <textarea
         class="textarea"
-        :disabled="busy"
+        :disabled="uiBusy"
         v-model="draft"
         placeholder="输入问题…（Enter 发送，Shift+Enter 换行）"
         rows="2"
@@ -32,7 +33,7 @@
             <button
               type="button"
               class="dd-trigger"
-              :disabled="busy"
+              :disabled="uiBusy"
               aria-haspopup="listbox"
               :aria-expanded="openMenu === 'mode'"
               @click.stop="toggleMenu('mode')"
@@ -63,7 +64,7 @@
             <button
               type="button"
               class="dd-trigger"
-              :disabled="busy"
+              :disabled="uiBusy"
               :title="searchModeHint"
               aria-haspopup="listbox"
               :aria-expanded="openMenu === 'search'"
@@ -93,12 +94,25 @@
         </div>
         <div class="bar-fill" aria-hidden="true" />
         <div class="bar-right">
-          <input ref="fileInput" type="file" multiple class="hidden-file" @change="onFileChange" />
-          <button type="button" class="ico" :disabled="busy" title="附件" @click="$refs.fileInput.click()">
+          <input
+            ref="fileInput"
+            type="file"
+            multiple
+            class="hidden-file"
+            :accept="fileAccept"
+            @change="onFileChange"
+          />
+          <button type="button" class="ico" :disabled="uiBusy" title="上传文件" @click="$refs.fileInput.click()">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
               <path
                 d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"
               />
+            </svg>
+          </button>
+          <button type="button" class="ico folder-btn" :disabled="uiBusy" title="读本地文件夹" @click="readLocalFolder">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+              <path d="M8 13h8" />
             </svg>
           </button>
           <button v-if="busy" type="button" class="ico danger" title="停止" @click="$emit('stop')">
@@ -121,9 +135,10 @@
       </div>
       <div class="foot-hint">
         <span v-if="busy">处理中…</span>
+        <span v-else-if="folderLoading">正在读取本地文件夹…</span>
         <span v-else-if="hasParsingAttachment">文档仍在解析中，完成后才能发送</span>
         <span v-else-if="hasImageAttachment">图片目前不会进入模型，请先移除图片或改传文档/文本</span>
-        <span v-else>文档将上传解析后加入本轮上下文</span>
+        <span v-else>支持上传文件，也支持直接读取服务端本地文件夹中的文档与代码文件</span>
       </div>
     </div>
   </div>
@@ -131,6 +146,7 @@
 
 <script>
 import { API_BASE } from "../apiBase.js";
+import { isSendableComposerState } from "../chatShared.js";
 
 const MODE_OPTIONS = [
   { value: "auto", label: "自动" },
@@ -144,6 +160,89 @@ const SEARCH_OPTIONS = [
   { value: "on", label: "开启（快轨）" },
   { value: "off", label: "关闭（快轨）" },
 ];
+const MAX_ATTACHMENT_FILES = 6;
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const UPLOAD_CONCURRENCY = 3;
+const SUPPORTED_DOCUMENT_EXTS = [
+  "txt",
+  "md",
+  "markdown",
+  "json",
+  "csv",
+  "pdf",
+  "doc",
+  "docx",
+  "xls",
+  "xlsx",
+  "yaml",
+  "yml",
+  "toml",
+  "ini",
+  "cfg",
+  "conf",
+  "env",
+  "log",
+  "xml",
+  "html",
+  "htm",
+  "css",
+  "scss",
+  "less",
+  "js",
+  "mjs",
+  "cjs",
+  "jsx",
+  "ts",
+  "tsx",
+  "py",
+  "java",
+  "kt",
+  "kts",
+  "scala",
+  "go",
+  "rs",
+  "c",
+  "cc",
+  "cpp",
+  "cxx",
+  "h",
+  "hh",
+  "hpp",
+  "cs",
+  "php",
+  "rb",
+  "swift",
+  "sh",
+  "bash",
+  "zsh",
+  "ps1",
+  "sql",
+  "r",
+  "lua",
+  "pl",
+  "pm",
+  "proto",
+  "properties",
+  "gradle",
+  "vue",
+  "svelte",
+  "dart",
+];
+const SPECIAL_DOCUMENT_NAMES = [
+  "dockerfile",
+  "makefile",
+  "jenkinsfile",
+  ".env",
+  ".gitignore",
+  ".npmrc",
+  ".yarnrc",
+  ".editorconfig",
+  ".prettierrc",
+  ".eslintrc",
+  "cmakelists.txt",
+];
+const SUPPORTED_DOCUMENT_EXT_SET = new Set([...SUPPORTED_DOCUMENT_EXTS, ...SPECIAL_DOCUMENT_NAMES]);
+const FILE_ACCEPT = SUPPORTED_DOCUMENT_EXTS.map((ext) => `.${ext}`).join(",");
 
 export default {
   name: "ChatInput",
@@ -156,26 +255,41 @@ export default {
     return {
       draft: "",
       attachments: [],
+      folderLoading: false,
       searchMode: "auto",
       openMenu: null,
       modeOptions: MODE_OPTIONS,
       searchOptions: SEARCH_OPTIONS,
+      _parseControllers: new Set(),
+      _parseControllerByAttachmentId: new Map(),
     };
   },
   computed: {
     hasParsingAttachment() {
-      return this.attachments.some((a) => a.status === "parsing");
+      return this.folderLoading || this.attachments.some((a) => a.status === "parsing");
     },
     hasImageAttachment() {
       return this.attachments.some((a) => a.kind === "image");
     },
     canSend() {
-      if (this.busy || this.hasParsingAttachment || this.hasImageAttachment) return false;
-      return !!this.draft.trim() || this.attachments.length > 0;
+      return isSendableComposerState({
+        draft: this.draft,
+        attachments: this.attachments,
+        busy: this.uiBusy,
+        hasParsingAttachment: this.hasParsingAttachment,
+        hasImageAttachment: this.hasImageAttachment,
+      });
+    },
+    uiBusy() {
+      return this.busy || this.folderLoading;
     },
     sendTitle() {
+      if (this.folderLoading) return "正在读取本地文件夹";
       if (this.hasParsingAttachment) return "文档仍在解析中";
       if (this.hasImageAttachment) return "图片暂未接入模型，请移除后发送";
+      if (!this.draft.trim() && !this.attachments.some((a) => a.kind === "document" && a.status === "ok" && a.doc)) {
+        return "无可发送内容";
+      }
       return "发送";
     },
     modeLabel() {
@@ -186,6 +300,9 @@ export default {
     },
     searchModeHint() {
       return "仅影响「快速轨」入口是否做前置联网检索；精化轨 / Agent 仍按内部逻辑按需搜索。";
+    },
+    fileAccept() {
+      return FILE_ACCEPT;
     },
   },
   watch: {
@@ -203,10 +320,16 @@ export default {
   },
   beforeUnmount() {
     document.removeEventListener("pointerdown", this._onDocDown, true);
+    this._parseControllers.forEach((controller) => controller.abort());
+    this._parseControllers.clear();
+    this._parseControllerByAttachmentId.clear();
   },
   methods: {
+    newAttachmentId() {
+      return `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    },
     toggleMenu(which) {
-      if (this.busy) return;
+      if (this.uiBusy) return;
       this.openMenu = this.openMenu === which ? null : which;
     },
     pickMode(value) {
@@ -223,34 +346,194 @@ export default {
       if (s === "parsing") return "解析中…";
       return "";
     },
-    removeAttachment(idx) {
-      this.attachments.splice(idx, 1);
+    attachmentTitle(att) {
+      if (!att) return "";
+      return att.error ? `${att.name}\n${att.error}` : att.name;
     },
-    async retryParse(idx) {
-      const att = this.attachments[idx];
-      if (!att || att.kind !== "document" || !att.file || this.busy) return;
-      att.status = "parsing";
-      att.error = "";
+    detectDocumentExt(name) {
+      const lower = String(name || "").trim().toLowerCase();
+      if (!lower) return "";
+      if (SPECIAL_DOCUMENT_NAMES.includes(lower)) return lower;
+      const idx = lower.lastIndexOf(".");
+      return idx >= 0 ? lower.slice(idx + 1) : "";
+    },
+    isImageFile(file) {
+      const name = String(file?.name || "").toLowerCase();
+      return Boolean(file?.type?.startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(name));
+    },
+    isSupportedDocumentFile(file) {
+      return SUPPORTED_DOCUMENT_EXT_SET.has(this.detectDocumentExt(file?.name));
+    },
+    formatFileSize(size) {
+      if (!Number.isFinite(size) || size <= 0) return "0 B";
+      const units = ["B", "KB", "MB", "GB"];
+      let value = size;
+      let unitIdx = 0;
+      while (value >= 1024 && unitIdx < units.length - 1) {
+        value /= 1024;
+        unitIdx += 1;
+      }
+      return `${value >= 10 || unitIdx === 0 ? Math.round(value) : value.toFixed(1)} ${units[unitIdx]}`;
+    },
+    createLocalErrorAttachment(file, error, kind = "document") {
+      this.attachments.push({
+        id: this.newAttachmentId(),
+        name: file?.name || "未命名文件",
+        kind,
+        type: file?.type || "",
+        status: "error",
+        error,
+        file: kind === "document" ? file : null,
+      });
+    },
+    currentDocumentCount() {
+      return this.attachments.filter((att) => att.kind === "document").length;
+    },
+    attachmentSignature(file) {
+      return [file?.name || "", file?.size || 0, file?.lastModified || 0].join("|");
+    },
+    existingAttachmentSignatures() {
+      return new Set(
+        this.attachments
+          .filter((att) => att?.file)
+          .map((att) => this.attachmentSignature(att.file))
+      );
+    },
+    async extractApiError(res) {
+      try {
+        const data = await res.json();
+        return data?.detail || data?.error || `HTTP ${res.status}`;
+      } catch (_) {
+        const text = await res.text().catch(() => "");
+        return text || `HTTP ${res.status}`;
+      }
+    },
+    applyParsedDocumentResult(att, doc) {
+      if (!att) return;
+      if (doc) {
+        att.doc = doc;
+        att.status = doc.status === "ok" ? "ok" : "error";
+        att.error = doc.status === "ok" ? "" : doc.error || "解析失败";
+      } else {
+        att.status = "error";
+        att.error = "解析结果为空";
+      }
+    },
+    async uploadDocumentAttachment(att, file) {
       const form = new FormData();
-      form.append("files", att.file);
+      form.append("files", file);
+      form.append("client_file_ids", att.id);
+      const controller = new AbortController();
+      this._parseControllers.add(controller);
+      this._parseControllerByAttachmentId.set(att.id, controller);
       try {
         const res = await fetch(`${API_BASE}/api/documents/parse`, {
           method: "POST",
           body: form,
+          signal: controller.signal,
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) throw new Error(await this.extractApiError(res));
         const data = await res.json();
-        const doc = (data.documents || [])[0];
-        if (doc) {
-          att.doc = doc;
-          att.status = doc.status === "ok" ? "ok" : "error";
-        } else {
-          att.status = "error";
-        }
+        const docs = data.documents || [];
+        const doc = docs.find((item) => item && item.client_file_id === att.id) || docs[0];
+        const current = this.attachments.find((item) => item.id === att.id);
+        this.applyParsedDocumentResult(current, doc);
       } catch (err) {
-        att.status = "error";
-        att.error = String(err?.message || err);
+        if (err?.name === "AbortError") return;
+        const current = this.attachments.find((item) => item.id === att.id);
+        if (current) {
+          current.status = "error";
+          current.error = String(err?.message || err);
+        }
+      } finally {
+        this._parseControllers.delete(controller);
+        this._parseControllerByAttachmentId.delete(att.id);
       }
+    },
+    async runUploadQueue(items) {
+      const queue = items.slice();
+      const workers = Array.from({ length: Math.min(UPLOAD_CONCURRENCY, queue.length) }, async () => {
+        while (queue.length > 0) {
+          const item = queue.shift();
+          if (!item) break;
+          await this.uploadDocumentAttachment(item.att, item.file);
+        }
+      });
+      await Promise.all(workers);
+    },
+    appendFolderDocuments(documents) {
+      (documents || []).forEach((doc) => {
+        if (!doc || !doc.name) return;
+        this.attachments.push({
+          id: this.newAttachmentId(),
+          name: doc.name,
+          kind: "document",
+          status: doc.status === "ok" ? "ok" : "error",
+          doc: doc.status === "ok" ? doc : null,
+          error: doc.status === "ok" ? "" : doc.error || "解析失败",
+          file: null,
+          source: "local_folder",
+        });
+      });
+    },
+    async readLocalFolder() {
+      if (this.uiBusy) return;
+      const folderPath = window.prompt("请输入服务端本地文件夹路径", "");
+      if (folderPath == null) return;
+      const normalizedPath = String(folderPath).trim();
+      if (!normalizedPath) return;
+      const recursive = window.confirm("是否递归读取子目录？\n确定：递归\n取消：仅当前目录");
+      this.folderLoading = true;
+      try {
+        const res = await fetch(`${API_BASE}/api/documents/parse_folder`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            folder_path: normalizedPath,
+            recursive,
+            max_files: 50,
+          }),
+        });
+        if (!res.ok) {
+          throw new Error(await this.extractApiError(res));
+        }
+        const data = await res.json();
+        const docs = data.documents || [];
+        if (!docs.length) {
+          this.createLocalErrorAttachment(
+            { name: normalizedPath, type: "" },
+            "该文件夹下没有读取到支持的文档文件。"
+          );
+          return;
+        }
+        this.appendFolderDocuments(docs);
+      } catch (err) {
+        this.createLocalErrorAttachment(
+          { name: normalizedPath, type: "" },
+          String(err?.message || err)
+        );
+      } finally {
+        this.folderLoading = false;
+      }
+    },
+    removeAttachment(idx) {
+      const att = this.attachments[idx];
+      if (att?.id) {
+        const controller = this._parseControllerByAttachmentId.get(att.id);
+        if (controller) {
+          controller.abort();
+          this._parseControllerByAttachmentId.delete(att.id);
+          this._parseControllers.delete(controller);
+        }
+      }
+      this.attachments.splice(idx, 1);
+    },
+    async retryParse(idx) {
+      const att = this.attachments[idx];
+      if (!att || att.kind !== "document" || !att.file || this.uiBusy) return;
+      att.status = "parsing";
+      att.error = "";
+      await this.uploadDocumentAttachment(att, att.file);
     },
     /** 从用户消息恢复输入区（编辑 / 多模态） */
     prefillFromUserEdit({ text = "", images = [], documents = [] }) {
@@ -259,6 +542,7 @@ export default {
       (images || []).forEach((im) => {
         if (im && im.url) {
           this.attachments.push({
+            id: this.newAttachmentId(),
             name: im.name || "图片",
             kind: "image",
             type: im.type || "image/png",
@@ -270,6 +554,7 @@ export default {
       (documents || []).forEach((d) => {
         if (d && d.name) {
           this.attachments.push({
+            id: this.newAttachmentId(),
             name: d.name,
             kind: "document",
             status: d.status === "ok" ? "ok" : "error",
@@ -284,76 +569,72 @@ export default {
       if (!files || !files.length) return;
       const list = Array.from(files);
       this.$refs.fileInput.value = "";
+      const existingSigs = this.existingAttachmentSignatures();
+      const selectedSigs = new Set();
+      const readyFiles = [];
+      let remainingSlots = Math.max(0, MAX_ATTACHMENT_FILES - this.currentDocumentCount());
 
-      const docFiles = list.filter((f) => !f.type.startsWith("image/"));
-      const imageFiles = list.filter((f) => f.type.startsWith("image/"));
-
-      for (const file of imageFiles) {
-        this.attachments.push({
-          name: file.name,
-          kind: "image",
-          type: file.type,
-          data: "",
-          status: "error",
-          error: "图片暂未接入后端模型输入，请改传文档或文本。",
-        });
-      }
-
-      if (docFiles.length === 0) return;
-
-      const form = new FormData();
-      docFiles.forEach((f) => form.append("files", f));
-      docFiles.forEach((f) =>
-        this.attachments.push({ name: f.name, kind: "document", status: "parsing", doc: null, file: f })
-      );
-      const parseSlotsStart = this.attachments.length - docFiles.length;
-
-      try {
-        const controller = new AbortController();
-        const res = await fetch(`${API_BASE}/api/documents/parse`, {
-          method: "POST",
-          body: form,
-          signal: controller.signal,
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        const docs = data.documents || [];
-        docs.forEach((doc, i) => {
-          const slot = parseSlotsStart + i;
-          if (this.attachments[slot]) {
-            this.attachments[slot].doc = doc;
-            this.attachments[slot].status = doc.status === "ok" ? "ok" : "error";
-          }
-        });
-      } catch (err) {
-        for (let i = 0; i < docFiles.length; i++) {
-          const slot = parseSlotsStart + i;
-          if (this.attachments[slot]) {
-            this.attachments[slot].status = "error";
-            this.attachments[slot].error = String(err?.message || err);
-          }
+      for (const file of list) {
+        const signature = this.attachmentSignature(file);
+        if (existingSigs.has(signature) || selectedSigs.has(signature)) {
+          this.createLocalErrorAttachment(file, "该文件已在附件列表中，无需重复上传。");
+          continue;
         }
+        selectedSigs.add(signature);
+
+        if (this.isImageFile(file)) {
+          this.createLocalErrorAttachment(file, "图片暂未接入后端模型输入，请改传文档或文本。", "image");
+          continue;
+        }
+        if (!this.isSupportedDocumentFile(file)) {
+          this.createLocalErrorAttachment(
+            file,
+            "暂不支持该格式。当前支持常见文档、配置和代码文件，如 py、java、js、ts、go、rs、c/c++、sql、yaml、vue 等。"
+          );
+          continue;
+        }
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          this.createLocalErrorAttachment(
+            file,
+            `文件过大：${this.formatFileSize(file.size)}，当前单文件上限为 ${this.formatFileSize(MAX_ATTACHMENT_BYTES)}。`
+          );
+          continue;
+        }
+        if (remainingSlots <= 0) {
+          this.createLocalErrorAttachment(file, `上传文件数量超过限制，当前最多支持 ${MAX_ATTACHMENT_FILES} 个文档。`);
+          continue;
+        }
+        remainingSlots -= 1;
+        readyFiles.push(file);
       }
+
+      if (readyFiles.length === 0) return;
+
+      const items = readyFiles.map((f) => {
+        const att = {
+          id: this.newAttachmentId(),
+          name: f.name,
+          kind: "document",
+          status: "parsing",
+          doc: null,
+          error: "",
+          file: f,
+        };
+        this.attachments.push(att);
+        return { file: f, att };
+      });
+      await this.runUploadQueue(items);
     },
     send() {
       const t = this.draft.trim();
-      if (!t && this.attachments.length === 0) return;
-      if (!this.canSend) return;
-
       const documents = this.attachments
         .filter((a) => a.kind === "document" && a.status === "ok" && a.doc)
         .map((a) => a.doc);
-
-      let content = t;
-      const imgs = this.attachments.filter((a) => a.kind === "image" && a.status === "ok");
-      if (imgs.length > 0 || documents.length > 0) {
-        content = [];
-        if (t) content.push({ type: "text", text: t });
-        imgs.forEach((a) => content.push({ type: "image_url", image_url: { url: a.data } }));
-      }
+      if (!t && documents.length === 0) return;
+      if (!this.canSend) return;
 
       this.$emit("send", {
-        content,
+        content: t,
         documents,
         searchMode: this.searchMode,
       });
@@ -393,6 +674,7 @@ export default {
 .att-item {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   background: #1e2433;
   border: 1px solid #3d4d64;
@@ -416,6 +698,14 @@ export default {
 }
 .att-status.error {
   color: #fca5a5;
+}
+.att-error {
+  max-width: 240px;
+  color: #fca5a5;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .att-retry {
   font-size: 11px;

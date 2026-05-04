@@ -12,12 +12,12 @@ import re
 import asyncio
 import time
 import hashlib
-import difflib
 from datetime import datetime, timedelta
 
 from search_service import SearchService
 from routing_signals import derive_user_signals, merge_signals_into_analysis, reasoning_keyword_boost
 from search_query_util import soft_degrade_note, validate_search_query
+from semantic_utils import is_probably_english, ngram_overlap_ratio, normalize_text, semantic_similarity
 
 from tools.layer import HarnessTools
 from tools.parsing import RE_AGENT_REFINE, RE_AGENT_WS, parse_agent_action
@@ -36,12 +36,19 @@ def _msg_content_to_text(content: Any) -> str:
     return str(content or "")
 
 
-def _format_messages_snippet(messages: Optional[List[Dict[str, Any]]], n: int = 4) -> str:
+def _format_messages_snippet(messages: Optional[List[Dict[str, Any]]], n: int = 4, max_chars: int = 4000) -> str:
     if not messages:
         return ""
-    return "\n".join(
-        f"{m.get('role')}: {_msg_content_to_text(m.get('content'))}" for m in messages[-n:]
-    )
+    rows = messages[-n:]
+    picked = []
+    used = 0
+    for msg in reversed(rows):
+        line = f"{msg.get('role')}: {_msg_content_to_text(msg.get('content'))}"
+        if picked and used + len(line) > max_chars:
+            break
+        picked.append(line)
+        used += len(line)
+    return "\n".join(reversed(picked))
 
 
 def _pg(meta: Optional[Dict[str, Any]], phase_group: str, event_summary: str) -> Dict[str, Any]:
@@ -68,6 +75,85 @@ def _track_select_summary(chosen: str, intended: str, analysis: Dict[str, Any]) 
     if intended and str(intended) != str(chosen):
         return f"原计划「{names.get(intended, intended)}」，实际执行「{base}」。{extra}".strip()
     return f"执行路径：「{base}」。{extra}".strip()
+
+
+def _int_budget(options: Optional[Dict[str, Any]], key: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int((options or {}).get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _build_layer1_prompt(
+    prompt: str,
+    instruction: str,
+    entry_block: str,
+    messages: Optional[List[Dict[str, Any]]],
+    *,
+    max_history_chars: int,
+) -> str:
+    l1_prompt = f"{instruction.strip()}\n{entry_block}\n\n【原始问题】\n{prompt.strip()}\n"
+    if entry_block.strip():
+        l1_prompt = (
+            "以下搜索摘要为本次信息来源，请优先使用其内容，引用时尽量标注来源序号；"
+            "不要超出摘要内容臆测。\n\n" + l1_prompt
+        )
+    ht = _format_messages_snippet(messages, 4, max_chars=max_history_chars)
+    if ht:
+        l1_prompt = f"【近期对话上下文参考】\n{ht}\n\n" + l1_prompt
+    return l1_prompt
+
+
+def _build_layer2_prompt(
+    prompt: str,
+    instruction: str,
+    draft_answer: str,
+    messages: Optional[List[Dict[str, Any]]],
+    *,
+    max_history_chars: int,
+) -> str:
+    l2_prompt = (
+        f"{instruction.strip()}\n\n"
+        f"【原始问题】\n{prompt.strip()}\n\n"
+        f"【初稿答案】\n{draft_answer.strip()}\n"
+        "请先识别你自己对初稿仍不确定、需要补证据的地方，再输出修正版答案；"
+        "修正版正文中不要保留“问题清单/修正后答案/仍不确定处”等元语言标题。\n"
+        "\n如需核实实时数据，可在审查结论中单行输出：<<ACTION: web_search(\"查询词\")>>\n"
+    )
+    ht = _format_messages_snippet(messages, 4, max_chars=max_history_chars)
+    if ht:
+        l2_prompt = f"【近期对话上下文参考】\n{ht}\n\n" + l2_prompt
+    return l2_prompt
+
+
+def _clean_review_body(review_body: str) -> str:
+    text = str(review_body or "").strip()
+    if not text:
+        return ""
+    patterns = [
+        r"(?is)^\s*1[\)\.、:].*?(?=(?:\n\s*2[\)\.、:])|\Z)",
+        r"(?is)^\s*初稿问题清单.*?(?=(?:\n\s*(?:2[\)\.、:]|修正版答案|最终答案))|\Z)",
+        r"(?is)\n\s*(?:仍不确定处|不确定点|问题清单|初稿问题)\s*[:：].*$",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, "", text).strip()
+    match = re.search(
+        r"(?is)(?:修正版答案|最终答案|答案正文|修正后答案)\s*[:：]\s*(.+?)(?:\n\s*(?:仍不确定处|不确定点)\s*[:：].*)?$",
+        text,
+    )
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def _build_layer3_prompt(prompt: str, instruction: str, review_body: str) -> str:
+    review_clean = _clean_review_body(review_body)
+    return (
+        f"{instruction.strip()}\n\n"
+        f"【原始问题】\n{prompt.strip()}\n\n"
+        f"【审查层答案】\n{review_clean}\n"
+    )
 
 
 @dataclass
@@ -138,14 +224,156 @@ class DualTrackHarness:
         self.search = SearchService(cfg)
         self.tools = HarnessTools(self)
         self._redis = redis_client
-        self._pipeline_seq = 0
+        self._search_request_cache_prefix = "harness:reqsearch:"
+        self._analysis_cache_prefix = "harness:analysis:v1:"
 
-    def _tag(self, phase: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        self._pipeline_seq += 1
-        d: Dict[str, Any] = {"pipeline_phase": phase, "pipeline_sequence": self._pipeline_seq}
-        if extra:
-            d.update(extra)
-        return d
+    def _make_tagger(self):
+        """每次请求创建独立序号闭包，消除并发竞态。"""
+        seq = [0]
+        def _tag(phase: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            seq[0] += 1
+            d: Dict[str, Any] = {"pipeline_phase": phase, "pipeline_sequence": seq[0]}
+            if extra:
+                d.update(extra)
+            return d
+        return _tag
+
+    def _track_search_overrides(self, track: str) -> Dict[str, Any]:
+        search_cfg = (self.cfg.get("harness") or {}).get("search") or {}
+        by_track = search_cfg.get("by_track") or {}
+        base = by_track.get(track) or {}
+        return {
+            "override_max_results": base.get("max_results"),
+            "override_search_depth": base.get("search_depth"),
+        }
+
+    def _normalized_search_key(self, query: str) -> str:
+        return normalize_text(query).lower()
+
+    def _session_search_cache_key(self, session_id: str, query: str) -> str:
+        digest = hashlib.sha256(self._normalized_search_key(query).encode("utf-8")).hexdigest()
+        return f"harness:searchkb:{session_id}:{digest}"
+
+    def _select_agent_history_messages(self, messages: Optional[List[Dict[str, Any]]], max_chars: int) -> List[Dict[str, Any]]:
+        if not messages:
+            return []
+        picked: List[Dict[str, Any]] = []
+        used = 0
+        budget = max(1200, max_chars)
+        for msg in reversed(messages):
+            role = msg.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            text = _msg_content_to_text(msg.get("content"))
+            estimate = max(1, len(text))
+            if picked and used + estimate > budget:
+                break
+            picked.append({"role": role, "content": text})
+            used += estimate
+        return list(reversed(picked))
+
+    def _build_search_queries(self, prompt: str, analysis: Dict[str, Any], options: Optional[Dict[str, Any]] = None) -> List[str]:
+        raw_items = analysis.get("search_queries")
+        queries: List[str] = []
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                q = str(item or "").strip()
+                if q:
+                    queries.append(q)
+        single = self.build_search_query(prompt, analysis, options)
+        if single:
+            queries.insert(0, single)
+        out: List[str] = []
+        seen = set()
+        for query in queries:
+            key = self._normalized_search_key(query)
+            if key and key not in seen:
+                seen.add(key)
+                out.append(query)
+        return out[:4]
+
+    async def _resolve_runtime_context(self, prompt: str, mode: str, options: Dict[str, Any]) -> Dict[str, Any]:
+        hcfg = self.cfg.get("harness") or {}
+        default_mode = hcfg.get("default_mode", "auto")
+        mode = (mode or default_mode).lower()
+        if mode not in ("auto", "fast", "refine", "agent"):
+            mode = "auto"
+
+        cx_cfg = hcfg.get("complexity") or {}
+        analyzer_deadline = float(cx_cfg.get("analyzer_total_timeout_s", 45))
+        sig_base = str(options.get("search_prompt_base") or prompt or "").strip()
+        search_markers = ("联网", "搜索", "查证", "最新", "今天", "实时", "weather", "news", "stock")
+        speculative_search_task = None
+        if any(mark in sig_base.lower() for mark in [m.lower() for m in search_markers]):
+            guessed_query = normalize_text(sig_base)
+            if guessed_query:
+                sub_opts = {**options, **{k: v for k, v in self._track_search_overrides("fast").items() if v is not None}}
+                speculative_search_task = asyncio.create_task(self.perform_web_search(guessed_query, sub_opts))
+        try:
+            analysis = await asyncio.wait_for(
+                self.analyze_complexity(prompt, options),
+                timeout=analyzer_deadline,
+            )
+        except asyncio.TimeoutError:
+            analysis = self._analyzer_fallback_timeout(prompt)
+
+        analysis = self._postprocess_analysis(sig_base, analysis)
+        signals = derive_user_signals(sig_base, options)
+        analysis = merge_signals_into_analysis(analysis, signals, sig_base)
+
+        intended_track = self._resolve_track(mode, analysis, options)
+        chosen_track = self.apply_confidence_track_guard(mode, analysis, sig_base, intended_track)
+        if options.get("upgrade_track"):
+            bump = {"fast": "refine", "refine": "agent"}
+            nt = bump.get(chosen_track)
+            if nt:
+                ag_en = bool((hcfg.get("agent") or {}).get("enabled", True))
+                if nt == "agent" and not ag_en:
+                    nt = "refine"
+                    analysis["fallback_reason"] = analysis.get("fallback_reason") or "upgrade_target_agent_disabled"
+                analysis["client_track_upgrade"] = f"{chosen_track}->{nt}"
+                chosen_track = nt
+
+        should_search, search_reason = self.should_search(prompt, analysis, options)
+        search_mandatory = self._search_mandatory(analysis, options)
+        if speculative_search_task:
+            if should_search:
+                try:
+                    prefetched = await speculative_search_task
+                    key = self._normalized_search_key(sig_base)
+                    options.setdefault("_request_search_cache", {})[key] = prefetched
+                except Exception:
+                    pass
+            else:
+                speculative_search_task.cancel()
+        return {
+            "hcfg": hcfg,
+            "mode": mode,
+            "analysis": analysis,
+            "sig_base": sig_base,
+            "intended_track": intended_track,
+            "chosen_track": chosen_track,
+            "should_search": should_search,
+            "search_reason": search_reason,
+            "search_mandatory": search_mandatory,
+        }
+
+    def _resolve_refine_context(self, analysis: Dict[str, Any], hcfg: Dict[str, Any]) -> Dict[str, Any]:
+        chain = hcfg.get("refine_chain") or {}
+        l1 = chain.get("layer1") or {}
+        l2 = chain.get("layer2") or {}
+        l3 = chain.get("layer3") or {}
+        routing = hcfg.get("routing") or {}
+        default_model = routing.get("default_model", "gpt-5.5")
+        refine_models = analysis.get("refine_models") or {}
+        return {
+            "chain": chain,
+            "l1": l1,
+            "l2": l2,
+            "l3": l3,
+            "default_model": default_model,
+            "refine_models": refine_models,
+        }
 
     def _keyword_hit(self, text: str, keywords: List[str]) -> List[str]:
         t = (text or "").lower()
@@ -158,6 +386,8 @@ class DualTrackHarness:
     async def analyze_complexity(self, prompt: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         hcfg = (self.cfg.get("harness") or {}).get("complexity") or {}
         manual = hcfg.get("manual_triggers") or []
+        opts = dict(options or {})
+        norm_prompt = self._norm_cache_prompt(prompt)
 
         manual_hits = self._keyword_hit(prompt, manual)
         if manual_hits:
@@ -188,11 +418,21 @@ class DualTrackHarness:
 
         analyzer_model = hcfg.get("analyzer_model", "gpt-5.5")
         base_prompt = hcfg.get("analyzer_prompt", "")
-        
         full_prompt = f"{base_prompt}\n\n{prompt}"
-        
-        # force JSON output where possible (some models support response_format)
-        llm_opts = dict(options or {})
+
+        cache_ttl = int(hcfg.get("analysis_cache_ttl_s", 300))
+        cache_key = self._analysis_cache_prefix + hashlib.sha256(norm_prompt.encode("utf-8")).hexdigest()
+        if self._redis:
+            try:
+                cached = await asyncio.to_thread(self._redis.get, cache_key)
+                if cached:
+                    data = json.loads(cached)
+                    data["analysis_cache_hit"] = True
+                    return data
+            except Exception:
+                pass
+
+        llm_opts = dict(opts)
         llm_opts["temperature"] = 0.0
         llm_opts["max_retries"] = int(hcfg.get("analyzer_max_retries", 1))
         llm_opts["request_timeout_s"] = float(hcfg.get("analyzer_request_timeout_s", 25))
@@ -230,8 +470,14 @@ class DualTrackHarness:
                     suggested_track = str(data.get("suggested_track") or "").strip().lower()
                     if suggested_track not in ("fast", "refine", "agent", ""):
                         suggested_track = ""
+                    raw_search_queries = data.get("search_queries")
+                    search_queries = []
+                    if isinstance(raw_search_queries, list):
+                        search_queries = [str(item or "").strip() for item in raw_search_queries if str(item or "").strip()]
+                    elif str(data.get("search_query") or "").strip():
+                        search_queries = [str(data.get("search_query") or "").strip()]
 
-                    return {
+                    result = {
                         "decision": decision,
                         "reasons": [f"llm_reason: {reason}"],
                         "complexity": complexity,
@@ -246,7 +492,19 @@ class DualTrackHarness:
                         "raw_llm_response": res.content,
                         "confidence": confidence,
                         "suggested_track": suggested_track or None,
+                        "search_queries": search_queries,
                     }
+                    if self._redis:
+                        try:
+                            await asyncio.to_thread(
+                                self._redis.set,
+                                cache_key,
+                                json.dumps(result, ensure_ascii=False),
+                                cache_ttl,
+                            )
+                        except Exception:
+                            pass
+                    return result
                 except json.JSONDecodeError:
                     return {
                         "decision": "fast",
@@ -281,17 +539,24 @@ class DualTrackHarness:
 
     def _analyzer_fallback_timeout(self, prompt: str) -> Dict[str, Any]:
         """LLM 预判整体超时：避免长时间卡住 SSE，按启发规则降级。"""
-        length = len(prompt or "")
+        text = str(prompt or "")
+        length = len(text)
+        low = text.lower()
+        has_code = "```" in text or any(k in low for k in ("traceback", "stack trace", "debug", "报错", "异常"))
+        question_count = text.count("?") + text.count("？")
+        deep_kw = any(k in text for k in ("写一篇", "详细分析", "完整方案", "深入分析", "系统阐述", "逐步分析"))
+        choose_refine = length > 200 or question_count >= 2 or deep_kw or has_code
+        task_type = "reasoning" if has_code else ("generation" if choose_refine else "conversation")
         return {
-            "decision": "refine" if length > 200 else "fast",
+            "decision": "refine" if choose_refine else "fast",
             "reasons": ["analyzer_total_timeout"],
-            "complexity": "high" if length > 200 else "low",
-            "type": "general",
-            "task_type": "generation" if length > 200 else "conversation",
-            "reason": "复杂度预判超时，已按长度规则降级并继续处理",
+            "complexity": "high" if choose_refine else "low",
+            "type": "code" if has_code else "general",
+            "task_type": task_type,
+            "reason": "复杂度预判超时，已按多特征启发规则降级并继续处理",
             "analyzer_timed_out": True,
-            "confidence": 0.45,
-            "suggested_track": "refine" if length > 200 else "fast",
+            "confidence": 0.55 if choose_refine else 0.45,
+            "suggested_track": "agent" if has_code else ("refine" if choose_refine else "fast"),
         }
 
     def route_fast_model(self, prompt: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
@@ -385,24 +650,23 @@ class DualTrackHarness:
         key_src = self._fast_cache_key_source(options, augmented_prompt)
         norm = self._norm_cache_prompt(key_src)
         pref = str(fcfg.get("key_prefix") or "harness:fast:v1:")
-        thresh = float(fcfg.get("similarity_threshold", 0.9))
+        thresh = float(fcfg.get("similarity_threshold", 0.82))
         max_scan = int(fcfg.get("max_scan_keys", 400))
         key = pref + hashlib.sha256(norm.encode("utf-8")).hexdigest()
+        zkey = pref + "zset"
 
         def _sync() -> Optional[str]:
             v = self._redis.get(key)
             if v:
                 return str(v)
-            raw = self._redis.lrange(pref + "lru", 0, -1)
+            raw = self._redis.zrevrange(zkey, 0, max(0, max_scan - 1))
             best_a: Optional[str] = None
             best_r = 0.0
-            for i, row in enumerate(raw or []):
-                if i >= max_scan:
-                    break
+            for row in raw or []:
                 try:
                     o = json.loads(row)
                     n2 = str(o.get("n") or "")
-                    r = difflib.SequenceMatcher(a=norm, b=n2).ratio()
+                    r = semantic_similarity(norm, n2)
                     if r > best_r:
                         best_r = r
                         best_a = str(o.get("a") or "")
@@ -427,11 +691,14 @@ class DualTrackHarness:
         ttl = int(fcfg.get("ttl_sec", 864000))
         key = pref + hashlib.sha256(norm.encode("utf-8")).hexdigest()
         row = json.dumps({"n": norm, "a": answer}, ensure_ascii=False)
+        zkey = pref + "zset"
 
         def _sync() -> None:
             self._redis.set(key, answer, ex=ttl)
-            self._redis.lpush(pref + "lru", row)
-            self._redis.ltrim(pref + "lru", 0, 199)
+            self._redis.zadd(zkey, {row: time.time()})
+            size = self._redis.zcard(zkey)
+            if size and int(size) > 200:
+                self._redis.zremrangebyrank(zkey, 0, int(size) - 201)
 
         try:
             await asyncio.to_thread(_sync)
@@ -494,6 +761,7 @@ class DualTrackHarness:
         tomorrow = today + timedelta(days=1)
         combined = f"{user_q} {base}"
         cl = combined.lower()
+        english = is_probably_english(combined)
 
         extras: List[str] = []
 
@@ -523,12 +791,29 @@ class DualTrackHarness:
             if "weather" not in cl:
                 add_token("weather")
 
+        if any(k in combined for k in ("股票", "股价", "汇率", "币价", "基金净值")) or any(
+            k in cl for k in ("stock", "share price", "exchange rate", "forex", "crypto price")
+        ):
+            for tok in (("实时" if not english else "live"), ("今日" if not english else "today")):
+                add_token(tok)
+
+        if re.search(r"\b(vue|react|python|node|typescript|java|spring|fastapi|django)\b", cl) and re.search(r"\b\d", cl):
+            add_token(str(datetime.now().year) if english else f"{datetime.now().year}年")
+
+        person_suffixes = ("先生", "女士", "老师", "教授", "博士")
+        for suffix in person_suffixes:
+            if base.endswith(suffix) and len(base) > len(suffix) + 1:
+                base = base[: -len(suffix)].strip()
+                break
+
         if extras:
             base = f"{base} " + " ".join(extras)
         base = base.strip()
         if str(analysis.get("search_intent") or "").lower() == "freshness_required":
             y = datetime.now().year
-            for tok in (f"{y}年", "近期", "最新进展", "latest update"):
+            year_tok = str(y) if english else f"{y}年"
+            fresh_tokens = ["latest update", "recent", year_tok] if english else [year_tok, "近期", "最新进展"]
+            for tok in fresh_tokens:
                 if tok not in base and tok.lower() not in base.lower():
                     base = f"{base} {tok}".strip()
                     break
@@ -592,12 +877,13 @@ class DualTrackHarness:
                     reasoning = chunk.get("reasoning_content") or ""
                     if content:
                         emitted_chars += len(content)
-                    elif reasoning:
-                        emitted_chars += len(reasoning)
                         step = int(options.get("stream_slice_chars") or 8)
                         for idx in range(0, len(content), step):
                             yield {"event": "chunk", "data": {"content": content[idx : idx + step]}}
                             await asyncio.sleep(0)
+                    elif reasoning:
+                        # 计入非空流，避免仅 reasoning 的模型被误判 EMPTY_STREAM；正文仍只推送 content
+                        emitted_chars += len(reasoning)
 
                 if emitted_chars <= 0:
                     last_error = f"{mk} stream ended without content"
@@ -652,18 +938,56 @@ class DualTrackHarness:
                 "latency_ms": 0,
                 "attempts": [],
             }
-        sr = await self.search.search(vq)
+        cache = options.setdefault("_request_search_cache", {})
+        cache_key = self._normalized_search_key(vq)
+        if cache_key in cache:
+            return dict(cache[cache_key])
+
+        session_id = str(options.get("session_id") or "").strip()
+        if self._redis and session_id:
+            try:
+                cached = await asyncio.to_thread(self._redis.get, self._session_search_cache_key(session_id, vq))
+                if cached:
+                    data = json.loads(cached)
+                    data["cached"] = True
+                    cache[cache_key] = data
+                    return dict(data)
+            except Exception:
+                pass
+
+        sr = await self.search.search(
+            vq,
+            override_max_results=options.get("override_max_results"),
+            override_search_depth=options.get("override_search_depth"),
+        )
         if sr.get("error") or not (sr.get("sources") or []):
+            cache[cache_key] = dict(sr)
             return sr
         h = self.cfg.get("harness") or {}
         rcfg = (h.get("search") or {}).get("relevance_filter") or {}
         if not rcfg.get("enabled", False):
+            cache[cache_key] = dict(sr)
+            return sr
+        if not bool(options.get("relevance_filter_sync", False)):
+            sr["relevance_filter_meta"] = {"deferred": True}
+            cache[cache_key] = dict(sr)
+            if self._redis and session_id:
+                try:
+                    await asyncio.to_thread(
+                        self._redis.set,
+                        self._session_search_cache_key(session_id, vq),
+                        json.dumps(sr, ensure_ascii=False),
+                        1800,
+                    )
+                except Exception:
+                    pass
             return sr
         try:
             from search_relevance import filter_sources_by_relevance, rebuild_context_from_sources
 
             uq = str(options.get("search_prompt_base") or "")[:6000]
             mk = str(rcfg.get("model") or "gpt-5.5")
+            context_chars = _int_budget(options, "search_context_chars", 6000, minimum=1500, maximum=12000)
             kept, fmeta = await filter_sources_by_relevance(
                 self,
                 uq,
@@ -674,11 +998,22 @@ class DualTrackHarness:
             if kept and len(kept) != len(sr.get("sources") or []):
                 sr["sources"] = kept
                 sr["context"] = rebuild_context_from_sources(
-                    kept, datetime.now().isoformat(timespec="seconds")
+                    kept, datetime.now().isoformat(timespec="seconds"), max_total_chars=context_chars
                 )
             sr["relevance_filter_meta"] = fmeta
         except Exception as e:
             sr["relevance_filter_meta"] = {"error": str(e)}
+        cache[cache_key] = dict(sr)
+        if self._redis and session_id:
+            try:
+                await asyncio.to_thread(
+                    self._redis.set,
+                    self._session_search_cache_key(session_id, vq),
+                    json.dumps(sr, ensure_ascii=False),
+                    1800,
+                )
+            except Exception:
+                pass
         return sr
 
     async def _fast_entry_search_step(
@@ -694,7 +1029,8 @@ class DualTrackHarness:
         Fast 轨入口联网：校验 query、区分强制/可选失败策略。
         返回 (更新后的 prompt, step, 若需中止整条流则非空 error 文案)。
         """
-        raw_q = self.build_search_query(prompt, analysis, options)
+        queries = self._build_search_queries(prompt, analysis, options)
+        raw_q = queries[0] if queries else self.build_search_query(prompt, analysis, options)
         vq, fc, vreason = validate_search_query(raw_q)
         if fc:
             meta = _pg(
@@ -736,14 +1072,50 @@ class DualTrackHarness:
                 None,
             )
 
-        sr = await self.perform_web_search(vq, options)
-        search_context = sr.get("context", "")
-        sources = sr.get("sources", [])
-        hard_err = sr.get("error")
+        merged_sources: List[Dict[str, Any]] = []
+        merged_contexts: List[str] = []
+        merged_attempts: List[Dict[str, Any]] = []
+        hard_err = None
+        fallback_from = None
+        total_latency_ms = 0
+        overrides = self._track_search_overrides("fast")
+        sub_opts = {**options, **{k: v for k, v in overrides.items() if v is not None}}
+        results = await asyncio.gather(*[self.perform_web_search(q, sub_opts) for q in queries[:4]])
+        seen_urls = set()
+        for sr in results:
+            total_latency_ms += int(sr.get("latency_ms") or 0)
+            merged_attempts.extend(list(sr.get("attempts") or []))
+            fallback_from = fallback_from or sr.get("fallback_from")
+            if sr.get("error") and not hard_err:
+                hard_err = sr.get("error")
+            for src in sr.get("sources") or []:
+                url = str(src.get("url") or "")
+                key = url or json.dumps(src, ensure_ascii=False, sort_keys=True)
+                if key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                merged_sources.append(src)
+            ctx = str(sr.get("context") or "").strip()
+            if ctx:
+                merged_contexts.append(ctx)
+        search_context = "\n\n".join(merged_contexts)
+        sources = merged_sources
+        sr = {
+            "context": search_context,
+            "sources": sources,
+            "error": hard_err,
+            "failure_code": results[0].get("failure_code") if results else None,
+            "degraded": any(bool(item.get("degraded")) for item in results),
+            "provider_used": next((item.get("provider_used") for item in results if item.get("provider_used")), "none"),
+            "latency_ms": total_latency_ms,
+            "attempts": merged_attempts,
+            "fallback_from": fallback_from,
+        }
         nsrc = len(sources)
         meta = {
             "query": raw_q,
             "query_effective": vq,
+            "queries": queries,
             "reason": search_reason,
             "sources": sources,
             "result_count": nsrc,
@@ -821,14 +1193,18 @@ class DualTrackHarness:
         options: Dict[str, Any],
     ) -> str:
         """Refine 轨：显式联网意图下 Layer1 前轻量检索，失败仅注入说明、不中止。"""
-        raw_q = self.build_search_query(prompt, analysis, options)
+        queries = self._build_search_queries(prompt, analysis, options)
+        raw_q = queries[0] if queries else self.build_search_query(prompt, analysis, options)
         vq, fc, vreason = validate_search_query(raw_q)
         if fc:
             return f"\n【入口联网】检索词未通过校验（{vreason or fc}），请依赖常识与后续审查层按需检索。\n"
-        sr = await self.perform_web_search(vq, options)
-        if sr.get("error"):
-            return f"\n【入口联网】检索未成功：{sr.get('error')}。后续审查层仍可输出 <<ACTION: web_search(\"...\")>> 复核。\n"
-        ctx = (sr.get("context") or "").strip()
+        overrides = self._track_search_overrides("refine")
+        sub_opts = {**options, **{k: v for k, v in overrides.items() if v is not None}}
+        results = await asyncio.gather(*[self.perform_web_search(q, sub_opts) for q in queries[:4]])
+        err = next((item.get("error") for item in results if item.get("error")), None)
+        if err and not any(item.get("sources") for item in results):
+            return f"\n【入口联网】检索未成功：{err}。后续审查层仍可输出 <<ACTION: web_search(\"...\")>> 复核。\n"
+        ctx = "\n\n".join(str(item.get("context") or "").strip() for item in results if str(item.get("context") or "").strip())
         if not ctx:
             return "\n【入口联网】未获得有效摘要，请后续审查层按需检索。\n"
         return f"\n【入口联网摘要（供初稿参考）】\n{ctx[:6000]}\n"
@@ -913,8 +1289,17 @@ class DualTrackHarness:
         dec = str(analysis.get("decision") or "fast").lower()
         return "refine" if dec == "refine" else "fast"
 
+    def _should_skip_refine_draft(self, prompt: str, analysis: Dict[str, Any], options: Dict[str, Any]) -> bool:
+        if bool(options.get("skip_draft")):
+            return True
+        if str(analysis.get("search_intent") or "none").lower() in ("required", "freshness_required"):
+            return False
+        text = str(options.get("search_prompt_base") or prompt or "").strip()
+        markers = ("帮我改进", "润色这段", "优化这段", "修改这段文字", "改写下面", "improve this", "polish this", "rewrite this")
+        return any(marker.lower() in text.lower() for marker in markers)
+
     async def _emit_text_chunks(self, text: str, options: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
-        step = max(1, int(options.get("stream_slice_chars") or 8))
+        step = max(1, int(options.get("stream_slice_chars") or 96))
         for i in range(0, len(text), step):
             yield {"event": "chunk", "data": {"content": text[i : i + step]}}
             await asyncio.sleep(0)
@@ -987,18 +1372,7 @@ class DualTrackHarness:
         options: Dict[str, Any],
         agent_model: str,
     ) -> str:
-        if str(analysis.get("complexity") or "").lower() != "high":
-            return ""
-        scfg = hcfg.get("complexity") or {}
-        cm = self._pick_agent_self_check_model(hcfg, analysis, agent_model)
-        sc_prompt = (
-            "请只做自检清单，不要输出对用户最终答案。\n"
-            "分两块：\n1) 我已核实或可依赖的事实\n2) 我仍不确定或需要更多证据的点\n\n"
-            f"【用户问题】\n{orig_q[:4000]}\n【草稿】\n{draft[:12000]}"
-        )
-        opts_sc = {**options, "temperature": 0.1}
-        rsc, _ = await self._ask_with_fallback([cm], sc_prompt, opts_sc, None)
-        return (rsc.content or "").strip() if rsc and rsc.success else ""
+        return ""
 
     async def _refine_from_draft_stream(
         self,
@@ -1036,12 +1410,16 @@ class DualTrackHarness:
         messages: Optional[List[Dict[str, Any]]],
         trace_id: str,
         hcfg: Dict[str, Any],
+        _tag,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         acfg = hcfg.get("agent") or {}
         routing = hcfg.get("routing") or {}
         default_model = routing.get("default_model", "gpt-5.5")
         agent_model = acfg.get("model") or analysis.get("selected_model") or default_model
-        max_iter = max(1, int(acfg.get("max_iterations", 5)))
+        max_map = acfg.get("max_iterations_by_complexity") or {}
+        cx = str(analysis.get("complexity") or "low").lower()
+        max_iter = int(max_map.get(cx) or acfg.get("max_iterations", 5))
+        max_iter = max(3, min(8, max_iter))
         agent_intro = (acfg.get("system_prompt") or "").strip()
         base_rules = (
             "你是具备工具调用能力的智能体，按「思考 → 行动 → 观察」循环推理。\n"
@@ -1059,13 +1437,14 @@ class DualTrackHarness:
         sys_content = (agent_intro + "\n\n" + base_rules).strip()
         thread_msgs: List[Dict[str, Any]] = []
         if messages:
-            for m in messages[-16:]:
+            history_budget = _int_budget(options, "agent_history_context_chars", 12000, minimum=2000, maximum=40000)
+            for m in self._select_agent_history_messages(messages, history_budget):
                 role = m.get("role")
                 if role not in ("user", "assistant"):
                     continue
                 thread_msgs.append({"role": role, "content": _msg_content_to_text(m.get("content"))})
         conv: List[Dict[str, Any]] = [{"role": "system", "content": sys_content}] + thread_msgs + [{"role": "user", "content": prompt}]
-        options.setdefault("_agent_loop_ctx", {"last_query": "", "last_ok": False})
+        options.setdefault("_agent_loop_ctx", {"last_query": "", "last_ok": False, "all_queries": []})
 
         yield {
             "event": "step",
@@ -1199,7 +1578,7 @@ class DualTrackHarness:
                             "name": "agent_self_check",
                             "status": "ok",
                             "meta": _pg(
-                                {**self._tag("review"), "chars": len(extra_sc)},
+                                {**_tag("review"), "chars": len(extra_sc)},
                                 "polishing",
                                 f"高复杂度自检完成（约 {len(extra_sc)} 字），供审查层参考。",
                             ),
@@ -1248,6 +1627,29 @@ class DualTrackHarness:
 
             if action_name == "web_search":
                 query = (action.get("query") or "").strip()
+                lo = options.get("_agent_loop_ctx") or {}
+                history_queries = list(lo.get("all_queries") or [])
+                repeated = False
+                for old_query in history_queries:
+                    if ngram_overlap_ratio(old_query, query) >= 0.7:
+                        repeated = True
+                        break
+                if repeated:
+                    conv.append(
+                        {
+                            "role": "user",
+                            "content": "【系统】该检索词与之前轮次高度重复，请换角度、泛化关键词或拆分子问题后再搜索。",
+                        }
+                    )
+                    yield {
+                        "event": "step",
+                        "step": {
+                            "name": "agent_web_search",
+                            "status": "skipped",
+                            "meta": _pg({"query": query, "reason": "repeat_query_detected"}, "reasoning", "检测到重复搜索，已要求 Agent 改写查询词。"),
+                        },
+                    }
+                    continue
                 vq, vfc, vreason = validate_search_query(query)
                 if vfc:
                     conv.append(
@@ -1281,9 +1683,9 @@ class DualTrackHarness:
                         ),
                     },
                 }
-                sr = await self.tools.web_search(vq, options)
+                track_overrides = self._track_search_overrides("agent")
+                sr = await self.tools.web_search(vq, {**options, **{k: v for k, v in track_overrides.items() if v is not None}})
                 ctx = (sr.get("context") or "")[:12000]
-                lo = options.get("_agent_loop_ctx") or {}
                 n_ok = len(sr.get("sources") or [])
                 st = Step(
                     name="agent_web_search",
@@ -1316,6 +1718,7 @@ class DualTrackHarness:
                 else:
                     lo["last_query"] = vq
                     lo["last_ok"] = True
+                    lo.setdefault("all_queries", []).append(vq)
                     conv.append({"role": "user", "content": f"【观察】联网摘要：\n{ctx}\n请继续推理或给出最终答案。"})
                 continue
 
@@ -1363,7 +1766,7 @@ class DualTrackHarness:
                             "name": "agent_self_check",
                             "status": "ok",
                             "meta": _pg(
-                                {**self._tag("review"), "chars": len(extra_sc2), "coerced_plain_text": True},
+                                {**_tag("review"), "chars": len(extra_sc2), "coerced_plain_text": True},
                                 "polishing",
                                 f"强制精化前自检完成（约 {len(extra_sc2)} 字），供审查层参考。",
                             ),
@@ -1457,13 +1860,7 @@ class DualTrackHarness:
             options["_fast_cache_identity"] = str(options.get("search_prompt_base") or prompt or "").strip()
         trace_id = options.get("trace_id") or new_trace_id()
         steps: List[Step] = []
-        self._pipeline_seq = 0
-
-        hcfg = self.cfg.get("harness") or {}
-        default_mode = hcfg.get("default_mode", "auto")
-        mode = (mode or default_mode).lower()
-        if mode not in ("auto", "fast", "refine", "agent"):
-            mode = "auto"
+        _tag = self._make_tagger()
 
         yield {"event": "trace", "trace_id": trace_id}
         yield {"event": "status", "phase": "analyze", "message": "正在分析问题…"}
@@ -1476,50 +1873,32 @@ class DualTrackHarness:
                 "meta": _pg({}, "intake", "正在调用预判模型分析意图与复杂度…"),
             },
         }
-        cx_cfg = hcfg.get("complexity") or {}
-        analyzer_deadline = float(cx_cfg.get("analyzer_total_timeout_s", 45))
-        try:
-            analysis = await asyncio.wait_for(
-                self.analyze_complexity(prompt, options),
-                timeout=analyzer_deadline,
-            )
-        except asyncio.TimeoutError:
-            analysis = self._analyzer_fallback_timeout(prompt)
-        sig_base = str(options.get("search_prompt_base") or prompt or "").strip()
-        analysis = self._postprocess_analysis(sig_base, analysis)
-        signals = derive_user_signals(sig_base, options)
-        analysis = merge_signals_into_analysis(analysis, signals, sig_base)
+        runtime = await self._resolve_runtime_context(prompt, mode, options)
+        hcfg = runtime["hcfg"]
+        mode = runtime["mode"]
+        analysis = runtime["analysis"]
+        intended_track = runtime["intended_track"]
+        chosen_track = runtime["chosen_track"]
+        should_search = runtime["should_search"]
+        search_reason = runtime["search_reason"]
+        search_mandatory = runtime["search_mandatory"]
 
         step_analyze = Step(
             name="complexity_analyze",
             status="ok",
-            meta=_pg({**analysis, **self._tag("intake")}, "intake", _analyze_step_summary(analysis)),
+            meta=_pg({**analysis, **_tag("intake")}, "intake", _analyze_step_summary(analysis)),
             input_preview=(prompt[:240] + ("…" if len(prompt) > 240 else "")),
         )
         steps.append(step_analyze)
         yield {"event": "step", "step": step_analyze.to_dict()}
 
         yield {"event": "status", "phase": "route", "message": "正在选择处理轨道…"}
-        intended_track = self._resolve_track(mode, analysis, options)
-        chosen_track = self.apply_confidence_track_guard(mode, analysis, sig_base, intended_track)
-        # upgrade_track：重新生成等场景下客户端可要求升轨，不限于 auto 模式
-        if options.get("upgrade_track"):
-            bump = {"fast": "refine", "refine": "agent"}
-            nt = bump.get(chosen_track)
-            if nt:
-                ag_en = bool((hcfg.get("agent") or {}).get("enabled", True))
-                if nt == "agent" and not ag_en:
-                    nt = "refine"
-                    analysis["fallback_reason"] = analysis.get("fallback_reason") or "upgrade_target_agent_disabled"
-                analysis["client_track_upgrade"] = f"{chosen_track}->{nt}"
-                chosen_track = nt
-
         step_track = Step(
             name="track_select",
             status="ok",
             meta=_pg(
                 {
-                    **self._tag("routing"),
+                    **_tag("routing"),
                     "mode": mode,
                     "track": chosen_track,
                     "task_type": analysis.get("task_type"),
@@ -1541,9 +1920,6 @@ class DualTrackHarness:
         steps.append(step_track)
         yield {"event": "step", "step": step_track.to_dict()}
         yield {"event": "trace", "trace_id": trace_id, "track": chosen_track}
-
-        should_search, search_reason = self.should_search(prompt, analysis, options)
-        search_mandatory = self._search_mandatory(analysis, options)
         if chosen_track == "fast" and should_search:
             yield {"event": "status", "phase": "search", "message": "正在联网检索（快轨）…"}
             yield {
@@ -1565,7 +1941,7 @@ class DualTrackHarness:
 
         if chosen_track == "agent":
             yield {"event": "status", "phase": "agent", "message": "正在 Agent 推理与按需工具…"}
-            async for ev in self._run_agent_stream(prompt, analysis, options, messages, trace_id, hcfg):
+            async for ev in self._run_agent_stream(prompt, analysis, options, messages, trace_id, hcfg, _tag):
                 yield ev
             return
 
@@ -1578,7 +1954,7 @@ class DualTrackHarness:
                         "name": "fast_answer_cache",
                         "status": "ok",
                         "meta": _pg(
-                            {**self._tag("cache"), "chars": len(cached)},
+                            {**_tag("cache"), "chars": len(cached)},
                             "fast",
                             "命中本地/Redis 答案缓存，跳过模型调用。",
                         ),
@@ -1594,7 +1970,7 @@ class DualTrackHarness:
                 name="fast_route",
                 status="ok",
                 meta=_pg(
-                    {**route, **self._tag("draft")},
+                    {**route, **_tag("draft")},
                     "fast",
                     f"快轨已选定首选模型「{route.get('selected') or '—'}」，将单段流式生成。",
                 ),
@@ -1613,7 +1989,8 @@ class DualTrackHarness:
             return
 
         # refine track
-        chain = hcfg.get("refine_chain") or {}
+        refine_ctx = self._resolve_refine_context(analysis, hcfg)
+        chain = refine_ctx["chain"]
         if not chain.get("enabled", True):
             route = self.route_fast_model(prompt, analysis)
             steps.append(
@@ -1634,13 +2011,13 @@ class DualTrackHarness:
                 yield s_event
             return
 
-        l1 = chain.get("layer1") or {}
-        l2 = chain.get("layer2") or {}
-        l3 = chain.get("layer3") or {}
-        
-        routing = hcfg.get("routing") or {}
-        default_model = routing.get("default_model", "gpt-5.5")
-        refine_models = analysis.get("refine_models") or {}
+        l1 = refine_ctx["l1"]
+        l2 = refine_ctx["l2"]
+        l3 = refine_ctx["l3"]
+        default_model = refine_ctx["default_model"]
+        refine_models = refine_ctx["refine_models"]
+        history_chars = _int_budget(options, "history_context_chars", 4000, minimum=800, maximum=12000)
+        review_search_chars = _int_budget(options, "review_search_context_chars", 6000, minimum=1500, maximum=12000)
 
         entry_block = ""
         si0 = str(analysis.get("search_intent") or "none").lower()
@@ -1672,7 +2049,9 @@ class DualTrackHarness:
             steps.append(step_re1)
             yield {"event": "step", "step": step_re1.to_dict()}
 
-        # Layer 1 (Non-streaming for intermediate layers to keep things manageable)
+        skip_draft = self._should_skip_refine_draft(prompt, analysis, options)
+        # Layer 1 — 流式输出草稿，让用户实时看到初稿内容
+        yield {"event": "stream_start", "track": "refine", "trace_id": trace_id}
         yield {"event": "status", "phase": "draft", "message": "正在生成初稿…"}
         yield {
             "event": "step",
@@ -1682,42 +2061,68 @@ class DualTrackHarness:
                 "meta": _pg({"phase": "初稿层 · 生成草稿"}, "refine", "精化轨：正在生成初稿…"),
             },
         }
-        # For Layer 1 & 2 we do NOT pass the entire chat history. They should only focus on the *current* task context.
-        # We append history manually into the prompt if needed, or simply let Layer 3 handle the conversational tone.
-        # Here we choose to just pass the prompt directly to keep drafts focused.
-        l1_prompt = f"{l1.get('instruction','').strip()}\n{entry_block}\n\n【原始问题】\n{prompt.strip()}\n"
-        
-        # If we have messages, we should probably prefix the recent history to give context, but NOT as role messages
-        # because the layer instructions expect a specific prompt format.
-        ht = _format_messages_snippet(messages, 4)
-        if ht:
-            l1_prompt = f"【近期对话上下文参考】\n{ht}\n\n" + l1_prompt
-
+        l1_prompt = ""
         l1_candidates = refine_models.get("draft") or [default_model]
-        r1, a1 = await self._ask_with_fallback(
-            l1_candidates, l1_prompt, self._layer_opts(hcfg, "layer1", options), messages=None
-        )
+        l1_stream_meta: Dict[str, Any] = {"model": None, "provider": None, "latency_ms": 0}
+        l1_stream_failed = False
+        if skip_draft:
+            r1_content = str(options.get("search_prompt_base") or prompt or "").strip()
+            l1_stream_meta["model"] = "user_draft"
+            l1_stream_meta["provider"] = "local"
+        else:
+            l1_prompt = _build_layer1_prompt(
+                prompt,
+                l1.get("instruction", ""),
+                entry_block,
+                messages,
+                max_history_chars=history_chars,
+            )
+            l1_buf: List[str] = []
+            async for s_event in self._stream_with_fallback(l1_candidates, l1_prompt, self._layer_opts(hcfg, "layer1", options), messages=None):
+                if s_event.get("event") == "chunk":
+                    chunk_content = str((s_event.get("data") or {}).get("content") or "")
+                    if chunk_content:
+                        l1_buf.append(chunk_content)
+                        yield s_event
+                elif s_event.get("event") == "model_start":
+                    l1_stream_meta["model"] = s_event.get("model")
+                    l1_stream_meta["provider"] = s_event.get("provider")
+                    yield s_event
+                elif s_event.get("event") == "model_end":
+                    l1_stream_meta["latency_ms"] = s_event.get("latency_ms", 0)
+                elif s_event.get("event") == "model_error":
+                    yield s_event
+                elif s_event.get("event") == "error":
+                    l1_stream_failed = True
+                    yield s_event
+            r1_content = "".join(l1_buf).strip()
         step_l1 = Step(
             name="refine_layer1_draft",
-            status="ok" if r1.success else "error",
-            provider=r1.provider,
-            model=r1.model,
-            latency_ms=r1.latency_ms,
+            status="ok" if (not l1_stream_failed and r1_content) else "error",
+            provider=l1_stream_meta["provider"],
+            model=l1_stream_meta["model"],
+            latency_ms=int(l1_stream_meta.get("latency_ms") or 0),
             input_preview=l1_prompt[:240] + ("…" if len(l1_prompt) > 240 else ""),
-            output=r1.content if r1.success else None,
-            error=r1.error if not r1.success else None,
+            output=r1_content if not l1_stream_failed else None,
+            error=None if (not l1_stream_failed and r1_content) else "Layer 1 failed",
             meta=_pg(
-                {**self._tag("draft"), "attempts": a1, "candidates": l1_candidates},
+                {**_tag("draft"), "candidates": l1_candidates, "skip_draft": skip_draft},
                 "refine",
-                f"初稿层完成（模型 {r1.model or '—'}）。",
+                "已直接将用户输入作为初稿，跳过 Layer1。"
+                if skip_draft
+                else f"初稿层完成（模型 {l1_stream_meta.get('model') or '—'}）。",
             ),
         )
         steps.append(step_l1)
         yield {"event": "step", "step": step_l1.to_dict()}
-        
-        if not r1.success:
-            yield {"event": "error", "error": "Layer 1 failed."}
+
+        if l1_stream_failed or not r1_content:
+            if not l1_stream_failed:
+                yield {"event": "error", "error": "Layer 1 failed."}
             return
+
+        # 审查前重置前端内容，L3 润色后输出最终版本
+        yield {"event": "content_reset"}
 
         # Layer 2（审查；若输出 <<ACTION: web_search("...")>> 则联网核查后重审，最多 3 轮）
         yield {"event": "status", "phase": "review", "message": "正在审查答案与必要时联网复核…"}
@@ -1729,15 +2134,13 @@ class DualTrackHarness:
                 "meta": _pg({"phase": "审查层 · 核对与必要时动作"}, "refine", "审查层：核对初稿，必要时触发联网核查…"),
             },
         }
-        l2_prompt = (
-            f"{l2.get('instruction','').strip()}\n\n"
-            f"【原始问题】\n{prompt.strip()}\n\n"
-            f"【初稿答案】\n{r1.content.strip()}\n"
-            "\n如需核实实时数据，可在审查结论中单行输出：<<ACTION: web_search(\"查询词\")>>\n"
+        l2_prompt = _build_layer2_prompt(
+            prompt,
+            l2.get("instruction", ""),
+            r1_content,
+            messages,
+            max_history_chars=history_chars,
         )
-        ht2 = _format_messages_snippet(messages, 4)
-        if ht2:
-            l2_prompt = f"【近期对话上下文参考】\n{ht2}\n\n" + l2_prompt
 
         l2_candidates = refine_models.get("review") or [default_model]
         r2, a2 = await self._ask_with_fallback(
@@ -1796,8 +2199,8 @@ class DualTrackHarness:
                     "latency_ms": 0,
                 }
             else:
-                sr = await self.perform_web_search(vq, options)
-            snip = (sr.get("context") or "")[:8000]
+                sr = await self.perform_web_search(vq, {**options, **{k: v for k, v in self._track_search_overrides("refine").items() if v is not None}})
+            snip = (sr.get("context") or "")[:review_search_chars]
             rc = len(sr.get("sources") or [])
             yield {
                 "event": "step",
@@ -1835,7 +2238,7 @@ class DualTrackHarness:
                 l2_candidates, retry_prompt, self._layer_opts(hcfg, "layer2", options), messages=None
             )
             if r2b.success:
-                review_body = (r2b.content or "").strip()
+                review_body = _clean_review_body((r2b.content or "").strip())
             else:
                 break
 
@@ -1846,10 +2249,10 @@ class DualTrackHarness:
             model=r2.model,
             latency_ms=r2.latency_ms,
             input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
-            output=review_body,
+            output=_clean_review_body(review_body),
             meta=_pg(
                 {
-                    **self._tag("review"),
+                    **_tag("review"),
                     "attempts": a2,
                     "candidates": l2_candidates,
                     "review_search_loops": search_loops,
@@ -1871,11 +2274,7 @@ class DualTrackHarness:
                 "meta": _pg({"phase": "润色层 · 流式成文"}, "refine", "润色层：按审查结论流式生成最终答复…"),
             },
         }
-        l3_prompt = (
-            f"{l3.get('instruction','').strip()}\n\n"
-            f"【原始问题】\n{prompt.strip()}\n\n"
-            f"【审查层答案】\n{review_body}\n"
-        )
+        l3_prompt = _build_layer3_prompt(prompt, l3.get("instruction", ""), _clean_review_body(review_body))
         l3_candidates = refine_models.get("polish") or [default_model]
         
         yield {"event": "stream_start", "track": "refine", "trace_id": trace_id}
@@ -1891,7 +2290,7 @@ class DualTrackHarness:
             name="refine_layer3_polish",
             status="ok" if l3_ok else "error",
             meta=_pg(
-                {**self._tag("polish"), "candidates": l3_candidates},
+                {**_tag("polish"), "candidates": l3_candidates},
                 "refine",
                 "润色层流式输出已完成。" if l3_ok else "润色层流式输出失败，请查看错误事件。",
             ),
@@ -1903,49 +2302,26 @@ class DualTrackHarness:
         options = options or {}
         trace_id = options.get("trace_id") or new_trace_id()
         steps: List[Step] = []
-        self._pipeline_seq = 0
-
-        hcfg = self.cfg.get("harness") or {}
-        default_mode = hcfg.get("default_mode", "auto")
-        mode = (mode or default_mode).lower()
-        if mode not in ("auto", "fast", "refine", "agent"):
-            mode = "auto"
-
-        cx_cfg = hcfg.get("complexity") or {}
-        analyzer_deadline = float(cx_cfg.get("analyzer_total_timeout_s", 45))
-        try:
-            analysis = await asyncio.wait_for(
-                self.analyze_complexity(prompt, options),
-                timeout=analyzer_deadline,
-            )
-        except asyncio.TimeoutError:
-            analysis = self._analyzer_fallback_timeout(prompt)
-        sig_base = str(options.get("search_prompt_base") or prompt or "").strip()
-        analysis = self._postprocess_analysis(sig_base, analysis)
-        signals = derive_user_signals(sig_base, options)
-        analysis = merge_signals_into_analysis(analysis, signals, sig_base)
+        _tag = self._make_tagger()
+        runtime = await self._resolve_runtime_context(prompt, mode, options)
+        hcfg = runtime["hcfg"]
+        mode = runtime["mode"]
+        analysis = runtime["analysis"]
+        intended_track = runtime["intended_track"]
+        chosen_track = runtime["chosen_track"]
+        should_search = runtime["should_search"]
+        search_reason = runtime["search_reason"]
+        search_mandatory = runtime["search_mandatory"]
 
         steps.append(
             Step(
                 name="complexity_analyze",
                 status="ok",
-                meta=_pg({**analysis, **self._tag("intake")}, "intake", _analyze_step_summary(analysis)),
+                meta=_pg({**analysis, **_tag("intake")}, "intake", _analyze_step_summary(analysis)),
                 input_preview=(prompt[:240] + ("…" if len(prompt) > 240 else "")),
             )
         )
 
-        intended_track = self._resolve_track(mode, analysis, options)
-        chosen_track = self.apply_confidence_track_guard(mode, analysis, sig_base, intended_track)
-        if options.get("upgrade_track"):
-            bump = {"fast": "refine", "refine": "agent"}
-            nt = bump.get(chosen_track)
-            if nt:
-                ag_en = bool((hcfg.get("agent") or {}).get("enabled", True))
-                if nt == "agent" and not ag_en:
-                    nt = "refine"
-                    analysis["fallback_reason"] = analysis.get("fallback_reason") or "upgrade_target_agent_disabled"
-                analysis["client_track_upgrade"] = f"{chosen_track}->{nt}"
-                chosen_track = nt
         if chosen_track == "agent":
             # 非流式接口暂不跑 Agent 循环，降级为 Refine 三阶段
             chosen_track = "refine"
@@ -1962,7 +2338,7 @@ class DualTrackHarness:
                 status="ok",
                 meta=_pg(
                     {
-                        **self._tag("routing"),
+                        **_tag("routing"),
                         "mode": mode,
                         "track": chosen_track,
                         "task_type": analysis.get("task_type"),
@@ -1980,8 +2356,6 @@ class DualTrackHarness:
             )
         )
 
-        should_search, search_reason = self.should_search(prompt, analysis, options)
-        search_mandatory = self._search_mandatory(analysis, options)
         if chosen_track == "fast" and should_search:
             prompt, ws_step, abort_err = await self._fast_entry_search_step(
                 prompt, analysis, options, search_reason, search_mandatory=search_mandatory
@@ -2004,6 +2378,15 @@ class DualTrackHarness:
                 }
 
         if chosen_track == "fast":
+            cached = await self._try_fast_cache_hit(options, prompt)
+            if cached:
+                steps.append(Step(name="fast_answer_cache", status="ok", meta={"chars": len(cached)}))
+                return {
+                    "trace_id": trace_id,
+                    "track": "fast",
+                    "final": AskResult(True, cached, "cache", "redis", 0).to_dict(),
+                    "steps": [s.to_dict() for s in steps],
+                }
             route = self.route_fast_model(prompt, analysis)
             steps.append(Step(name="fast_route", status="ok", meta=route))
 
@@ -2021,6 +2404,8 @@ class DualTrackHarness:
                     meta={"attempts": attempts},
                 )
             )
+            if res.success:
+                await self._store_fast_cache_answer(options, prompt, res.content or "")
             return {
                 "trace_id": trace_id,
                 "track": "fast",
@@ -2029,7 +2414,8 @@ class DualTrackHarness:
             }
 
         # refine track
-        chain = hcfg.get("refine_chain") or {}
+        refine_ctx = self._resolve_refine_context(analysis, hcfg)
+        chain = refine_ctx["chain"]
         if not chain.get("enabled", True):
             # fallback to fast if disabled
             route = self.route_fast_model(prompt, analysis)
@@ -2055,15 +2441,13 @@ class DualTrackHarness:
                 "steps": [s.to_dict() for s in steps],
             }
 
-        l1 = chain.get("layer1") or {}
-        l2 = chain.get("layer2") or {}
-        l3 = chain.get("layer3") or {}
-        
-        # fallback default
-        routing = hcfg.get("routing") or {}
-        default_model = routing.get("default_model", "gpt-5.5")
-
-        refine_models = analysis.get("refine_models") or {}
+        l1 = refine_ctx["l1"]
+        l2 = refine_ctx["l2"]
+        l3 = refine_ctx["l3"]
+        default_model = refine_ctx["default_model"]
+        refine_models = refine_ctx["refine_models"]
+        history_chars = _int_budget(options, "history_context_chars", 4000, minimum=800, maximum=12000)
+        review_search_chars = _int_budget(options, "review_search_context_chars", 6000, minimum=1500, maximum=12000)
 
         entry_block = ""
         si_sync = str(analysis.get("search_intent") or "none").lower()
@@ -2084,13 +2468,26 @@ class DualTrackHarness:
                 )
             )
 
+        skip_draft = self._should_skip_refine_draft(prompt, analysis, options)
         # Layer 1
         # 对于 refine 链的第一层，我们将历史消息注入，但要把 prompt 包装为 l1_prompt
-        l1_prompt = f"{l1.get('instruction','').strip()}\n{entry_block}\n\n【原始问题】\n{prompt.strip()}\n"
         l1_candidates = refine_models.get("draft") or [default_model]
-        r1, a1 = await self._ask_with_fallback(
-            l1_candidates, l1_prompt, self._layer_opts(hcfg, "layer1", options), messages=messages
-        )
+        if skip_draft:
+            draft_text = str(options.get("search_prompt_base") or prompt or "").strip()
+            r1 = AskResult(True, draft_text, "local", "user_draft", 0)
+            a1: List[Dict[str, Any]] = []
+            l1_prompt = draft_text
+        else:
+            l1_prompt = _build_layer1_prompt(
+                prompt,
+                l1.get("instruction", ""),
+                entry_block,
+                messages,
+                max_history_chars=history_chars,
+            )
+            r1, a1 = await self._ask_with_fallback(
+                l1_candidates, l1_prompt, self._layer_opts(hcfg, "layer1", options), messages=None
+            )
         steps.append(
             Step(
                 name="refine_layer1_draft",
@@ -2101,7 +2498,7 @@ class DualTrackHarness:
                 input_preview=l1_prompt[:240] + ("…" if len(l1_prompt) > 240 else ""),
                 output=r1.content if r1.success else None,
                 error=r1.error if not r1.success else None,
-                meta={**self._tag("draft"), "attempts": a1, "candidates": l1_candidates},
+                meta={**_tag("draft"), "attempts": a1, "candidates": l1_candidates, "skip_draft": skip_draft},
             )
         )
         if not r1.success:
@@ -2114,15 +2511,16 @@ class DualTrackHarness:
             }
 
         # Layer 2（含可选联网核查，与流式接口逻辑对齐）
-        l2_prompt = (
-            f"{l2.get('instruction','').strip()}\n\n"
-            f"【原始问题】\n{prompt.strip()}\n\n"
-            f"【初稿答案】\n{r1.content.strip()}\n"
-            "\n如需核实实时数据，可在审查结论中单行输出：<<ACTION: web_search(\"查询词\")>>\n"
+        l2_prompt = _build_layer2_prompt(
+            prompt,
+            l2.get("instruction", ""),
+            r1.content or "",
+            messages,
+            max_history_chars=history_chars,
         )
         l2_candidates = refine_models.get("review") or [default_model]
         r2, a2 = await self._ask_with_fallback(
-            l2_candidates, l2_prompt, self._layer_opts(hcfg, "layer2", options), messages=messages
+            l2_candidates, l2_prompt, self._layer_opts(hcfg, "layer2", options), messages=None
         )
         if not r2.success:
             steps.append(
@@ -2170,8 +2568,8 @@ class DualTrackHarness:
                     "failure_code": vfc,
                 }
             else:
-                sr = await self.perform_web_search(vq, options)
-            snip = (sr.get("context") or "")[:8000]
+                sr = await self.perform_web_search(vq, {**options, **{k: v for k, v in self._track_search_overrides("refine").items() if v is not None}})
+            snip = (sr.get("context") or "")[:review_search_chars]
             steps.append(
                 Step(
                     name="review_web_search",
@@ -2190,10 +2588,10 @@ class DualTrackHarness:
                 + "\n\n请结合上述联网信息更新审查结论；若仍需核实可再次输出 <<ACTION: web_search(\"查询词\")>>。"
             )
             r2b, _ = await self._ask_with_fallback(
-                l2_candidates, retry_prompt, self._layer_opts(hcfg, "layer2", options), messages=messages
+                l2_candidates, retry_prompt, self._layer_opts(hcfg, "layer2", options), messages=None
             )
             if r2b.success:
-                review_body = (r2b.content or "").strip()
+                review_body = _clean_review_body((r2b.content or "").strip())
             else:
                 break
 
@@ -2205,20 +2603,16 @@ class DualTrackHarness:
                 model=r2.model,
                 latency_ms=r2.latency_ms,
                 input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
-                output=review_body,
-                meta={**self._tag("review"), "attempts": a2, "candidates": l2_candidates, "review_search_loops": search_loops},
+                output=_clean_review_body(review_body),
+                meta={**_tag("review"), "attempts": a2, "candidates": l2_candidates, "review_search_loops": search_loops},
             )
         )
 
         # Layer 3
-        l3_prompt = (
-            f"{l3.get('instruction','').strip()}\n\n"
-            f"【原始问题】\n{prompt.strip()}\n\n"
-            f"【审查层答案】\n{review_body}\n"
-        )
+        l3_prompt = _build_layer3_prompt(prompt, l3.get("instruction", ""), _clean_review_body(review_body))
         l3_candidates = refine_models.get("polish") or [default_model]
         r3, a3 = await self._ask_with_fallback(
-            l3_candidates, l3_prompt, self._layer_opts(hcfg, "layer3", options), messages=messages
+            l3_candidates, l3_prompt, self._layer_opts(hcfg, "layer3", options), messages=None
         )
         steps.append(
             Step(
@@ -2230,7 +2624,7 @@ class DualTrackHarness:
                 input_preview=l3_prompt[:240] + ("…" if len(l3_prompt) > 240 else ""),
                 output=r3.content if r3.success else None,
                 error=r3.error if not r3.success else None,
-                meta={**self._tag("polish"), "attempts": a3, "candidates": l3_candidates},
+                meta={**_tag("polish"), "attempts": a3, "candidates": l3_candidates},
             )
         )
 
