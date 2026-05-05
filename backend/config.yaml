@@ -1,6 +1,6 @@
 server:
   # SSE：队列侧最长空闲等待（秒），超时发 heartbeat，防止代理断开
-  sse_queue_timeout_s: 15
+  sse_queue_timeout_s: 8  # 缩短 heartbeat 间隔，提升用户体验
   cors_allow_origins:
     - "http://localhost:5173"
     - "http://127.0.0.1:5173"
@@ -18,9 +18,9 @@ harness:
 
   # 路由守卫与低置信度随 suggested_track 的阈值（可微调「效果 vs 快轨」）
   routing_tuning:
-    confidence_track_guard_threshold: 0.6
-    confidence_track_guard_min_prompt_chars: 200
-    low_confidence_suggested_track_threshold: 0.55
+    confidence_track_guard_threshold: 0.52  # 降低阈值，减少不必要的升级
+    confidence_track_guard_min_prompt_chars: 150  # 降低字符数要求
+    low_confidence_suggested_track_threshold: 0.50  # 降低阈值
 
   # Refine 审查层内 <<ACTION: web_search>> 最大轮数
   refine_chain_tuning:
@@ -29,17 +29,19 @@ harness:
   # 流式输出：按标点优先断句（中文体验）
   stream_tuning:
     smart_chunk_boundary: true
+    # Refine L1→L2 过渡期的 content_reset 事件（前端可据此折叠草稿）；不想出现“清空再输出”可关
+    emit_content_reset: true
 
   # Agent：连续高度相似输出时注入纠偏，避免空转
   agent_tuning:
     stuck_loop_guard: true
-    stuck_reply_similarity: 0.96
+    stuck_reply_similarity: 0.88  # 降低阈值，更早检测重复
 
   search:
     tavily_api_key: "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"
     provider: tavily
     fallback: duckduckgo
-    query_enrich: true
+    query_enrich: false  # 关闭自动增强，让 LLM analyzer 生成更精准的 search_query
     search_depth: basic
     max_results: 8
     by_track:
@@ -59,14 +61,13 @@ harness:
     relevance_filter:
       enabled: true
       model: "gpt-5.5"
-      # 效果优先：全轨同步跑检索摘要相关性过滤（可改 quality_tracks + sync_tracks 省小模型调用）
-      sync_default_mode: always
+      # 仅质量轨道同步过滤，fast 轨异步过滤以提升响应速度
+      sync_default_mode: quality_tracks
       sync_tracks:
         - refine
         - agent
-        - fast
     session_cache_ttl_s: 1800
-    session_cache_ttl_freshness_s: 600
+    session_cache_ttl_freshness_s: 180  # 强时效缩短到 3 分钟
     # 会话内检索结果 Redis TTL：强时效 < 显式联网 < 默认（秒）
     session_cache_ttl_required_s: 900
     session_cache_ttl_explicit_s: 1800
@@ -137,10 +138,10 @@ harness:
 
   complexity:
     # 预判 LLM 单次请求超时（秒）、重试次数、整体硬超时（超过则降级为规则预判，避免 SSE 长时间无响应）
-    analyzer_request_timeout_s: 20
-    analyzer_max_retries: 1
-    # 须 ≥ analyzer_request_timeout_s × analyzer_max_retries（适配层每次尝试一轮）
-    analyzer_total_timeout_s: 45
+    analyzer_request_timeout_s: 18
+    analyzer_max_retries: 2  # 2 次重试（共 3 次尝试）
+    # 须 ≥ analyzer_request_timeout_s × (analyzer_max_retries + 1)
+    analyzer_total_timeout_s: 60  # 18 * 3 = 54，留余量
     analysis_cache_ttl_s: 300
     # 非空则强制用于高复杂度自检；留空则自动：推理向 selected_model → reasoning.review[0] → Agent 主模型 → routing 默认
     agent_self_check_model: ""

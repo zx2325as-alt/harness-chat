@@ -5,6 +5,9 @@ from typing import Any, Dict, Optional, AsyncGenerator, List
 
 import httpx
 import asyncio
+import os
+import uuid
+import time
 
 from semantic_utils import is_probably_english
 from utils import Timer, env_get
@@ -21,6 +24,39 @@ def _get_shared_client() -> httpx.AsyncClient:
     if _shared_client is None or _shared_client.is_closed:
         _shared_client = httpx.AsyncClient(limits=_SHARED_LIMITS)
     return _shared_client
+
+
+def _trace_enabled() -> bool:
+    v = str(os.getenv("MODEL_TRACE") or "").strip().lower()
+    return v not in ("", "0", "false", "no", "off")
+
+
+async def _trace_write(event: Dict[str, Any]) -> None:
+    """
+    最小回放日志：JSONL 追加写入，不记录 prompt/messages 正文，避免泄漏与体积爆炸。
+    通过环境变量开启：
+      MODEL_TRACE=1
+      MODEL_TRACE_PATH=...（可选，默认 backend/model_trace.jsonl）
+    """
+    if not _trace_enabled():
+        return
+    try:
+        path = str(os.getenv("MODEL_TRACE_PATH") or "model_trace.jsonl").strip() or "model_trace.jsonl"
+        line = json.dumps({**(event or {}), "ts": time.time()}, ensure_ascii=False)
+    except Exception:
+        return
+
+    def _append() -> None:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            return
+
+    try:
+        await asyncio.to_thread(_append)
+    except Exception:
+        return
 
 def _failure_kind_from_error(exc: BaseException, message: str) -> Optional[str]:
     """供上层回退链决策：限流不重试同一 key，尽快换模型。"""
@@ -120,6 +156,7 @@ class OpenAICompatAdapter(BaseAdapter):
     provider = "openai_compat"
 
     async def ask(self, prompt: str, options: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None) -> AskResult:
+        trace_id = uuid.uuid4().hex[:10]
         base_url = self.cfg.get("base_url", "https://api.openai.com/v1")
         url = _openai_chat_completions_url(str(base_url))
         model = self.cfg.get("model", self.model_name)
@@ -168,6 +205,20 @@ class OpenAICompatAdapter(BaseAdapter):
         max_retries = max(1, int(options.get("max_retries", self.cfg.get("max_retries", 3))))
         last_error = None
         last_failure_kind: Optional[str] = None
+        await _trace_write(
+            {
+                "kind": "ask_request",
+                "trace_id": trace_id,
+                "model_key": self.model_name,
+                "model": str(model),
+                "base_url": str(base_url),
+                "prompt_len": len(prompt or ""),
+                "messages_len": len(messages or []),
+                "temperature": options.get("temperature"),
+                "request_timeout_s": timeout_s,
+                "max_retries": max_retries,
+            }
+        )
         for attempt in range(max_retries):
             try:
                 client = _get_shared_client()
@@ -206,7 +257,7 @@ class OpenAICompatAdapter(BaseAdapter):
                     content = "\n".join(parts)
                 content = str(content).strip()
                 usage = data.get("usage") or {}
-                return AskResult(
+                out = AskResult(
                     success=True,
                     content=content,
                     provider="openai_compat",
@@ -216,6 +267,18 @@ class OpenAICompatAdapter(BaseAdapter):
                     tokens_out=int(usage.get("completion_tokens") or 0),
                     raw={"id": data.get("id")},
                 )
+                await _trace_write(
+                    {
+                        "kind": "ask_response",
+                        "trace_id": trace_id,
+                        "success": True,
+                        "latency_ms": out.latency_ms,
+                        "tokens_in": out.tokens_in,
+                        "tokens_out": out.tokens_out,
+                        "content_len": len(out.content or ""),
+                    }
+                )
+                return out
             except Exception as e:
                 last_error = str(e)
                 last_failure_kind = _failure_kind_from_error(e, last_error)
@@ -228,7 +291,7 @@ class OpenAICompatAdapter(BaseAdapter):
                     await asyncio.sleep(1 * (attempt + 1))
                 continue
 
-        return AskResult(
+        out_fail = AskResult(
             success=False,
             content="",
             provider="openai_compat",
@@ -237,8 +300,20 @@ class OpenAICompatAdapter(BaseAdapter):
             error=last_error or "Unknown error",
             failure_kind=last_failure_kind,
         )
+        await _trace_write(
+            {
+                "kind": "ask_response",
+                "trace_id": trace_id,
+                "success": False,
+                "latency_ms": out_fail.latency_ms,
+                "failure_kind": out_fail.failure_kind,
+                "error": (out_fail.error or "")[:300],
+            }
+        )
+        return out_fail
 
     async def stream(self, prompt: str, options: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None) -> AsyncGenerator[Dict[str, Any], None]:
+        trace_id = uuid.uuid4().hex[:10]
         base_url = self.cfg.get("base_url", "https://api.openai.com/v1")
         url = _openai_chat_completions_url(str(base_url))
         model = self.cfg.get("model", self.model_name)
@@ -282,6 +357,20 @@ class OpenAICompatAdapter(BaseAdapter):
         timeout_s = float(options.get("request_timeout_s", self.cfg.get("timeout_s", 60)))
         max_retries = max(1, int(options.get("max_retries", self.cfg.get("max_retries", 3))))
         last_error = None
+        await _trace_write(
+            {
+                "kind": "stream_request",
+                "trace_id": trace_id,
+                "model_key": self.model_name,
+                "model": str(model),
+                "base_url": str(base_url),
+                "prompt_len": len(prompt or ""),
+                "messages_len": len(messages or []),
+                "temperature": options.get("temperature"),
+                "request_timeout_s": timeout_s,
+                "max_retries": max_retries,
+            }
+        )
         for attempt in range(max_retries):
             try:
                 # We don't retry extensively on stream, just let it fail if it fails immediately
@@ -292,40 +381,93 @@ class OpenAICompatAdapter(BaseAdapter):
                         line = line.strip()
                         if not line:
                             continue
-                        if line.startswith("data:"):
-                            data_str = line[5:].strip()
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                data = json.loads(data_str)
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                
-                                # Standard text delta
-                                content = delta.get("content", "")
-                                
-                                # Handle Reasoning/Think models (like DeepSeek) that might return reasoning_content
-                                reasoning_content = delta.get("reasoning_content", "")
-                                
-                                if content or reasoning_content:
-                                    yield {
-                                        "content": content or "",
-                                        "reasoning_content": reasoning_content or "",
+                        if not line.startswith("data:"):
+                            await _trace_write(
+                                {
+                                    "kind": "stream_anomaly",
+                                    "trace_id": trace_id,
+                                    "type": "non_data_line",
+                                    "sample": line[:120],
+                                }
+                            )
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+
+                            # Standard text delta
+                            content = delta.get("content", "")
+
+                            # Handle Reasoning/Think models (like DeepSeek) that might return reasoning_content
+                            reasoning_content = delta.get("reasoning_content", "")
+
+                            if reasoning_content and not content:
+                                await _trace_write(
+                                    {
+                                        "kind": "stream_anomaly",
+                                        "trace_id": trace_id,
+                                        "type": "reasoning_only_delta",
+                                        "model": str(model),
                                     }
-                            except json.JSONDecodeError:
-                                pass
+                                )
+
+                            if content or reasoning_content:
+                                yield {
+                                    "content": content or "",
+                                    "reasoning_content": reasoning_content or "",
+                                }
+                        except json.JSONDecodeError:
+                            await _trace_write(
+                                {
+                                    "kind": "stream_anomaly",
+                                    "trace_id": trace_id,
+                                    "type": "json_decode_error",
+                                    "sample": data_str[:120],
+                                }
+                            )
                 # 如果成功执行完流，跳出重试循环
                 break
             except Exception as e:
                 last_error = str(e)
                 fk = _failure_kind_from_error(e, last_error)
                 if "401" in last_error or "403" in last_error or "404" in last_error:
+                    await _trace_write(
+                        {
+                            "kind": "stream_response",
+                            "trace_id": trace_id,
+                            "success": False,
+                            "failure_kind": fk,
+                            "error": last_error[:300],
+                        }
+                    )
                     raise Exception(f"请求失败: {last_error}")
                 if fk == "rate_limit":
+                    await _trace_write(
+                        {
+                            "kind": "stream_response",
+                            "trace_id": trace_id,
+                            "success": False,
+                            "failure_kind": fk,
+                            "error": last_error[:300],
+                        }
+                    )
                     raise Exception(f"请求失败: {last_error}")
 
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 * (attempt + 1))
                 else:
+                    await _trace_write(
+                        {
+                            "kind": "stream_response",
+                            "trace_id": trace_id,
+                            "success": False,
+                            "failure_kind": fk,
+                            "error": last_error[:300],
+                        }
+                    )
                     raise Exception(f"服务暂时不可用或网络异常，已重试 {max_retries} 次: {last_error}")
 
 

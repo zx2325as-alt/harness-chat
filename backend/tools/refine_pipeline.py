@@ -185,6 +185,7 @@ async def stream_refine_from_draft(
         l3.get("instruction", ""),
         review_body,
         options=options,
+        messages=messages,
     )
     l3_candidates = refine_models.get("polish") or [default_model]
     opts_l3 = {**options, "temperature": float(l3.get("temperature", 0.3))}

@@ -29,12 +29,14 @@ def _clean_review_body(review_body: str) -> str:
     if not text:
         return ""
 
+    # 优先提取 FINAL_ANSWER 分隔符
     mfb = _RE_FINAL_BLOCK.match(text)
     if mfb:
         body = str(mfb.group(1) or "").strip()
         if body:
             return body
 
+    # 提取修正版答案
     m = re.search(r"(?is)(?:修正版答案|最终答案|答案正文|修正后答案)\s*[:：]\s*", text)
     if m:
         rest = text[m.end() :]
@@ -43,8 +45,11 @@ def _clean_review_body(review_body: str) -> str:
         if body:
             return body
 
-    text = re.sub(r"(?is)^\s*初稿问题清单\s*[:：].*?(?=\n\s*(?:修正版答案|最终答案)|\Z)", "", text)
-    tail_pat = re.compile(r"(?is)(\n\s*(?:仍不确定处|不确定点|问题清单)\s*[:：].*)$")
+    # 删除明确的元语言标记
+    text = re.sub(r"(?is)^\s*【?初稿问题清单】?\s*[:：].*?(?=\n\s*(?:修正版答案|最终答案)|\Z)", "", text)
+
+    # 仅当"仍不确定处"后跟明确的列表格式时才删除，避免误删正文中的"我仍不确定..."表述
+    tail_pat = re.compile(r"(?is)(\n\s*【?(?:仍不确定处|不确定点|问题清单)】?\s*[:：]\s*\n\s*(?:[-•\d]+\.|\d+\)|[一二三四五]、).*)$")
     m2 = tail_pat.search(text)
     if m2 is not None and m2.start() >= max(24, int(len(text) * 0.22)):
         text = text[: m2.start()].strip()

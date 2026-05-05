@@ -330,6 +330,7 @@ async def _prepare_documents_context_block_async(prompt: str, options: Dict[str,
     else:
         bw, ew = bw / s, ew / s
 
+    # 将 BM25 计算改为异步执行，避免阻塞 asyncio 事件循环
     rows = await asyncio.to_thread(_rank_document_rows, options.get("documents"), str(prompt), bm25_weight=bw, embedding_weight=ew)
     meta: Dict[str, Any] = {"ranked": len(rows)}
     if not rows:
@@ -546,51 +547,52 @@ def _normalise_stream_event(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _validate_harness_models(cfg: Dict[str, Any]) -> None:
-    """启动时校验配置中引用的模型名是否已在 models 注册（仅告警，不阻断）。"""
+    """启动时校验配置中引用的模型名是否已在 models 注册（效果优先：直接阻断）。"""
     models = set((cfg.get("models") or {}).keys())
     h = cfg.get("harness") or {}
+    errors: List[str] = []
     cx = h.get("complexity") or {}
     am = str(cx.get("analyzer_model") or "").strip()
     if am and am not in models:
-        print(f"Warning: harness.complexity.analyzer_model not registered: {am!r}")
+        errors.append(f"harness.complexity.analyzer_model -> {am!r}")
     sc = (h.get("search") or {}).get("relevance_filter") or {}
     rm = str(sc.get("model") or "").strip()
     if rm and rm not in models:
-        print(f"Warning: harness.search.relevance_filter.model not registered: {rm!r}")
+        errors.append(f"harness.search.relevance_filter.model -> {rm!r}")
     rt = h.get("routing") or {}
     dm = str(rt.get("default_model") or "").strip()
     if dm and dm not in models:
-        print(f"Warning: harness.routing.default_model not registered: {dm!r}")
+        errors.append(f"harness.routing.default_model -> {dm!r}")
     for mk in rt.get("default_models") or []:
         s = str(mk or "").strip()
         if s and s not in models:
-            print(f"Warning: harness.routing.default_models contains unknown model: {s!r}")
+            errors.append(f"harness.routing.default_models[] -> {s!r}")
     ag = h.get("agent") or {}
     am = str(ag.get("model") or "").strip()
     if am and am not in models:
-        print(f"Warning: harness.agent.model not registered: {am!r}")
+        errors.append(f"harness.agent.model -> {am!r}")
     for _tt, mk in (ag.get("model_by_task_type") or {}).items():
         s = str(mk or "").strip()
         if s and s not in models:
-            print(f"Warning: harness.agent.model_by_task_type.{_tt} unknown model: {s!r}")
+            errors.append(f"harness.agent.model_by_task_type.{_tt} -> {s!r}")
     tpl = h.get("task_model_templates") or {}
     for tt, block in tpl.items():
         if not isinstance(block, dict):
             continue
         sm = str(block.get("selected_model") or "").strip()
         if sm and sm not in models:
-            print(f"Warning: task_model_templates.{tt}.selected_model not registered: {sm!r}")
+            errors.append(f"harness.task_model_templates.{tt}.selected_model -> {sm!r}")
         for fb in block.get("fallback_models") or []:
             s = str(fb or "").strip()
             if s and s not in models:
-                print(f"Warning: task_model_templates.{tt}.fallback_models contains unknown model: {s!r}")
+                errors.append(f"harness.task_model_templates.{tt}.fallback_models[] -> {s!r}")
         rmd = block.get("refine_models") or {}
         if isinstance(rmd, dict):
             for pool in ("draft", "review", "polish"):
                 for mk in rmd.get(pool) or []:
                     s = str(mk or "").strip()
                     if s and s not in models:
-                        print(f"Warning: task_model_templates.{tt}.refine_models.{pool} unknown model: {s!r}")
+                        errors.append(f"harness.task_model_templates.{tt}.refine_models.{pool}[] -> {s!r}")
     allowed_tt = {"conversation", "generation", "reasoning", "code"}
     for tt in (h.get("task_model_templates") or {}).keys():
         if str(tt) not in allowed_tt:
@@ -598,6 +600,9 @@ def _validate_harness_models(cfg: Dict[str, Any]) -> None:
                 f"Warning: task_model_templates has unknown task_type key {tt!r}; "
                 "_merge_task_model_templates will fall back to conversation template."
             )
+    if errors:
+        joined = "\n- " + "\n- ".join(errors[:80])
+        raise ValueError("config.yaml 引用的模型未在 models 注册（已阻断启动）：" + joined)
 
 
 def _warn_analyzer_timeout_budget(cfg: Dict[str, Any]) -> None:
@@ -610,12 +615,13 @@ def _warn_analyzer_timeout_budget(cfg: Dict[str, Any]) -> None:
     except (TypeError, ValueError):
         return
     # OpenAICompatAdapter: for attempt in range(max_retries) → 共 max_retries 次 POST
-    attempts = max(1, retries)
+    # 这里的 analyzer_max_retries 语义为“重试次数”，所以总尝试次数 = 1 + retries
+    attempts = max(1, 1 + max(0, retries))
     floor = req_t * attempts
     if total < floor:
         print(
             f"Warning: harness.complexity.analyzer_total_timeout_s ({total}s) is below "
-            f"analyzer_request_timeout_s × analyzer_max_retries = {floor}s; "
+            f"analyzer_request_timeout_s × (analyzer_max_retries+1) = {floor}s; "
             "asyncio.wait_for may cancel the analyzer before it finishes."
         )
 
@@ -865,6 +871,8 @@ def create_app() -> FastAPI:
 
             async def _produce() -> None:
                 lock_key: Optional[str] = None
+                renew_task: Optional[asyncio.Task] = None
+                renew_stop: Optional[asyncio.Event] = None
                 try:
                     if redis_client and session_id and client_run_id and stream_connect_attempt == 0:
                         lock_key = f"harness:sse_run:{session_id}:{client_run_id}"
@@ -883,6 +891,36 @@ def create_app() -> FastAPI:
                                 }
                             )
                             return
+
+                        # 续期机制：避免长时间流式输出导致锁过期而被误并发
+                        renew_stop = asyncio.Event()
+
+                        async def _renew_lock_loop() -> None:
+                            assert lock_key is not None
+                            while True:
+                                try:
+                                    await asyncio.wait_for(renew_stop.wait(), timeout=300.0)
+                                    return
+                                except asyncio.TimeoutError:
+                                    pass
+                                try:
+                                    # 仅当锁仍归属当前 trace_id 时才续期
+                                    def _renew_if_owner() -> None:
+                                        try:
+                                            val = redis_client.get(lock_key)
+                                            if val is None:
+                                                return
+                                            cur = val.decode("utf-8") if isinstance(val, (bytes, bytearray)) else str(val)
+                                            if cur == trace_id:
+                                                redis_client.expire(lock_key, 1800)
+                                        except Exception:
+                                            return
+
+                                    await asyncio.to_thread(_renew_if_owner)
+                                except Exception:
+                                    return
+
+                        renew_task = asyncio.create_task(_renew_lock_loop())
                     async for ev in harness.run_stream(
                         str(last_prompt_str),
                         messages=historical_messages,
@@ -900,6 +938,16 @@ def create_app() -> FastAPI:
                         }
                     )
                 finally:
+                    if renew_stop:
+                        try:
+                            renew_stop.set()
+                        except Exception:
+                            pass
+                    if renew_task and not renew_task.done():
+                        try:
+                            renew_task.cancel()
+                        except Exception:
+                            pass
                     if lock_key and redis_client:
                         try:
                             await asyncio.to_thread(redis_client.delete, lock_key)

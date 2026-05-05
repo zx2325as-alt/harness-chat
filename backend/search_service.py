@@ -13,10 +13,11 @@ TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
 
 class SearchService:
-    def __init__(self, cfg: Dict[str, Any]):
+    def __init__(self, cfg: Dict[str, Any], redis_client: Any = None):
         self.cfg = cfg
         h = (cfg.get("harness") or {}).get("search") or {}
         self._search_cfg = h
+        self._redis = redis_client
         self.provider = str(h.get("provider", "tavily")).strip().lower()
         self.fallback = str(h.get("fallback", "duckduckgo")).strip().lower()
         if self.fallback in ("", "false", "no", "off"):
@@ -261,9 +262,10 @@ class SearchService:
         override_max_results: Optional[int] = None,
         override_search_depth: Optional[str] = None,
     ) -> Dict[str, Any]:
+        t0 = time.perf_counter()
         query = (query or "").strip()
         if not query:
-            return {
+            out0 = {
                 "context": "",
                 "sources": [],
                 "error": "搜索关键词为空",
@@ -273,6 +275,21 @@ class SearchService:
                 "latency_ms": 0,
                 "attempts": [],
             }
+            if self._redis:
+                asyncio.create_task(
+                    self._log_search_stat(
+                        {
+                            "provider_used": "none",
+                            "success": False,
+                            "failure_code": "EMPTY_QUERY",
+                            "latency_ms": 0,
+                            "result_count": 0,
+                            "query_len": 0,
+                            "ts": time.time(),
+                        }
+                    )
+                )
+            return out0
 
         attempts: List[Dict[str, Any]] = []
 
@@ -288,7 +305,7 @@ class SearchService:
                 }
             )
             if not r.get("ok"):
-                return {
+                out1 = {
                     "context": r.get("context") or "",
                     "sources": [],
                     "error": r.get("error") or "DuckDuckGo 搜索失败",
@@ -298,7 +315,39 @@ class SearchService:
                     "latency_ms": int(r.get("latency_ms") or 0),
                     "attempts": attempts,
                 }
-            return self._finalize_result(r, attempts)
+                if self._redis:
+                    asyncio.create_task(
+                        self._log_search_stat(
+                            {
+                                "provider_used": "duckduckgo",
+                                "success": False,
+                                "failure_code": out1.get("failure_code") or "",
+                                "latency_ms": int((time.perf_counter() - t0) * 1000),
+                                "result_count": 0,
+                                "query_len": len(query),
+                                "ts": time.time(),
+                            }
+                        )
+                    )
+                return out1
+            out_ok = self._finalize_result(r, attempts)
+            if self._redis:
+                asyncio.create_task(
+                    self._log_search_stat(
+                        {
+                            "provider_used": out_ok.get("provider_used") or "duckduckgo",
+                            "success": True,
+                            "failure_code": out_ok.get("failure_code") or "",
+                            "latency_ms": int((time.perf_counter() - t0) * 1000),
+                            "result_count": len(out_ok.get("sources") or []),
+                            "query_len": len(query),
+                            "degraded": bool(out_ok.get("degraded")),
+                            "fallback_from": out_ok.get("fallback_from") or "",
+                            "ts": time.time(),
+                        }
+                    )
+                )
+            return out_ok
 
         r = await self._tavily_search(
             query,
@@ -316,7 +365,24 @@ class SearchService:
         )
 
         if r.get("ok"):
-            return self._finalize_result(r, attempts)
+            out_ok2 = self._finalize_result(r, attempts)
+            if self._redis:
+                asyncio.create_task(
+                    self._log_search_stat(
+                        {
+                            "provider_used": out_ok2.get("provider_used") or "tavily",
+                            "success": True,
+                            "failure_code": out_ok2.get("failure_code") or "",
+                            "latency_ms": int((time.perf_counter() - t0) * 1000),
+                            "result_count": len(out_ok2.get("sources") or []),
+                            "query_len": len(query),
+                            "degraded": bool(out_ok2.get("degraded")),
+                            "fallback_from": out_ok2.get("fallback_from") or "",
+                            "ts": time.time(),
+                        }
+                    )
+                )
+            return out_ok2
 
         if self.fallback == "duckduckgo":
             r2 = await self._duckduckgo_search(query, override_max_results=override_max_results)
@@ -332,9 +398,26 @@ class SearchService:
             if r2.get("ok"):
                 meta = dict(r2)
                 meta["fallback_from"] = r.get("failure_code") or "tavily"
-                return self._finalize_result(meta, attempts)
+                out_ok3 = self._finalize_result(meta, attempts)
+                if self._redis:
+                    asyncio.create_task(
+                        self._log_search_stat(
+                            {
+                                "provider_used": out_ok3.get("provider_used") or "duckduckgo",
+                                "success": True,
+                                "failure_code": out_ok3.get("failure_code") or "",
+                                "latency_ms": int((time.perf_counter() - t0) * 1000),
+                                "result_count": len(out_ok3.get("sources") or []),
+                                "query_len": len(query),
+                                "degraded": bool(out_ok3.get("degraded")),
+                                "fallback_from": out_ok3.get("fallback_from") or "",
+                                "ts": time.time(),
+                            }
+                        )
+                    )
+                return out_ok3
 
-        return {
+        out_fail = {
             "context": r.get("context") or "",
             "sources": r.get("sources") or [],
             "error": r.get("error") or "搜索失败",
@@ -344,6 +427,23 @@ class SearchService:
             "latency_ms": r.get("latency_ms") or 0,
             "attempts": attempts,
         }
+        if self._redis:
+            asyncio.create_task(
+                self._log_search_stat(
+                    {
+                        "provider_used": out_fail.get("provider_used") or "tavily",
+                        "success": False,
+                        "failure_code": out_fail.get("failure_code") or "",
+                        "latency_ms": int((time.perf_counter() - t0) * 1000),
+                        "result_count": len(out_fail.get("sources") or []),
+                        "query_len": len(query),
+                        "degraded": bool(out_fail.get("degraded")),
+                        "fallback_from": out_fail.get("fallback_from") or "",
+                        "ts": time.time(),
+                    }
+                )
+            )
+        return out_fail
 
     def _finalize_result(self, r: Dict[str, Any], attempts: List[Dict[str, Any]]) -> Dict[str, Any]:
         provider = r.get("provider") or "unknown"
@@ -358,3 +458,25 @@ class SearchService:
             "attempts": attempts,
             "fallback_from": r.get("fallback_from"),
         }
+
+    async def _log_search_stat(self, stat: Dict[str, Any]) -> None:
+        """
+        写入 Redis Stream（不影响主路径）。
+        仅记录统计字段，不记录 query/内容，避免泄漏与体积膨胀。
+        """
+        if not self._redis:
+            return
+        try:
+            payload = {k: ("" if v is None else str(v)) for k, v in (stat or {}).items()}
+        except Exception:
+            return
+        try:
+            await asyncio.to_thread(
+                self._redis.xadd,
+                "harness:search:stats",
+                payload,
+                maxlen=5000,
+                approximate=True,
+            )
+        except Exception:
+            return

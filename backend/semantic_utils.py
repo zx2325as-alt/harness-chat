@@ -67,7 +67,9 @@ def _load_sentence_transformer():
     except Exception:
         return None
     try:
-        return SentenceTransformer(_EMBED_MODEL_NAME)
+        # 默认只读本地缓存，避免在启动预热/首请求时阻塞等待 HuggingFace
+        #（若本地没有模型，则直接回退到稀疏向量相似度）
+        return SentenceTransformer(_EMBED_MODEL_NAME, local_files_only=True)
     except Exception:
         return None
 

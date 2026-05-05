@@ -137,13 +137,18 @@ def _build_layer2_prompt(
     return l2_prompt
 
 
-def _build_layer3_prompt(prompt: str, instruction: str, review_body: str) -> str:
+def _build_layer3_prompt(prompt: str, instruction: str, review_body: str, messages: Optional[List[Dict[str, Any]]] = None, *, max_history_chars: int = 2000) -> str:
     review_clean = _clean_review_body(review_body)
-    return (
+    base = (
         f"{instruction.strip()}\n\n"
         f"【原始问题】\n{prompt.strip()}\n\n"
         f"【审查层答案】\n{review_clean}\n"
     )
+    # 添加历史上下文，提升润色质量
+    ht = _format_messages_snippet(messages, 2, max_chars=max_history_chars)
+    if ht:
+        base = f"【近期对话上下文参考】\n{ht}\n\n" + base
+    return base
 
 
 class ModelRegistry:
@@ -170,7 +175,7 @@ class DualTrackHarness:
     def __init__(self, cfg: Dict[str, Any], redis_client: Any = None):
         self.cfg = cfg
         self.registry = ModelRegistry(cfg.get("models", {}))
-        self.search = SearchService(cfg)
+        self.search = SearchService(cfg, redis_client=redis_client)
         self.tools = HarnessTools(self)
         self._redis = redis_client
         self._search_request_cache_prefix = "harness:reqsearch:"
@@ -248,10 +253,11 @@ class DualTrackHarness:
         block = str((options or {}).get("_documents_context_block") or "").strip()
         if not block:
             return prompt
+        # 文档上下文后置：先锚定用户问题，再提供证据，减少“只看文档忽略问题”的偏航
         return (
-            f"{block}\n\n"
-            "请优先基于上述文档回答；涉及文档信息时，尽量标注来自哪份文档或哪段内容。\n\n"
-            f"{prompt}"
+            f"{prompt}\n\n"
+            "【参考文档】以下为你可引用的文档片段，请优先基于这些信息作答；涉及文档信息时尽量标注来自哪份文档或哪段内容。\n\n"
+            f"{block}"
         )
 
     def _build_refine_layer1_prompt(
@@ -306,11 +312,15 @@ class DualTrackHarness:
         review_body: str,
         *,
         options: Optional[Dict[str, Any]] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        max_history_chars: int = 2000,
     ) -> str:
         return _build_layer3_prompt(
             self._attach_documents_to_prompt(question, options),
             instruction,
             _clean_review_body(review_body),
+            messages=messages,
+            max_history_chars=max_history_chars,
         )
 
     def _build_refine_layer2_fallback_text(self, draft_answer: str, entry_block: str = "") -> str:
@@ -469,7 +479,11 @@ class DualTrackHarness:
             search_markers = ("联网", "搜索", "查证", "最新", "今天", "实时", "weather", "news", "stock")
         speculative_search_task = None
         speculative_guess_key = ""
-        if any(mark in sig_base.lower() for mark in [m.lower() for m in search_markers]):
+        # 投机预取增加成本评估：过滤命令、示例、过短输入
+        if (any(mark in sig_base.lower() for mark in [m.lower() for m in search_markers]) and
+            len(sig_base) > 10 and
+            not sig_base.startswith(('/help', '/config', '/clear', '/')) and
+            not any(x in sig_base.lower() for x in ('示例', 'example', 'test', 'demo'))):
             spec_analysis: Dict[str, Any] = {
                 "search_query": "",
                 "search_queries": [],
@@ -631,35 +645,42 @@ class DualTrackHarness:
         *,
         extra_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """预判 JSON 损坏 / LLM 失败时：偏「质量保守」降级（倾向 refine / agent），避免一律 fast。"""
+        """预判 JSON 损坏 / LLM 失败时：改进启发式规则，提高置信度。"""
         text = str(prompt or "")
         low = text.lower()
         has_code = "```" in text or any(k in low for k in ("traceback", "stack trace", "debug", "报错", "异常"))
         length = len(text)
         question_count = text.count("?") + text.count("？")
+
+        # 增加更多特征
+        entities = len(re.findall(r'[\u4e00-\u9fff]{2,4}(?:公司|大学|医院|先生|女士|教授|博士)', text))
+        question_density = question_count / max(1, len(text) / 100)
+
         deep_kw = any(
             k in text
             for k in ("写一篇", "详细分析", "完整方案", "深入分析", "系统阐述", "逐步分析", "证明", "推导", "定理")
         )
-        short_chat = length < 96 and question_count == 0 and not deep_kw and not has_code
+
+        # 更精细的分类
+        short_chat = length < 96 and entities == 0 and question_density < 0.5 and not deep_kw and not has_code
         if short_chat:
             complexity = "low"
             decision = "fast"
             task_type = "conversation"
             suggested_track = "fast"
-            conf = 0.42
-        elif has_code or "def " in low or "class " in low:
+            conf = 0.68  # 提高置信度
+        elif has_code or "def " in low or "class " in low or entities >= 3:
             complexity = "high"
             decision = "refine"
-            task_type = "code"
+            task_type = "code" if has_code else "reasoning"
             suggested_track = "agent"
-            conf = 0.48
+            conf = 0.62
         else:
             complexity = "medium"
             decision = "refine"
             task_type = "reasoning" if question_count >= 1 or length > 180 else "generation"
             suggested_track = "refine"
-            conf = 0.5
+            conf = 0.58
         out = {
             "decision": decision,
             "reasons": list(reasons),
@@ -1120,6 +1141,10 @@ class DualTrackHarness:
         scfg = hcfg.get("search") or {}
         if not bool(scfg.get("query_enrich", True)):
             return base
+        # 仅在确有联网/时效信号时做 enrich，避免噪声扩散影响召回
+        si = str(analysis.get("search_intent") or opts.get("_effective_search_intent") or "none").lower()
+        if si not in ("required", "freshness_required", "explicit"):
+            return base
 
         today = datetime.now().date()
         tomorrow = today + timedelta(days=1)
@@ -1178,7 +1203,8 @@ class DualTrackHarness:
                 break
 
         if extras:
-            base = f"{base} " + " ".join(extras)
+            # 上限：避免过度扩展 query
+            base = f"{base} " + " ".join(extras[:2])
         base = base.strip()
         if str(analysis.get("search_intent") or "").lower() == "freshness_required":
             y = datetime.now().year
@@ -1197,8 +1223,7 @@ class DualTrackHarness:
         anchor_block = f"【用户原话】\n{user_anchor}\n\n" if user_anchor else ""
         return (
             f"{search_context}\n"
-            "【约束】优先采用与用户提问中实体（地点、时间范围、主题等）一致的检索片段；"
-            "若摘要明显指向其他实体或不匹配用户所指范围，勿当作对用户问题的直接证据，应在答复中说明不确定性，并可建议用户收窄表述或改用更权威的本地官方发布渠道核实。\n\n"
+            "【要求】只把与用户所指实体/时间范围一致的片段当作证据；不一致则说明不确定。\n\n"
             f"{anchor_block}"
             "请在答复中对采用的检索内容标注来源序号（如 [1]），并在文末列出引用链接。\n\n"
             f"【用户问题】\n{prompt}"
@@ -1529,6 +1554,10 @@ class DualTrackHarness:
         extra_ctx = ""
         search_loops = 0
         rb = (review_body or "").strip()
+        # 智能停止：连续多轮“无新增信息”则提前终止，减少无效联网与重复审查
+        stagnant_rounds = 0
+        last_sources_sig = ""
+        last_snip_head = ""
         overrides = {k: v for k, v in self._track_search_overrides(track).items() if v is not None}
         for _ in range(self._max_review_web_rounds()):
             wm = RE_AGENT_WS.search(rb)
@@ -1554,6 +1583,28 @@ class DualTrackHarness:
             snip = (sr.get("context") or "")[:review_search_chars]
             rc = len(sr.get("sources") or [])
             yield {"kind": "after_search", "loop": search_loops, "query": q, "sr": sr, "snip": snip, "result_count": rc}
+
+            # 计算“新增信息”签名：urls + snippet 前缀（轻量）
+            try:
+                urls = [str(s.get("url") or "") for s in (sr.get("sources") or []) if isinstance(s, dict)]
+                urls = [u for u in urls if u.strip()]
+                urls_key = "|".join(urls[:10])
+            except Exception:
+                urls_key = ""
+            snip_head = normalize_text(snip)[:800]
+            sources_sig = hashlib.sha256((urls_key + "\n" + snip_head).encode("utf-8")).hexdigest()[:12]
+            if sources_sig and sources_sig == last_sources_sig:
+                stagnant_rounds += 1
+            elif last_snip_head and snip_head and ngram_overlap_ratio(last_snip_head, snip_head) >= 0.92:
+                stagnant_rounds += 1
+            else:
+                stagnant_rounds = 0
+            last_sources_sig = sources_sig or last_sources_sig
+            last_snip_head = snip_head or last_snip_head
+            if stagnant_rounds >= 2:
+                yield {"kind": "early_stop", "loop": search_loops, "reason": "no_new_information"}
+                break
+
             if sr.get("error"):
                 extra_ctx += f"\n\n【联网核查失败】{sr.get('error')}"
             else:
@@ -1884,13 +1935,25 @@ class DualTrackHarness:
     def _agent_plain_text_should_refine(self, analysis: Dict[str, Any]) -> Tuple[bool, str]:
         """
         Agent 轨：本轮无 ACTION 的纯文本是否必须改为草稿走 Review→Polish。
-        条件：高复杂度 / 分析器倾向精化 / 强时效或高风险信号。
+        条件：高复杂度 + 高风险/强时效 / 分析器倾向精化 / 强时效或高风险信号。
         """
         cx = str(analysis.get("complexity") or "low").lower()
         dec = str(analysis.get("decision") or "fast").lower()
         si = str(analysis.get("search_intent") or "none").lower()
+
+        # 仅当高复杂度 +（强时效/高风险/实体混淆/数值敏感/来源敏感）时才强制 refine，避免过度触发
         if cx == "high":
-            return True, "complexity_high"
+            if si in ("required", "freshness_required"):
+                return True, "complexity_high_with_search_intent"
+            if bool(analysis.get("high_risk_domain")):
+                return True, "complexity_high_with_high_risk"
+            if bool(analysis.get("entity_confusion_risk")):
+                return True, "complexity_high_with_entity_confusion"
+            if bool(analysis.get("numeric_sensitive")):
+                return True, "complexity_high_with_numeric_sensitive"
+            if bool(analysis.get("source_sensitive")):
+                return True, "complexity_high_with_source_sensitive"
+
         if dec == "refine":
             return True, "decision_refine"
         if bool(analysis.get("search_required")):
@@ -2859,8 +2922,14 @@ class DualTrackHarness:
                 yield {"event": "error", "error": "Layer 1 failed."}
             return
 
-        # 审查前重置前端内容，L3 润色后输出最终版本
-        yield {"event": "content_reset"}
+        # 审查前：可选发 content_reset（前端可折叠草稿；若不希望出现“清空再输出”，可在 config 关闭）
+        stune = (self.cfg.get("harness") or {}).get("stream_tuning") or {}
+        if bool(stune.get("emit_content_reset", True)):
+            yield {
+                "event": "content_reset",
+                "reason": "draft_to_review",
+                "draft_snapshot": (r1_content or "")[:200],
+            }
 
         # Layer 2（审查；可按 <<ACTION: web_search("...")>> 联网核查后重审；轮数上限见 refine_chain_tuning.max_review_web_rounds）
         yield {"event": "status", "phase": "review", "message": "正在审查答案与必要时联网复核…"}
@@ -3049,6 +3118,7 @@ class DualTrackHarness:
             l3.get("instruction", ""),
             review_body,
             options=options,
+            messages=messages,
         )
         l3_candidates = refine_models.get("polish") or [default_model]
         
@@ -3437,6 +3507,7 @@ class DualTrackHarness:
             l3.get("instruction", ""),
             review_body,
             options=options,
+            messages=messages,
         )
         l3_candidates = refine_models.get("polish") or [default_model]
         r3, a3 = await self._ask_with_fallback(
