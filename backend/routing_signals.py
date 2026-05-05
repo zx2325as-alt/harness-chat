@@ -129,7 +129,7 @@ def _norm_si(v: str) -> str:
     return ""
 
 
-def _norm_suggested_track(v: str) -> str:
+def norm_suggested_track(v: str) -> str:
     x = (v or "").strip().lower()
     if x in ("fast", "refine", "agent"):
         return x
@@ -234,7 +234,7 @@ def apply_suggested_track_on_conflict(signals: Dict[str, Any], analysis: Dict[st
     out = dict(signals)
     if not signals.get("intent_conflict"):
         return out
-    st = _norm_suggested_track(str(analysis.get("suggested_track") or ""))
+    st = norm_suggested_track(str(analysis.get("suggested_track") or ""))
     if st == "fast":
         out["output_intent"] = "fast"
         out["output_intent_source"] = "analyzer_suggested_track"

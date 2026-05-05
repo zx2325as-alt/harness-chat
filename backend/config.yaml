@@ -33,6 +33,12 @@ harness:
     relevance_filter:
       enabled: true
       model: "gpt-5.5"
+    session_cache_ttl_s: 1800
+    session_cache_ttl_freshness_s: 600
+
+  documents:
+    bm25_weight: 0.55
+    embedding_weight: 0.45
 
   fast_answer_cache:
     enabled: false

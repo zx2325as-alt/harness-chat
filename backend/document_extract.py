@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 
 MAX_TEXT_CHARS = 180_000
 CHUNK_SIZE = 6_000
+CHUNK_OVERLAP = 800
 MAX_PDF_PAGES = 80
 MAX_SHEET_ROWS = 2_000
 
@@ -110,13 +111,19 @@ class ExtractedDocument:
         return data
 
 
-def _chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[Dict[str, Any]]:
+def _chunk_text(
+    text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP
+) -> List[Dict[str, Any]]:
     text = (text or "").strip()
     if not text:
         return []
+    ov = max(0, min(overlap, chunk_size // 2))
+    step = max(1, chunk_size - ov)
     chunks = []
-    for idx, start in enumerate(range(0, len(text), chunk_size), start=1):
+    for idx, start in enumerate(range(0, len(text), step), start=1):
         part = text[start : start + chunk_size]
+        if not part:
+            break
         chunks.append({"index": idx, "content": part, "start": start, "end": start + len(part)})
     return chunks
 

@@ -3,10 +3,6 @@ from __future__ import annotations
 
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from search_query_util import validate_search_query
-from tools.parsing import RE_AGENT_WS
-
-
 async def stream_refine_from_draft(
     harness: Any,
     question: str,
@@ -122,84 +118,68 @@ async def stream_refine_from_draft(
             yield s_event
         return
     review_body = _clean_review_body(r2.content or "")
-    extra_ctx = ""
-    review_snip_loop = 0
-    for _round in range(3):
-        wm = RE_AGENT_WS.search(review_body)
-        if not wm:
-            break
-        review_snip_loop += 1
-        q = wm.group(1).strip()
-        yield {
-            "event": "step",
-            "step": {
-                "name": "review_web_search",
-                "status": "running",
-                "meta": _pg(
-                    {
-                        **extra_meta,
-                        "query": q,
-                        "review_round": review_snip_loop,
-                        "phase": "审查内按需检索",
-                        "pipeline_phase": "retrieval",
-                    },
-                    "polishing",
-                    f"审查中联网：第 {review_snip_loop} 轮「{q[:60]}{'…' if len(q) > 60 else ''}」…",
-                ),
-            },
-        }
-        vq, vfc, vreason = validate_search_query(q)
-        if vfc:
-            sr = {
-                "context": "",
-                "sources": [],
-                "error": vreason or vfc,
-                "failure_code": vfc,
-            }
-        else:
-            overrides = harness._track_search_overrides("refine")
-            sr = await harness.perform_web_search(vq, {**options, **{k: v for k, v in overrides.items() if v is not None}})
-        snip = (sr.get("context") or "")[:review_search_chars]
-        rc = len(sr.get("sources") or [])
-        yield {
-            "event": "step",
-            "step": {
-                "name": "review_web_search",
-                "status": "error" if sr.get("error") else "ok",
-                "meta": _pg(
-                    {
-                        **extra_meta,
-                        "query": q,
-                        "review_round": review_snip_loop,
-                        "phase": "审查内按需检索",
-                        "result_count": rc,
-                        "sources": sr.get("sources") or [],
-                        "pipeline_phase": "retrieval",
-                    },
-                    "polishing",
-                    (
-                        f"审查检索完成，约 {rc} 条来源。"
-                        if not sr.get("error")
-                        else f"审查检索失败：{sr.get('error') or 'error'}"
+    async for ev in harness._iter_refine_review_web_rounds(
+        review_body,
+        l2_prompt,
+        l2_candidates,
+        opts_l2,
+        options,
+        review_search_chars,
+        "refine",
+    ):
+        if ev["kind"] == "round_start":
+            review_snip_loop = ev["loop"]
+            q = ev["query"]
+            yield {
+                "event": "step",
+                "step": {
+                    "name": "review_web_search",
+                    "status": "running",
+                    "meta": _pg(
+                        {
+                            **extra_meta,
+                            "query": q,
+                            "review_round": review_snip_loop,
+                            "phase": "审查内按需检索",
+                            "pipeline_phase": "retrieval",
+                        },
+                        "polishing",
+                        f"审查中联网：第 {review_snip_loop} 轮「{q[:60]}{'…' if len(q) > 60 else ''}」…",
                     ),
-                ),
-                "error": sr.get("error"),
-            },
-        }
-        if sr.get("error"):
-            extra_ctx += f"\n\n【联网核查失败】{sr.get('error')}"
-        else:
-            extra_ctx += f"\n\n【联网核查补充】\n{snip}"
-        retry_prompt = (
-            l2_prompt
-            + extra_ctx
-            + "\n\n请结合上述联网信息更新审查结论，若仍需核实可再次输出 <<ACTION: web_search(\"查询词\")>>。"
-        )
-        r2b, _ = await harness._ask_with_fallback(l2_candidates, retry_prompt, opts_l2, messages=None)
-        if r2b.success:
-            review_body = _clean_review_body(r2b.content)
-        else:
-            break
+                },
+            }
+        elif ev["kind"] == "after_search":
+            review_snip_loop = ev["loop"]
+            q = ev["query"]
+            sr = ev["sr"]
+            rc = ev["result_count"]
+            yield {
+                "event": "step",
+                "step": {
+                    "name": "review_web_search",
+                    "status": "error" if sr.get("error") else "ok",
+                    "meta": _pg(
+                        {
+                            **extra_meta,
+                            "query": q,
+                            "review_round": review_snip_loop,
+                            "phase": "审查内按需检索",
+                            "result_count": rc,
+                            "sources": sr.get("sources") or [],
+                            "pipeline_phase": "retrieval",
+                        },
+                        "polishing",
+                        (
+                            f"审查检索完成，约 {rc} 条来源。"
+                            if not sr.get("error")
+                            else f"审查检索失败：{sr.get('error') or 'error'}"
+                        ),
+                    ),
+                    "error": sr.get("error"),
+                },
+            }
+        elif ev["kind"] == "complete":
+            review_body = ev["review_body"]
     l3_prompt = harness._build_refine_layer3_prompt(
         question,
         l3.get("instruction", ""),
@@ -221,7 +201,7 @@ async def stream_refine_from_draft(
         },
     }
     l3_ok = True
-    async for s_event in harness._stream_with_fallback(l3_candidates, l3_prompt, opts_l3, messages=messages):
+    async for s_event in harness._stream_with_fallback(l3_candidates, l3_prompt, opts_l3, messages=None):
         yield s_event
         if s_event.get("event") == "error":
             l3_ok = False

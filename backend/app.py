@@ -166,7 +166,14 @@ def _doc_score(query: str, text: str) -> int:
     return sum(1 for tok in terms if tok in t)
 
 
-def _documents_context(documents: Any, query: str = "", max_total_chars: int = 60_000) -> str:
+def _documents_context(
+    documents: Any,
+    query: str = "",
+    max_total_chars: int = 60_000,
+    *,
+    bm25_weight: float = 0.55,
+    embedding_weight: float = 0.45,
+) -> str:
     if not isinstance(documents, list) or not documents:
         return ""
     pieces = ["【已上传文档内容】"]
@@ -207,7 +214,7 @@ def _documents_context(documents: Any, query: str = "", max_total_chars: int = 6
         emb_scores = batch_semantic_similarity(query, [str(r.get("content") or "")[:2000] for r in top_n])
         for idx, row in enumerate(top_n):
             row["embedding_score"] = float(emb_scores[idx]) if idx < len(emb_scores) else 0.0
-            row["score"] = row.get("score", 0.0) * 0.55 + row.get("embedding_score", 0.0) * 0.45
+            row["score"] = row.get("score", 0.0) * bm25_weight + row.get("embedding_score", 0.0) * embedding_weight
         top_n.sort(key=lambda x: x.get("score", 0), reverse=True)
         ranked = top_n + ranked[20:]
     selected = [r for r in ranked if float(r.get("score", 0) or 0) > 0][:8] if query else []
@@ -239,7 +246,20 @@ def _int_option(options: Dict[str, Any], key: str, default: int, *, minimum: int
 
 def _prepare_documents_context_block(prompt: str, options: Dict[str, Any]) -> str:
     doc_budget = _int_option(options, "doc_context_chars", 40_000, minimum=2_000, maximum=60_000)
-    return _documents_context(options.get("documents"), query=prompt, max_total_chars=doc_budget)
+    bw = float(options.get("_doc_bm25_weight", 0.55))
+    ew = float(options.get("_doc_embedding_weight", 0.45))
+    s = bw + ew
+    if s <= 0:
+        bw, ew = 0.55, 0.45
+    else:
+        bw, ew = bw / s, ew / s
+    return _documents_context(
+        options.get("documents"),
+        query=prompt,
+        max_total_chars=doc_budget,
+        bm25_weight=bw,
+        embedding_weight=ew,
+    )
 
 
 def _ensure_non_empty_prompt(last_prompt: str, hist: List[Dict[str, Any]]) -> None:
@@ -438,7 +458,10 @@ def create_app() -> FastAPI:
             _validate_upload_name(name)
             data = await _read_upload_file_limited(f, max_file_bytes)
             client_file_id = ids[idx] if idx < len(ids) else None
-            cached_doc = _load_document_cache(redis_client, data)
+            if redis_client:
+                cached_doc = await asyncio.to_thread(_load_document_cache, redis_client, data)
+            else:
+                cached_doc = None
             if cached_doc:
                 doc = dict(cached_doc)
                 if client_file_id:
@@ -554,7 +577,12 @@ def create_app() -> FastAPI:
         _ensure_non_empty_prompt(str(last_prompt), hist)
         options["search_prompt_base"] = str(last_prompt)
         options["session_id"] = req.session_id or ""
-        options["_documents_context_block"] = _prepare_documents_context_block(str(last_prompt), options)
+        hdoc = (cfg.get("harness") or {}).get("documents") or {}
+        options["_doc_bm25_weight"] = float(hdoc.get("bm25_weight", 0.55))
+        options["_doc_embedding_weight"] = float(hdoc.get("embedding_weight", 0.45))
+        options["_documents_context_block"] = await asyncio.to_thread(
+            _prepare_documents_context_block, str(last_prompt), options
+        )
         result = await harness.run(str(last_prompt), messages=hist, mode=req.mode, options=options)
         return result
 
@@ -598,7 +626,12 @@ def create_app() -> FastAPI:
 
         options["search_prompt_base"] = str(last_prompt_str)
         options["session_id"] = session_id or ""
-        options["_documents_context_block"] = _prepare_documents_context_block(str(last_prompt_str), options)
+        hdoc = (cfg.get("harness") or {}).get("documents") or {}
+        options["_doc_bm25_weight"] = float(hdoc.get("bm25_weight", 0.55))
+        options["_doc_embedding_weight"] = float(hdoc.get("embedding_weight", 0.45))
+        options["_documents_context_block"] = await asyncio.to_thread(
+            _prepare_documents_context_block, str(last_prompt_str), options
+        )
 
         client_run_id = str(options.get("client_run_id") or "").strip()
         stream_connect_attempt = _int_option(options, "stream_connect_attempt", 0, minimum=0, maximum=20)
