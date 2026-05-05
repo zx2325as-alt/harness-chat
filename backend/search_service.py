@@ -69,11 +69,6 @@ class SearchService:
         digest = hashlib.sha256(norm.encode("utf-8")).hexdigest()
         return f"harness:searchkb:{session_id}:{digest}"
 
-    async def _load_session_cache(self, session_id: str, query: str) -> Optional[Dict[str, Any]]:
-        redis_client = getattr(self.cfg, "get", None) and None
-        redis_client = None
-        return None
-
     async def _tavily_search(
         self,
         query: str,
@@ -107,8 +102,10 @@ class SearchService:
         }
 
         t0 = time.perf_counter()
+        # 单次 HTTP 等待上限：夹在 timeout_s 与 timeout_s_max 之间（原先 max 会把两档都抬高）
+        http_timeout = max(3.0, min(float(self.timeout_s_max), float(self.timeout_s)))
         try:
-            async with httpx.AsyncClient(timeout=max(self.timeout_s, self.timeout_s_max)) as client:
+            async with httpx.AsyncClient(timeout=http_timeout) as client:
                 r = await client.post(TAVILY_SEARCH_URL, json=body)
                 latency_ms = int((time.perf_counter() - t0) * 1000)
                 if r.status_code in (401, 403):

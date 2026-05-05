@@ -8,6 +8,8 @@ server:
 harness:
   # default: auto | fast | refine
   default_mode: "auto"
+  # 非流式兜底与 Agent 直接输出时的字符切片；中文界面可略小于默认 96 以更顺滑
+  stream_slice_chars: 72
 
   search:
     tavily_api_key: "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"
@@ -35,6 +37,9 @@ harness:
       model: "gpt-5.5"
     session_cache_ttl_s: 1800
     session_cache_ttl_freshness_s: 600
+    # 会话内检索结果 Redis TTL：强时效 < 显式联网 < 默认（秒）
+    session_cache_ttl_required_s: 900
+    session_cache_ttl_explicit_s: 1800
 
   documents:
     bm25_weight: 0.55
@@ -77,7 +82,8 @@ harness:
     # 预判 LLM 单次请求超时（秒）、重试次数、整体硬超时（超过则降级为规则预判，避免 SSE 长时间无响应）
     analyzer_request_timeout_s: 20
     analyzer_max_retries: 1
-    analyzer_total_timeout_s: 35
+    # 须 ≥ analyzer_request_timeout_s × analyzer_max_retries（适配层每次尝试一轮）
+    analyzer_total_timeout_s: 45
     analysis_cache_ttl_s: 300
     # 非空则强制用于高复杂度自检；留空则自动：推理向 selected_model → reasoning.review[0] → Agent 主模型 → routing 默认
     agent_self_check_model: ""

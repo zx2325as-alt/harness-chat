@@ -422,9 +422,30 @@ def _normalise_stream_event(event: Dict[str, Any]) -> Dict[str, Any]:
     return event
 
 
+def _warn_analyzer_timeout_budget(cfg: Dict[str, Any]) -> None:
+    h = cfg.get("harness") or {}
+    cpx = h.get("complexity") or {}
+    try:
+        req_t = int(cpx.get("analyzer_request_timeout_s", 20))
+        retries = int(cpx.get("analyzer_max_retries", 1))
+        total = int(cpx.get("analyzer_total_timeout_s", 45))
+    except (TypeError, ValueError):
+        return
+    # OpenAICompatAdapter: for attempt in range(max_retries) → 共 max_retries 次 POST
+    attempts = max(1, retries)
+    floor = req_t * attempts
+    if total < floor:
+        print(
+            f"Warning: harness.complexity.analyzer_total_timeout_s ({total}s) is below "
+            f"analyzer_request_timeout_s × analyzer_max_retries = {floor}s; "
+            "asyncio.wait_for may cancel the analyzer before it finishes."
+        )
+
+
 def create_app() -> FastAPI:
     global redis_client
     cfg = load_yaml(CONFIG_PATH)
+    _warn_analyzer_timeout_budget(cfg)
     redis_client = _init_redis_client(cfg)
     app = FastAPI(title="Harness Chat (Dual-Track)", version="0.1.0")
 

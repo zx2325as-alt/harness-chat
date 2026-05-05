@@ -129,6 +129,7 @@ def _build_layer2_prompt(
         f"【初稿答案】\n{draft_answer.strip()}\n"
         "请先识别你自己对初稿仍不确定、需要补证据的地方，再输出修正版答案；"
         "修正版正文中不要保留“问题清单/修正后答案/仍不确定处”等元语言标题。\n"
+        "（请勿在答案正文中间单独使用行首「仍不确定处：」作为小节标题，以免后处理误截断。）\n"
         "\n如需核实实时数据，可在审查结论中单行输出：<<ACTION: web_search(\"查询词\")>>\n"
     )
     ht = _format_messages_snippet(messages, 4, max_chars=max_history_chars)
@@ -213,6 +214,9 @@ class ModelRegistry:
     def __init__(self, models_cfg: Dict[str, Any]):
         self.models_cfg = models_cfg or {}
         self._adapters = {}
+
+    def is_registered(self, model_key: str) -> bool:
+        return bool(model_key and model_key in self.models_cfg)
 
     def get(self, model_key: str):
         if model_key not in self._adapters:
@@ -816,7 +820,7 @@ class DualTrackHarness:
             candidates.append(selected)
         if isinstance(fallbacks, list):
             candidates.extend(fallbacks)
-            
+
         # Deduplicate while preserving order
         seen = set()
         unique_candidates = []
@@ -825,8 +829,17 @@ class DualTrackHarness:
                 seen.add(c)
                 unique_candidates.append(c)
 
+        def _reg_ok(key: str) -> bool:
+            return bool(key and self.registry.is_registered(key))
+
+        unique_candidates = [c for c in unique_candidates if _reg_ok(str(c))]
+        default_models = [c for c in default_models if _reg_ok(str(c))]
+
         if not unique_candidates:
             unique_candidates = default_models
+        if not unique_candidates:
+            dm = str(default_model or "").strip()
+            unique_candidates = [dm] if _reg_ok(dm) else list(self.registry.models_cfg.keys())[:3]
 
         return {
             "rule": "llm_autonomous_choice",
@@ -849,6 +862,17 @@ class DualTrackHarness:
             return "refine"
         return chosen
 
+    def _registered_model_list(self, keys: Any) -> List[str]:
+        out: List[str] = []
+        if not isinstance(keys, list):
+            return out
+        reg = self.registry.models_cfg or {}
+        for k in keys:
+            s = str(k or "").strip()
+            if s and s in reg:
+                out.append(s)
+        return out
+
     def _merge_task_model_templates(self, analysis: Dict[str, Any]) -> None:
         hcfg = self.cfg.get("harness") or {}
         tpl_root = hcfg.get("task_model_templates") or {}
@@ -856,17 +880,28 @@ class DualTrackHarness:
         tpl = tpl_root.get(tt) or tpl_root.get("conversation") or {}
         if not tpl:
             return
+        sm = str(analysis.get("selected_model") or "").strip()
+        if sm and not self.registry.is_registered(sm):
+            analysis["selected_model_invalid"] = sm
+            analysis["selected_model"] = ""
         if not str(analysis.get("selected_model") or "").strip() and tpl.get("selected_model"):
-            analysis["selected_model"] = tpl["selected_model"]
-        if not analysis.get("fallback_models") and tpl.get("fallback_models"):
-            analysis["fallback_models"] = list(tpl["fallback_models"])
+            cand = str(tpl["selected_model"]).strip()
+            if self.registry.is_registered(cand):
+                analysis["selected_model"] = cand
+        fb = analysis.get("fallback_models")
+        if isinstance(fb, list) and fb:
+            analysis["fallback_models"] = self._registered_model_list(fb)
+        elif not analysis.get("fallback_models") and tpl.get("fallback_models"):
+            analysis["fallback_models"] = self._registered_model_list(tpl["fallback_models"])
         rm = analysis.get("refine_models")
         if not isinstance(rm, dict):
             rm = {}
         rtpl = tpl.get("refine_models") or {}
         for k in ("draft", "review", "polish"):
-            if not rm.get(k) and rtpl.get(k):
-                rm[k] = list(rtpl[k])
+            if rm.get(k):
+                rm[k] = self._registered_model_list(rm[k])
+            elif rtpl.get(k):
+                rm[k] = self._registered_model_list(rtpl[k])
         if rm:
             analysis["refine_models"] = rm
 
@@ -1179,9 +1214,15 @@ class DualTrackHarness:
         scfg = h.get("search") or {}
         base = int(scfg.get("session_cache_ttl_s", 1800))
         fresh_ttl = int(scfg.get("session_cache_ttl_freshness_s", 600))
+        req_ttl = int(scfg.get("session_cache_ttl_required_s", base))
+        expl_ttl = int(scfg.get("session_cache_ttl_explicit_s", base))
         si = str(options.get("_effective_search_intent") or options.get("search_intent") or "none").lower()
         if si == "freshness_required":
             return max(60, fresh_ttl)
+        if si == "required":
+            return max(60, req_ttl)
+        if si == "explicit":
+            return max(60, expl_ttl)
         return max(60, base)
 
     def _search_mandatory(self, analysis: Dict[str, Any], options: Dict[str, Any]) -> bool:
@@ -1590,8 +1631,6 @@ class DualTrackHarness:
         if si in ("required", "freshness_required"):
             if ag_enabled and tt in ("reasoning", "code"):
                 return "agent"
-            if tt == "generation" or cx in ("high", "medium"):
-                return "refine"
             return "refine"
 
         if si == "explicit" and tt == "conversation" and cx == "low":
@@ -1638,7 +1677,9 @@ class DualTrackHarness:
         return any(marker.lower() in text.lower() for marker in markers)
 
     async def _emit_text_chunks(self, text: str, options: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
-        step = max(1, int(options.get("stream_slice_chars") or 96))
+        hcfg = self.cfg.get("harness") or {}
+        default_slice = int(hcfg.get("stream_slice_chars", 72))
+        step = max(1, int(options.get("stream_slice_chars") or default_slice))
         for i in range(0, len(text), step):
             yield {"event": "chunk", "data": {"content": text[i : i + step]}}
             await asyncio.sleep(0)
@@ -1659,7 +1700,7 @@ class DualTrackHarness:
             return True, "search_required"
         if si in ("required", "freshness_required"):
             return True, f"search_intent_{si}"
-        if analysis.get("manual_hits"):
+        if analysis.get("manual_hits") and cx == "high":
             return True, "manual_keyword_trigger"
         raw_type = str(analysis.get("type") or "").lower()
         if raw_type == "web_search":
@@ -1944,7 +1985,12 @@ class DualTrackHarness:
                         "meta": _pg({}, "polishing", "按 Agent 工具调用：进入审查 → 按需联网 → 润色…"),
                     },
                 }
-                yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
+                yield {
+                    "event": "stream_start",
+                    "track": "agent",
+                    "trace_id": trace_id,
+                    "meta": {"stream_phase": "tool_refine"},
+                }
                 refine_ok = True
                 async for ev in self._refine_from_draft_stream(
                     orig_q,
@@ -2124,7 +2170,12 @@ class DualTrackHarness:
                             ),
                         },
                     }
-                yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
+                yield {
+                    "event": "stream_start",
+                    "track": "agent",
+                    "trace_id": trace_id,
+                    "meta": {"stream_phase": "plain_coerce_refine"},
+                }
                 refine_ok = True
                 async for ev in self._refine_from_draft_stream(
                     prompt,
@@ -2159,7 +2210,12 @@ class DualTrackHarness:
                 }
                 return
 
-            yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
+            yield {
+                "event": "stream_start",
+                "track": "agent",
+                "trace_id": trace_id,
+                "meta": {"stream_phase": "direct_answer"},
+            }
             async for ev in self._emit_text_chunks(text, options):
                 yield ev
             return
@@ -2178,7 +2234,12 @@ class DualTrackHarness:
                 ),
             },
         }
-        yield {"event": "stream_start", "track": "agent", "trace_id": trace_id}
+        yield {
+            "event": "stream_start",
+            "track": "agent",
+            "trace_id": trace_id,
+            "meta": {"stream_phase": "fallback_refine"},
+        }
         fb_ok = True
         async for ev in self._refine_from_draft_stream(
             prompt,

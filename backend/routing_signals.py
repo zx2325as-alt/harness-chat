@@ -281,7 +281,7 @@ def reasoning_keyword_boost(prompt: str) -> Tuple[bool, str]:
         return True, "latex"
     if "```" in t:
         return True, "code_block"
-    logic_kw = ("证明", "推导", "如果", "那么", "充要条件", "归纳法", "反证法", "蕴含", "当且仅当")
+    logic_kw = ("证明", "推导", "充要条件", "归纳法", "反证法", "蕴含", "当且仅当")
     if any(k in t for k in logic_kw):
         return True, "logic_keywords"
     debug_kw = (
