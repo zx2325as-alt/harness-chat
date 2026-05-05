@@ -1060,6 +1060,25 @@ export default {
 };
 </script>
 
+<style>
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden; /* 禁止页面级滚动条（外层不许滑动） */
+}
+
+/* 整体缩放：让 UI 更紧凑（90%） */
+#app {
+  transform: scale(0.85);
+  transform-origin: top left;
+  width: calc(100% / 0.85);
+  height: calc(100% / 0.85);
+}
+</style>
+
 <style scoped>
 .layout {
   height: 100%;
@@ -1068,6 +1087,7 @@ export default {
   background: #161b26;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "PingFang SC",
     "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  overflow: hidden;
 }
 .topbar {
   height: 52px;
@@ -1332,6 +1352,31 @@ export default {
   .right {
     max-height: 380px;
     border-top: 1px solid #2f3a4d;
+  }
+}
+
+@media (max-width: 760px) {
+  .topbar {
+    padding: 0 10px;
+    gap: 8px;
+  }
+  .subtitle {
+    display: none;
+  }
+  .sidebar {
+    display: none;
+  }
+  .main {
+    grid-template-columns: 1fr !important;
+  }
+  .right {
+    display: none;
+  }
+  .col-resizer {
+    display: none;
+  }
+  .messages {
+    padding: 14px 14px;
   }
 }
 </style>

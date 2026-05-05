@@ -502,8 +502,16 @@ class DualTrackHarness:
             search_markers = ("联网", "搜索", "查证", "最新", "今天", "实时", "weather", "news", "stock")
         speculative_search_task = None
         speculative_guess_key = ""
+        # 全局不联网：禁止投机预取，避免任何后台检索请求
+        global_no_search = str(options.get("search_mode") or options.get("search") or "auto").lower() in (
+            "off",
+            "false",
+            "0",
+            "disabled",
+        )
         # 投机预取增加成本评估：过滤命令、示例、过短输入
-        if (any(mark in sig_base.lower() for mark in [m.lower() for m in search_markers]) and
+        if (not global_no_search and
+            any(mark in sig_base.lower() for mark in [m.lower() for m in search_markers]) and
             len(sig_base) > 10 and
             not sig_base.startswith(('/help', '/config', '/clear', '/')) and
             not any(x in sig_base.lower() for x in ('示例', 'example', 'test', 'demo'))):
@@ -1516,6 +1524,19 @@ class DualTrackHarness:
 
     async def perform_web_search(self, query: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         options = options or {}
+        # 全局不联网最高优先级：前端 search_mode=off 时，任何轨道/任何阶段都不得发出外部检索请求
+        mode = str(options.get("search_mode") or options.get("search") or "auto").lower()
+        if mode in ("off", "false", "0", "disabled"):
+            return {
+                "context": "",
+                "sources": [],
+                "error": "全局已关闭联网搜索（search_mode=off）",
+                "failure_code": "SEARCH_DISABLED",
+                "degraded": True,
+                "provider_used": "none",
+                "latency_ms": 0,
+                "attempts": [],
+            }
         vq, fc, reason = validate_search_query((query or "").strip())
         if fc:
             return {

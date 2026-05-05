@@ -1,6 +1,7 @@
 <template>
   <div class="msg" :class="{ user: role === 'user', assistant: role !== 'user' }">
-    <div class="bubble" :class="{ 'user-bubble': role === 'user' }">
+    <div class="bubble-wrap">
+      <div class="bubble" :class="{ 'user-bubble': role === 'user' }">
       <div class="meta" v-if="role !== 'user' && meta && !meta.pending">
         <span v-if="meta.track" class="pill" :title="metaTitle">{{ meta.track }}</span>
         <span v-if="meta.provider" class="pill">{{ meta.provider }}</span>
@@ -32,11 +33,12 @@
         <pre v-else-if="meta?.streaming" class="stream-plain">{{ textContent }}</pre>
         <div v-else v-html="renderedContent"></div>
       </div>
-
+    </div>
+      <!-- 操作按钮放到气泡框外（参考图2） -->
       <div class="actions" v-if="!meta?.pending && !meta?.streaming && role !== 'system'">
-        <button class="action-btn" v-if="role === 'user'" @click="$emit('edit')">编辑</button>
-        <button class="action-btn" v-if="role === 'assistant'" @click="$emit('regenerate')">重新生成</button>
-        <button v-if="role === 'assistant' && meta?.stopped" class="action-btn" @click="$emit('retry')">重试</button>
+        <button class="action-btn" v-if="role === 'user'" @click="$emit('edit')" title="编辑">编辑</button>
+        <button class="action-btn" v-if="role === 'assistant'" @click="$emit('regenerate')" title="重新生成">重新生成</button>
+        <button v-if="role === 'assistant' && meta?.stopped" class="action-btn" @click="$emit('retry')" title="重试">重试</button>
       </div>
     </div>
   </div>
@@ -105,8 +107,18 @@ export default {
 .msg.assistant {
   justify-content: flex-start;
 }
-.bubble {
+.bubble-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
   max-width: min(92%, 720px);
+}
+.msg.user .bubble-wrap {
+  align-items: flex-end;
+}
+.bubble {
+  width: 100%;
 }
 .bubble.user-bubble {
   background: #2f3a4d;
@@ -180,11 +192,11 @@ export default {
 .actions {
   display: flex;
   gap: 8px;
-  margin-top: 10px;
   opacity: 0;
   transition: opacity 0.15s;
 }
-.msg:hover .actions {
+.msg:hover .actions,
+.actions:focus-within {
   opacity: 1;
 }
 .action-btn {
