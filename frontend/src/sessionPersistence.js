@@ -89,6 +89,10 @@ export function resolveLoadedSessionsState(idbRaw, localRaw) {
   return { ...parsedState, parseFailures };
 }
 
+export function shouldAutoPersistRecoveredEmptySession(loadedState) {
+  return !((loadedState?.parseFailures || []).length >= 2);
+}
+
 function cloneSessionsForPrune(sessions) {
   return Array.isArray(sessions)
     ? sessions.map((session) => ({

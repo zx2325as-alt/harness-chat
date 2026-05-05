@@ -46,8 +46,15 @@ async def stream_refine_from_draft(
         extra_review_context=extra_review_context,
     )
     l2_candidates = refine_models.get("review") or [default_model]
+    polish_pool = refine_models.get("polish") or [default_model]
     opts_l2 = {**options, "temperature": float(l2.get("temperature", 0.1))}
-    r2, a2 = await harness._ask_with_fallback(l2_candidates, l2_prompt, opts_l2, messages=None)
+    r2, a2, polish_ok, polish_tried = await harness._refine_layer2_ask_with_polish_rescue(
+        l2_candidates,
+        l2_prompt,
+        opts_l2,
+        polish_pool,
+        default_model,
+    )
     step_l2 = Step(
         name="refine_layer2_review",
         status="ok" if r2.success else "error",
@@ -64,12 +71,32 @@ async def stream_refine_from_draft(
                 "candidates": l2_candidates,
                 "from_agent": True,
                 "pipeline_phase": "review",
+                "polish_rescue_attempted": polish_tried,
+                "polish_rescue_recovered": polish_ok,
             },
             "polishing",
             "审查层：对照草稿与自检要点核对事实与结构…",
         ),
     )
     yield {"event": "step", "step": step_l2.to_dict()}
+    if polish_ok:
+        yield {
+            "event": "step",
+            "step": {
+                "name": "refine_layer2_polish_rescue",
+                "status": "ok",
+                "meta": _pg(
+                    {
+                        **extra_meta,
+                        "model": r2.model,
+                        "pipeline_phase": "review",
+                        "from_agent": True,
+                    },
+                    "polishing",
+                    "审查模型池失败，已由润色模型池完成同任务补救。",
+                ),
+            },
+        }
     if not r2.success:
         fallback_text = harness._build_refine_layer2_fallback_text(draft_text, "")
         yield {"event": "status", "phase": "fallback", "message": "审查层失败，已回退到草稿结果…"}

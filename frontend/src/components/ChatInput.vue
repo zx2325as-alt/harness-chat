@@ -161,7 +161,6 @@ const SEARCH_OPTIONS = [
   { value: "on", label: "开启（快轨）" },
   { value: "off", label: "关闭（快轨）" },
 ];
-const MAX_ATTACHMENT_FILES = 6;
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const UPLOAD_CONCURRENCY = 3;
 const SUPPORTED_DOCUMENT_EXTS = [
@@ -492,7 +491,6 @@ export default {
     appendFolderDocuments(documents) {
       const existingDocSigs = this.existingDocumentPayloadSignatures();
       const selectedDocSigs = new Set();
-      let remainingSlots = Math.max(0, MAX_ATTACHMENT_FILES - this.currentDocumentCount());
       (documents || []).forEach((doc) => {
         if (!doc || !doc.name) return;
         const docSig = this.documentPayloadSignature(doc);
@@ -503,14 +501,6 @@ export default {
           );
           return;
         }
-        if (remainingSlots <= 0) {
-          this.createLocalErrorAttachment(
-            { name: doc.name, type: "" },
-            `导入文件数量超过限制，当前最多支持 ${MAX_ATTACHMENT_FILES} 个文档。`
-          );
-          return;
-        }
-        remainingSlots -= 1;
         if (docSig) selectedDocSigs.add(docSig);
         this.attachments.push({
           id: this.newAttachmentId(),
@@ -526,14 +516,6 @@ export default {
     },
     async readLocalFolder() {
       if (this.uiBusy) return;
-      const remainingSlots = Math.max(0, MAX_ATTACHMENT_FILES - this.currentDocumentCount());
-      if (remainingSlots <= 0) {
-        this.createLocalErrorAttachment(
-          { name: "本地文件夹", type: "" },
-          `导入文件数量超过限制，当前最多支持 ${MAX_ATTACHMENT_FILES} 个文档。`
-        );
-        return;
-      }
       const folderPath = window.prompt("请输入服务端本地文件夹路径", "");
       if (folderPath == null) return;
       const normalizedPath = String(folderPath).trim();
@@ -547,7 +529,6 @@ export default {
           body: JSON.stringify({
             folder_path: normalizedPath,
             recursive,
-            max_files: remainingSlots,
           }),
         });
         if (!res.ok) {
@@ -628,7 +609,6 @@ export default {
       const existingSigs = this.existingAttachmentSignatures();
       const selectedSigs = new Set();
       const readyFiles = [];
-      let remainingSlots = Math.max(0, MAX_ATTACHMENT_FILES - this.currentDocumentCount());
 
       for (const file of list) {
         const signature = this.attachmentSignature(file);
@@ -656,11 +636,6 @@ export default {
           );
           continue;
         }
-        if (remainingSlots <= 0) {
-          this.createLocalErrorAttachment(file, `上传文件数量超过限制，当前最多支持 ${MAX_ATTACHMENT_FILES} 个文档。`);
-          continue;
-        }
-        remainingSlots -= 1;
         readyFiles.push(file);
       }
 

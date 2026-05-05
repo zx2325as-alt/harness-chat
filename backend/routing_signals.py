@@ -78,19 +78,13 @@ ENTITY_CONFUSION_KW = (
     "还是",
 )
 NUMERIC_SENSITIVE_KW = (
-    "多少",
-    "数字",
-    "比例",
-    "百分比",
-    "营收",
-    "收入",
-    "利润",
-    "市值",
-    "排名",
-    "票房",
-    "用户数",
-    "下载量",
-    "销量",
+    "具体数字",
+    "准确数字",
+    "数据是多少",
+    "数字是多少",
+    "具体数据",
+    "最新数据",
+    "最新数字",
 )
 SOURCE_SENSITIVE_KW = (
     "来源",
@@ -125,6 +119,7 @@ NUMERIC_METRIC_KW = (
     "数据",
 )
 NUMERIC_WEAK_QUERY_KW = ("几", "多少", "多大", "多高", "多低")
+NUMERIC_TIME_KW = ("最新", "当前", "今年", "去年", "本月", "本周", "最近", "实时")
 
 
 def _norm_si(v: str) -> str:
@@ -177,10 +172,8 @@ def detect_search_sensitivity(prompt: str) -> Dict[str, Any]:
         numeric_hits.append("weak_query+metric")
     elif re.search(r"\d", t) and any(metric in t for metric in NUMERIC_METRIC_KW):
         numeric_hits.append("number+metric")
-
-    for k in NUMERIC_METRIC_KW:
-        if k in t and k not in numeric_hits:
-            numeric_hits.append(k)
+    elif any(metric in t for metric in NUMERIC_METRIC_KW) and any(flag in t for flag in NUMERIC_TIME_KW):
+        numeric_hits.append("metric+time")
     for k in SOURCE_SENSITIVE_KW:
         if k in t:
             source_hits.append(k)
@@ -265,6 +258,13 @@ def merge_signals_into_analysis(
     out["high_risk_domain"] = hr
     out["high_risk_hits"] = hits
     out.update(sensitivity)
+    cur_si = str(out.get("search_intent") or "none").lower()
+    if (out.get("numeric_sensitive") or out.get("source_sensitive")) and cur_si in (
+        "none",
+        "optional",
+        "",
+    ):
+        out["search_intent"] = "required"
     return out
 
 

@@ -418,7 +418,6 @@ def create_app() -> FastAPI:
         files: List[UploadFile] = File(...),
         client_file_ids: Optional[List[str]] = Form(None),
     ) -> Dict[str, Any]:
-        max_files = _int_option(cfg.get("server") or {}, "upload_max_files", DEFAULT_MAX_UPLOAD_FILES, minimum=1, maximum=20)
         max_file_bytes = _int_option(
             cfg.get("server") or {},
             "upload_max_file_bytes",
@@ -426,8 +425,6 @@ def create_app() -> FastAPI:
             minimum=256 * 1024,
             maximum=50 * 1024 * 1024,
         )
-        if len(files) > max_files:
-            raise HTTPException(status_code=400, detail=f"上传文件数量超过限制：最多 {max_files} 个")
         documents = []
         ids = list(client_file_ids or [])
         for idx, f in enumerate(files):
@@ -460,14 +457,14 @@ def create_app() -> FastAPI:
         payload:
           folder_path: str          必填，绝对或相对路径
           recursive:   bool = True  是否递归子目录
-          max_files:   int  = 50    最多文件数
+          max_files:   int  = 0     最多文件数；<= 0 表示不限制
         """
         folder_path = str(payload.get("folder_path") or "").strip()
         if not folder_path:
             raise HTTPException(status_code=400, detail="folder_path 不能为空")
 
         recursive = bool(payload.get("recursive", True))
-        max_files = min(int(payload.get("max_files", 50)), 200)
+        max_files = int(payload.get("max_files", 0) or 0)
 
         try:
             result = await load_folder_documents(

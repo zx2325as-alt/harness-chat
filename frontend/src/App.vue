@@ -129,7 +129,12 @@ import {
   stepSignature as getStepSignature,
   userContentToPrompt as contentToPrompt,
 } from "./chatShared.js";
-import { loadSessionsState, persistSessionsState, pruneSessionsForQuota } from "./sessionPersistence.js";
+import {
+  loadSessionsState,
+  persistSessionsState,
+  pruneSessionsForQuota,
+  shouldAutoPersistRecoveredEmptySession,
+} from "./sessionPersistence.js";
 
 /** SSE 在这么长时间内完全无事件则客户端主动断开（有 step/status 等即会刷新） */
 const CHAT_STREAM_IDLE_MS = 180000;
@@ -230,7 +235,7 @@ export default {
         if ((loaded.parseFailures || []).length >= 2) {
           this.chatBanner = "本地历史加载失败，已自动创建新会话；原有本地存储数据可能已损坏。";
         }
-        this.createNewSession();
+        this.createNewSession({ persist: shouldAutoPersistRecoveredEmptySession(loaded) });
       } else {
         const preferredId = loaded.currentSessionId;
         this.currentSessionId =
@@ -332,12 +337,14 @@ export default {
         this.scrollToBottom();
       });
     },
-    createNewSession() {
+    createNewSession(options = {}) {
       if (this.interactionBusy) return;
       const newSession = this._makeBlankSession();
       this.sessions.unshift(newSession);
       this.currentSessionId = newSession.id;
-      this.scheduleSaveSessions();
+      if (options.persist !== false) {
+        this.scheduleSaveSessions();
+      }
     },
     selectSession(id) {
       if (this.interactionBusy) return;

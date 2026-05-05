@@ -131,20 +131,18 @@ def _clean_review_body(review_body: str) -> str:
     text = str(review_body or "").strip()
     if not text:
         return ""
-    patterns = [
-        r"(?is)^\s*1[\)\.、:].*?(?=(?:\n\s*2[\)\.、:])|\Z)",
-        r"(?is)^\s*初稿问题清单.*?(?=(?:\n\s*(?:2[\)\.、:]|修正版答案|最终答案))|\Z)",
-        r"(?is)\n\s*(?:仍不确定处|不确定点|问题清单|初稿问题)\s*[:：].*$",
-    ]
-    for pattern in patterns:
-        text = re.sub(pattern, "", text).strip()
+
     match = re.search(
         r"(?is)(?:修正版答案|最终答案|答案正文|修正后答案)\s*[:：]\s*(.+?)(?:\n\s*(?:仍不确定处|不确定点)\s*[:：].*)?$",
         text,
     )
     if match:
         return match.group(1).strip()
-    return text
+
+    text = re.sub(r"(?is)^\s*初稿问题清单\s*[:：].*?(?=\n\s*(?:修正版答案|最终答案)|\Z)", "", text)
+    text = re.sub(r"(?is)\n\s*(?:仍不确定处|不确定点|问题清单)\s*[:：].*$", "", text)
+
+    return text.strip()
 
 
 def _build_layer3_prompt(prompt: str, instruction: str, review_body: str) -> str:
@@ -371,6 +369,45 @@ class DualTrackHarness:
         if not entry:
             return draft
         return f"{draft}\n\n{entry}".strip()
+
+    async def _refine_layer2_ask_with_polish_rescue(
+        self,
+        l2_candidates: List[str],
+        l2_prompt: str,
+        layer_opts: Dict[str, Any],
+        polish_candidates: List[str],
+        default_model: str,
+    ) -> Tuple[Any, List[Dict[str, Any]], bool, bool]:
+        """
+        审查层：review 模型池全部失败后，用 polish 模型池同任务补救。
+        返回 (result, attempts, recovered_via_polish, attempted_polish_rescue)。
+        """
+        r2, attempts = await self._ask_with_fallback(l2_candidates, l2_prompt, layer_opts, messages=None)
+        if r2.success:
+            return r2, attempts, False, False
+        polish_pool = [str(m).strip() for m in (polish_candidates or []) if str(m).strip()]
+        if not polish_pool:
+            polish_pool = [str(default_model).strip() or "gpt-5.5"]
+        seen = set(l2_candidates)
+        rescue = [m for m in polish_pool if m not in seen]
+        if not rescue:
+            rescue = polish_pool
+        r3, att2 = await self._ask_with_fallback(rescue, l2_prompt, layer_opts, messages=None)
+        merged = (attempts or []) + (att2 or [])
+        if r3.success:
+            return r3, merged, True, True
+        return r2, merged, False, True
+
+    def _resolve_agent_model(self, hcfg: Dict[str, Any], analysis: Dict[str, Any], routing_default: str) -> str:
+        acfg = hcfg.get("agent") or {}
+        base = str(acfg.get("model") or analysis.get("selected_model") or routing_default or "").strip()
+        by_tt = acfg.get("model_by_task_type") or {}
+        tt = str(analysis.get("task_type") or "").strip().lower()
+        if isinstance(by_tt, dict) and tt:
+            pick = str(by_tt.get(tt) or "").strip()
+            if pick:
+                return pick
+        return base or routing_default
 
     def _fast_cache_scope(self, options: Dict[str, Any]) -> str:
         return json.dumps(
@@ -606,15 +643,19 @@ class DualTrackHarness:
                 
                 try:
                     data = json.loads(content)
-                    complexity = data.get("complexity", "low").lower()
+                    complexity = str(data.get("complexity", "low") or "low").lower()
+                    if complexity not in ("low", "medium", "high"):
+                        complexity = "low"
                     selected_model = data.get("selected_model", "")
                     fallback_models = data.get("fallback_models", [])
                     refine_models = data.get("refine_models", {})
                     reason = data.get("reason", "")
                     decision = str(data.get("decision", "") or "").strip().lower()
                     if decision not in ("fast", "refine"):
-                        decision = "refine" if complexity == "high" else "fast"
+                        decision = "refine" if complexity in ("high", "medium") else "fast"
                     task_type = str(data.get("task_type") or "").strip().lower()
+                    if task_type not in ("conversation", "generation", "reasoning", "code"):
+                        task_type = ""
                     if not task_type:
                         task_type = self._infer_task_type_from_json(data)
 
@@ -1373,7 +1414,9 @@ class DualTrackHarness:
     def _infer_task_type_from_json(self, data: Dict[str, Any]) -> str:
         """当模型未返回 task_type 时，由 complexity/type 推断。"""
         raw_type = str(data.get("type") or "").lower()
-        if raw_type in ("math_logic", "code"):
+        if raw_type == "code":
+            return "code"
+        if raw_type in ("math_logic",):
             return "reasoning"
         if raw_type in ("writing", "web_search", "document_qa"):
             return "generation"
@@ -1420,12 +1463,12 @@ class DualTrackHarness:
         if oi == "fast":
             return "fast"
         if oi == "deep":
-            if ag_enabled and tt == "reasoning":
+            if ag_enabled and tt in ("reasoning", "code"):
                 return "agent"
             return "refine"
 
         if si in ("required", "freshness_required"):
-            if ag_enabled and tt == "reasoning":
+            if ag_enabled and tt in ("reasoning", "code"):
                 return "agent"
             if tt == "generation" or cx in ("high", "medium"):
                 return "refine"
@@ -1436,9 +1479,9 @@ class DualTrackHarness:
             if dec == "fast":
                 return "refine"
 
-        if ag_enabled and tt == "reasoning":
+        if ag_enabled and tt in ("reasoning", "code"):
             return "agent"
-        if tt == "reasoning" and not ag_enabled:
+        if tt in ("reasoning", "code") and not ag_enabled:
             analysis["fallback_reason"] = "agent_disabled_by_config"
             analysis["agent_disabled_fallback"] = True
             return "refine"
@@ -1576,7 +1619,7 @@ class DualTrackHarness:
         acfg = hcfg.get("agent") or {}
         routing = hcfg.get("routing") or {}
         default_model = routing.get("default_model", "gpt-5.5")
-        agent_model = acfg.get("model") or analysis.get("selected_model") or default_model
+        agent_model = self._resolve_agent_model(hcfg, analysis, default_model)
         max_map = acfg.get("max_iterations_by_complexity") or {}
         cx = str(analysis.get("complexity") or "low").lower()
         max_iter = int(max_map.get(cx) or acfg.get("max_iterations", 5))
@@ -2311,8 +2354,13 @@ class DualTrackHarness:
         )
 
         l2_candidates = refine_models.get("review") or [default_model]
-        r2, a2 = await self._ask_with_fallback(
-            l2_candidates, l2_prompt, self._layer_opts(hcfg, "layer2", options), messages=None
+        polish_pool = refine_models.get("polish") or [default_model]
+        r2, a2, l2_polish_recovered, l2_polish_tried = await self._refine_layer2_ask_with_polish_rescue(
+            l2_candidates,
+            l2_prompt,
+            self._layer_opts(hcfg, "layer2", options),
+            polish_pool,
+            default_model,
         )
         if not r2.success:
             fallback_text = self._build_refine_layer2_fallback_text(r1_content, entry_block)
@@ -2324,7 +2372,16 @@ class DualTrackHarness:
                 latency_ms=r2.latency_ms,
                 input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
                 error=r2.error,
-                meta=_pg({"attempts": a2, "candidates": l2_candidates}, "refine", "审查层调用失败。"),
+                meta=_pg(
+                    {
+                        "attempts": a2,
+                        "candidates": l2_candidates,
+                        "polish_rescue_attempted": l2_polish_tried,
+                        "polish_rescue_recovered": l2_polish_recovered,
+                    },
+                    "refine",
+                    "审查层调用失败（含润色池补救未成功）。" if l2_polish_tried else "审查层调用失败。",
+                ),
             )
             steps.append(step_l2)
             yield {"event": "step", "step": step_l2.to_dict()}
@@ -2351,6 +2408,19 @@ class DualTrackHarness:
             return
 
         review_body = (r2.content or "").strip()
+        if l2_polish_recovered:
+            yield {
+                "event": "step",
+                "step": {
+                    "name": "refine_layer2_polish_rescue",
+                    "status": "ok",
+                    "meta": _pg(
+                        {"phase": "审查层 · 润色池补救", "model": r2.model},
+                        "refine",
+                        "审查模型池失败，已由润色模型池完成同任务补救。",
+                    ),
+                },
+            }
         extra_ctx = ""
         search_loops = 0
         for _ in range(3):
@@ -2720,8 +2790,13 @@ class DualTrackHarness:
             options=options,
         )
         l2_candidates = refine_models.get("review") or [default_model]
-        r2, a2 = await self._ask_with_fallback(
-            l2_candidates, l2_prompt, self._layer_opts(hcfg, "layer2", options), messages=None
+        polish_pool = refine_models.get("polish") or [default_model]
+        r2, a2, l2_polish_recovered, l2_polish_tried = await self._refine_layer2_ask_with_polish_rescue(
+            l2_candidates,
+            l2_prompt,
+            self._layer_opts(hcfg, "layer2", options),
+            polish_pool,
+            default_model,
         )
         if not r2.success:
             fallback_text = self._build_refine_layer2_fallback_text(r1.content or "", entry_block)
@@ -2734,7 +2809,12 @@ class DualTrackHarness:
                     latency_ms=r2.latency_ms,
                     input_preview=l2_prompt[:240] + ("…" if len(l2_prompt) > 240 else ""),
                     error=r2.error,
-                    meta={"attempts": a2, "candidates": l2_candidates},
+                    meta={
+                        "attempts": a2,
+                        "candidates": l2_candidates,
+                        "polish_rescue_attempted": l2_polish_tried,
+                        "polish_rescue_recovered": l2_polish_recovered,
+                    },
                 )
             )
             steps.append(
@@ -2758,6 +2838,19 @@ class DualTrackHarness:
                 },
                 "steps": [s.to_dict() for s in steps],
             }
+
+        if l2_polish_recovered:
+            steps.append(
+                Step(
+                    name="refine_layer2_polish_rescue",
+                    status="ok",
+                    meta=_pg(
+                        {"phase": "审查层 · 润色池补救", "model": r2.model},
+                        "refine",
+                        "审查模型池失败，已由润色模型池完成同任务补救。",
+                    ),
+                )
+            )
 
         review_body = (r2.content or "").strip()
         extra_ctx = ""
