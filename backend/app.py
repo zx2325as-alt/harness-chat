@@ -24,7 +24,12 @@ from pydantic import BaseModel, Field
 import redis
 
 from harness import DualTrackHarness
-from document_extract import SUPPORTED_DOCUMENT_EXTS, detect_document_ext, extract_document
+from document_extract import (
+    SUPPORTED_DOCUMENT_EXTS,
+    configure_document_limits,
+    detect_document_ext,
+    extract_document,
+)
 from local_docs import load_folder_documents
 from semantic_utils import batch_semantic_similarity
 from utils import load_yaml, new_trace_id, env_get
@@ -84,6 +89,7 @@ class ChatResponse(BaseModel):
     track: str
     final: AskOut
     steps: List[StepOut]
+    meta: Optional[Dict[str, Any]] = None
 
 
 def _content_to_text(content: Any) -> str:
@@ -215,6 +221,13 @@ def _documents_context(
         for idx, row in enumerate(top_n):
             row["embedding_score"] = float(emb_scores[idx]) if idx < len(emb_scores) else 0.0
             row["score"] = row.get("score", 0.0) * bm25_weight + row.get("embedding_score", 0.0) * embedding_weight
+        for row in top_n:
+            name = str(row.get("name") or "")
+            head = str(row.get("content") or "")[:800]
+            bonus = 0.0
+            if query.strip():
+                bonus = 0.028 * min(8, _doc_score(query, name) + _doc_score(query, head))
+            row["score"] = float(row.get("score", 0.0)) + bonus
         top_n.sort(key=lambda x: x.get("score", 0), reverse=True)
         ranked = top_n + ranked[20:]
     selected = [r for r in ranked if float(r.get("score", 0) or 0) > 0][:8] if query else []
@@ -422,6 +435,54 @@ def _normalise_stream_event(event: Dict[str, Any]) -> Dict[str, Any]:
     return event
 
 
+def _validate_harness_models(cfg: Dict[str, Any]) -> None:
+    """启动时校验配置中引用的模型名是否已在 models 注册（仅告警，不阻断）。"""
+    models = set((cfg.get("models") or {}).keys())
+    h = cfg.get("harness") or {}
+    cx = h.get("complexity") or {}
+    am = str(cx.get("analyzer_model") or "").strip()
+    if am and am not in models:
+        print(f"Warning: harness.complexity.analyzer_model not registered: {am!r}")
+    sc = (h.get("search") or {}).get("relevance_filter") or {}
+    rm = str(sc.get("model") or "").strip()
+    if rm and rm not in models:
+        print(f"Warning: harness.search.relevance_filter.model not registered: {rm!r}")
+    rt = h.get("routing") or {}
+    dm = str(rt.get("default_model") or "").strip()
+    if dm and dm not in models:
+        print(f"Warning: harness.routing.default_model not registered: {dm!r}")
+    for mk in rt.get("default_models") or []:
+        s = str(mk or "").strip()
+        if s and s not in models:
+            print(f"Warning: harness.routing.default_models contains unknown model: {s!r}")
+    ag = h.get("agent") or {}
+    am = str(ag.get("model") or "").strip()
+    if am and am not in models:
+        print(f"Warning: harness.agent.model not registered: {am!r}")
+    for _tt, mk in (ag.get("model_by_task_type") or {}).items():
+        s = str(mk or "").strip()
+        if s and s not in models:
+            print(f"Warning: harness.agent.model_by_task_type.{_tt} unknown model: {s!r}")
+    tpl = h.get("task_model_templates") or {}
+    for tt, block in tpl.items():
+        if not isinstance(block, dict):
+            continue
+        sm = str(block.get("selected_model") or "").strip()
+        if sm and sm not in models:
+            print(f"Warning: task_model_templates.{tt}.selected_model not registered: {sm!r}")
+        for fb in block.get("fallback_models") or []:
+            s = str(fb or "").strip()
+            if s and s not in models:
+                print(f"Warning: task_model_templates.{tt}.fallback_models contains unknown model: {s!r}")
+        rmd = block.get("refine_models") or {}
+        if isinstance(rmd, dict):
+            for pool in ("draft", "review", "polish"):
+                for mk in rmd.get(pool) or []:
+                    s = str(mk or "").strip()
+                    if s and s not in models:
+                        print(f"Warning: task_model_templates.{tt}.refine_models.{pool} unknown model: {s!r}")
+
+
 def _warn_analyzer_timeout_budget(cfg: Dict[str, Any]) -> None:
     h = cfg.get("harness") or {}
     cpx = h.get("complexity") or {}
@@ -445,7 +506,9 @@ def _warn_analyzer_timeout_budget(cfg: Dict[str, Any]) -> None:
 def create_app() -> FastAPI:
     global redis_client
     cfg = load_yaml(CONFIG_PATH)
+    configure_document_limits((cfg.get("harness") or {}).get("documents"))
     _warn_analyzer_timeout_budget(cfg)
+    _validate_harness_models(cfg)
     redis_client = _init_redis_client(cfg)
     app = FastAPI(title="Harness Chat (Dual-Track)", version="0.1.0")
 
@@ -660,6 +723,11 @@ def create_app() -> FastAPI:
             k: v for k, v in options.items() if k not in ("client_run_id", "stream_connect_attempt")
         }
         redis_history_items = _redis_history_limit(cfg)
+        try:
+            sse_queue_timeout_s = float((cfg.get("server") or {}).get("sse_queue_timeout_s", 15))
+        except (TypeError, ValueError):
+            sse_queue_timeout_s = 15.0
+        sse_queue_timeout_s = max(5.0, min(120.0, sse_queue_timeout_s))
 
         async def event_generator():
             final_answer = ""
@@ -722,7 +790,7 @@ def create_app() -> FastAPI:
                         break
 
                     try:
-                        event = await asyncio.wait_for(queue.get(), timeout=15)
+                        event = await asyncio.wait_for(queue.get(), timeout=sse_queue_timeout_s)
                     except asyncio.TimeoutError:
                         yield f"data: {json.dumps({'event': 'heartbeat', 'trace_id': trace_id}, ensure_ascii=False)}\n\n"
                         continue

@@ -1,4 +1,6 @@
 server:
+  # SSE：队列侧最长空闲等待（秒），超时发 heartbeat，防止代理断开
+  sse_queue_timeout_s: 15
   cors_allow_origins:
     - "http://localhost:5173"
     - "http://127.0.0.1:5173"
@@ -10,6 +12,28 @@ harness:
   default_mode: "auto"
   # 非流式兜底与 Agent 直接输出时的字符切片；中文界面可略小于默认 96 以更顺滑
   stream_slice_chars: 72
+  features:
+    # 预判 JSON 损坏时追加一次「仅修 JSON」的短调用（质量优先）
+    analyzer_json_repair: true
+
+  # 路由守卫与低置信度随 suggested_track 的阈值（可微调「效果 vs 快轨」）
+  routing_tuning:
+    confidence_track_guard_threshold: 0.6
+    confidence_track_guard_min_prompt_chars: 200
+    low_confidence_suggested_track_threshold: 0.55
+
+  # Refine 审查层内 <<ACTION: web_search>> 最大轮数
+  refine_chain_tuning:
+    max_review_web_rounds: 3
+
+  # 流式输出：按标点优先断句（中文体验）
+  stream_tuning:
+    smart_chunk_boundary: true
+
+  # Agent：连续高度相似输出时注入纠偏，避免空转
+  agent_tuning:
+    stuck_loop_guard: true
+    stuck_reply_similarity: 0.96
 
   search:
     tavily_api_key: "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"
@@ -40,10 +64,29 @@ harness:
     # 会话内检索结果 Redis TTL：强时效 < 显式联网 < 默认（秒）
     session_cache_ttl_required_s: 900
     session_cache_ttl_explicit_s: 1800
+    # 命中任一子串时启动投机预取联网（与 build_search_query 配合）
+    speculative_markers:
+      - "联网"
+      - "搜索"
+      - "查证"
+      - "最新"
+      - "今天"
+      - "实时"
+      - "weather"
+      - "news"
+      - "stock"
+      - "行情"
+      - "汇率"
+      - "政策"
 
   documents:
     bm25_weight: 0.55
     embedding_weight: 0.45
+    max_text_chars: 220000
+    chunk_size: 7000
+    chunk_overlap: 900
+    max_pdf_pages: 100
+    max_sheet_rows: 2500
 
   fast_answer_cache:
     enabled: false
@@ -51,6 +94,8 @@ harness:
     ttl_sec: 86400
     similarity_threshold: 0.92
     max_scan_keys: 400
+    # 先 ngram 过滤再语义相似，减少无效 embedding 调用
+    cheap_ngram_overlap_min: 0.06
 
   task_model_templates:
     reasoning:
@@ -160,6 +205,8 @@ harness:
   # Agent 轨（task_type=reasoning）：思考-行动-观察；工具含联网与 refine_answer 封装
   agent:
     enabled: true
+    # 非流式 /api/chat 是否跑完整 Agent 循环（与 SSE 效果对齐）；false 时仍降级 Refine
+    sync_non_stream_api: true
     model: "gpt-5.5"
     # 覆写默认 agent.model；未列出的 task_type 仍用 model
     model_by_task_type:

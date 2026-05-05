@@ -22,12 +22,23 @@ from routing_signals import (
     reasoning_keyword_boost,
 )
 from search_query_util import soft_degrade_note, validate_search_query
-from semantic_utils import is_probably_english, ngram_overlap_ratio, normalize_text, semantic_similarity
+from semantic_utils import (
+    is_probably_english,
+    ngram_overlap_ratio,
+    normalize_text,
+    semantic_similarity,
+)
 
 from tools.layer import HarnessTools
 from tools.parsing import RE_AGENT_REFINE, RE_AGENT_WS, parse_agent_action
 from tools.refine_pipeline import compile_agent_fallback_draft, stream_refine_from_draft
 
+from json_utils import extract_balanced_json_object, strip_markdown_json_fence
+from stream_chunking import iter_chunk_spans
+
+
+SSE_PROTOCOL_META: Dict[str, Any] = {"protocol_version": 1, "stream_schema": "harness-v1"}
+SYNC_API_META: Dict[str, Any] = {"protocol_version": 1, "api_schema": "harness-sync-v1"}
 
 REFINE_REVIEW_RETRY_SUFFIX = (
     "\n\n请结合上述联网信息更新审查结论；若仍需核实可再次输出 <<ACTION: web_search(\"查询词\")>>。"
@@ -152,7 +163,11 @@ def _clean_review_body(review_body: str) -> str:
             return body
 
     text = re.sub(r"(?is)^\s*初稿问题清单\s*[:：].*?(?=\n\s*(?:修正版答案|最终答案)|\Z)", "", text)
-    text = re.sub(r"(?is)\n\s*(?:仍不确定处|不确定点|问题清单)\s*[:：].*$", "", text)
+    # 仅裁掉「正文末尾」的元信息块，避免误删正文中间的合法用语
+    tail_pat = re.compile(r"(?is)(\n\s*(?:仍不确定处|不确定点|问题清单)\s*[:：].*)$")
+    m2 = tail_pat.search(text)
+    if m2 is not None and m2.start() >= max(24, int(len(text) * 0.22)):
+        text = text[: m2.start()].strip()
 
     return text.strip()
 
@@ -521,9 +536,14 @@ class DualTrackHarness:
             mode = "auto"
 
         cx_cfg = hcfg.get("complexity") or {}
-        analyzer_deadline = float(cx_cfg.get("analyzer_total_timeout_s", 35))
+        analyzer_deadline = float(cx_cfg.get("analyzer_total_timeout_s", 45))
         sig_base = str(options.get("search_prompt_base") or prompt or "").strip()
-        search_markers = ("联网", "搜索", "查证", "最新", "今天", "实时", "weather", "news", "stock")
+        sr_cfg = hcfg.get("search") or {}
+        raw_spec = sr_cfg.get("speculative_markers")
+        if isinstance(raw_spec, list) and any(str(x).strip() for x in raw_spec):
+            search_markers = tuple(str(m).strip().lower() for m in raw_spec if str(m).strip())
+        else:
+            search_markers = ("联网", "搜索", "查证", "最新", "今天", "实时", "weather", "news", "stock")
         speculative_search_task = None
         speculative_guess_key = ""
         if any(mark in sig_base.lower() for mark in [m.lower() for m in search_markers]):
@@ -627,6 +647,164 @@ class DualTrackHarness:
                 hits.append(k)
         return hits
 
+    def _feature_enabled(self, key: str, default: bool = True) -> bool:
+        h = self.cfg.get("harness") or {}
+        feat = h.get("features") or {}
+        return bool(feat.get(key, default))
+
+    def _normalize_analyzer_llm_dict(self, data: Dict[str, Any], raw_llm_response: str) -> Dict[str, Any]:
+        complexity = str(data.get("complexity", "low") or "low").lower()
+        if complexity not in ("low", "medium", "high"):
+            complexity = "low"
+        selected_model = data.get("selected_model", "")
+        fallback_models = data.get("fallback_models", [])
+        refine_models = data.get("refine_models", {})
+        reason = data.get("reason", "")
+        decision = str(data.get("decision", "") or "").strip().lower()
+        if decision not in ("fast", "refine"):
+            decision = "refine" if complexity in ("high", "medium") else "fast"
+        task_type = str(data.get("task_type") or "").strip().lower()
+        if task_type not in ("conversation", "generation", "reasoning", "code"):
+            task_type = ""
+        if not task_type:
+            task_type = self._infer_task_type_from_json(data)
+        try:
+            confidence = float(data.get("confidence", 0.85))
+        except (TypeError, ValueError):
+            confidence = 0.85
+        confidence = max(0.0, min(1.0, confidence))
+        suggested_track = str(data.get("suggested_track") or "").strip().lower()
+        if suggested_track not in ("fast", "refine", "agent", ""):
+            suggested_track = ""
+        raw_search_queries = data.get("search_queries")
+        search_queries: List[str] = []
+        if isinstance(raw_search_queries, list):
+            search_queries = [str(item or "").strip() for item in raw_search_queries if str(item or "").strip()]
+        elif str(data.get("search_query") or "").strip():
+            search_queries = [str(data.get("search_query") or "").strip()]
+        return {
+            "decision": decision,
+            "reasons": [f"llm_reason: {reason}"],
+            "complexity": complexity,
+            "type": data.get("type", "general"),
+            "task_type": task_type,
+            "search_required": bool(data.get("search_required", False)),
+            "search_query": str(data.get("search_query") or ""),
+            "selected_model": selected_model,
+            "fallback_models": fallback_models,
+            "refine_models": refine_models,
+            "reason": reason,
+            "raw_llm_response": raw_llm_response,
+            "confidence": confidence,
+            "suggested_track": suggested_track or None,
+            "search_queries": search_queries,
+        }
+
+    def _analyzer_heuristic_fallback_result(
+        self,
+        prompt: str,
+        reasons: List[str],
+        raw_response: Optional[str],
+        *,
+        extra_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """预判 JSON 损坏 / LLM 失败时：偏「质量保守」降级（倾向 refine / agent），避免一律 fast。"""
+        text = str(prompt or "")
+        low = text.lower()
+        has_code = "```" in text or any(k in low for k in ("traceback", "stack trace", "debug", "报错", "异常"))
+        length = len(text)
+        question_count = text.count("?") + text.count("？")
+        deep_kw = any(
+            k in text
+            for k in ("写一篇", "详细分析", "完整方案", "深入分析", "系统阐述", "逐步分析", "证明", "推导", "定理")
+        )
+        short_chat = length < 96 and question_count == 0 and not deep_kw and not has_code
+        if short_chat:
+            complexity = "low"
+            decision = "fast"
+            task_type = "conversation"
+            suggested_track = "fast"
+            conf = 0.42
+        elif has_code or "def " in low or "class " in low:
+            complexity = "high"
+            decision = "refine"
+            task_type = "code"
+            suggested_track = "agent"
+            conf = 0.48
+        else:
+            complexity = "medium"
+            decision = "refine"
+            task_type = "reasoning" if question_count >= 1 or length > 180 else "generation"
+            suggested_track = "refine"
+            conf = 0.5
+        out = {
+            "decision": decision,
+            "reasons": list(reasons),
+            "complexity": complexity,
+            "type": "code" if has_code else "general",
+            "task_type": task_type,
+            "search_required": False,
+            "search_query": "",
+            "selected_model": "",
+            "fallback_models": [],
+            "refine_models": {},
+            "reason": "；".join(reasons),
+            "raw_llm_response": raw_response,
+            "confidence": conf,
+            "suggested_track": suggested_track,
+            "search_queries": [],
+        }
+        if extra_meta:
+            out.update(extra_meta)
+        return out
+
+    def _parse_analyzer_json_candidates(self, raw_content: str) -> Optional[Dict[str, Any]]:
+        candidates: List[str] = []
+        stripped = strip_markdown_json_fence(raw_content)
+        candidates.append(stripped)
+        if stripped != raw_content.strip():
+            candidates.append(raw_content.strip())
+        bal = extract_balanced_json_object(raw_content)
+        if bal:
+            candidates.append(bal)
+        seen: set[str] = set()
+        for cand in candidates:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            try:
+                return json.loads(cand)
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    async def _repair_analyzer_json_with_llm(self, broken: str, analyzer_model: str, llm_opts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self._feature_enabled("analyzer_json_repair", True):
+            return None
+        snippet = (broken or "")[:6500]
+        prompt = (
+            "下列文本本应是一段 JSON 路由判定，但可能损坏。"
+            "请只输出一个合法 JSON 对象，键需包含："
+            "complexity, decision, task_type, type, search_required, search_query, confidence, "
+            "suggested_track, selected_model, fallback_models, refine_models, reason。"
+            "不要 markdown 围栏，不要解释。\n\n"
+            f"<<<BROKEN>>>\n{snippet}\n<<<END>>>"
+        )
+        ropts = {**llm_opts, "temperature": 0.0, "max_retries": 1}
+        try:
+            rt = float(ropts.get("request_timeout_s", 20))
+        except (TypeError, ValueError):
+            rt = 20.0
+        ropts["request_timeout_s"] = min(14.0, max(5.0, rt))
+        try:
+            adapter = self.registry.get(analyzer_model)
+            res = await adapter.ask(prompt, ropts)
+            if not res.success or not (res.content or "").strip():
+                return None
+            return self._parse_analyzer_json_candidates(res.content)
+        except Exception:
+            return None
+
     async def analyze_complexity(self, prompt: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         hcfg = (self.cfg.get("harness") or {}).get("complexity") or {}
         manual = hcfg.get("manual_triggers") or []
@@ -648,7 +826,6 @@ class DualTrackHarness:
 
         use_llm = bool(hcfg.get("use_llm_analyzer", False))
         if not use_llm:
-            # fallback rule if llm disabled
             length = len(prompt or "")
             return {
                 "decision": "refine" if length > 200 else "fast",
@@ -684,106 +861,53 @@ class DualTrackHarness:
         try:
             adapter = self.registry.get(analyzer_model)
             res = await adapter.ask(full_prompt, llm_opts)
-            if res.success:
-                # Try to parse JSON from the response
-                content = res.content.strip()
-                # Often models wrap json in ```json ... ```
-                json_match = re.search(r"```(?:json)?(.*?)```", content, re.DOTALL)
-                if json_match:
-                    content = json_match.group(1).strip()
-                
+            if not res.success:
+                return self._analyzer_heuristic_fallback_result(
+                    prompt,
+                    ["analyzer_llm_call_failed"],
+                    res.content,
+                    extra_meta={"analyzer_failure": True},
+                )
+
+            data = self._parse_analyzer_json_candidates(res.content or "")
+            repair_attempted = False
+            if data is None and self._feature_enabled("analyzer_json_repair", True):
+                repair_attempted = True
+                data = await self._repair_analyzer_json_with_llm(res.content or "", analyzer_model, llm_opts)
+
+            if data is None:
+                reasons = ["json_parse_error"]
+                if repair_attempted:
+                    reasons.append("analyzer_json_repair_failed")
+                return self._analyzer_heuristic_fallback_result(
+                    prompt,
+                    reasons,
+                    res.content,
+                    extra_meta={"analyzer_json_recover_failed": True},
+                )
+
+            result = self._normalize_analyzer_llm_dict(data, res.content)
+            if repair_attempted:
+                result.setdefault("reasons", []).append("analyzer_json_repair_ok")
+
+            if self._redis:
                 try:
-                    data = json.loads(content)
-                    complexity = str(data.get("complexity", "low") or "low").lower()
-                    if complexity not in ("low", "medium", "high"):
-                        complexity = "low"
-                    selected_model = data.get("selected_model", "")
-                    fallback_models = data.get("fallback_models", [])
-                    refine_models = data.get("refine_models", {})
-                    reason = data.get("reason", "")
-                    decision = str(data.get("decision", "") or "").strip().lower()
-                    if decision not in ("fast", "refine"):
-                        decision = "refine" if complexity in ("high", "medium") else "fast"
-                    task_type = str(data.get("task_type") or "").strip().lower()
-                    if task_type not in ("conversation", "generation", "reasoning", "code"):
-                        task_type = ""
-                    if not task_type:
-                        task_type = self._infer_task_type_from_json(data)
-
-                    try:
-                        confidence = float(data.get("confidence", 0.85))
-                    except (TypeError, ValueError):
-                        confidence = 0.85
-                    confidence = max(0.0, min(1.0, confidence))
-                    suggested_track = str(data.get("suggested_track") or "").strip().lower()
-                    if suggested_track not in ("fast", "refine", "agent", ""):
-                        suggested_track = ""
-                    raw_search_queries = data.get("search_queries")
-                    search_queries = []
-                    if isinstance(raw_search_queries, list):
-                        search_queries = [str(item or "").strip() for item in raw_search_queries if str(item or "").strip()]
-                    elif str(data.get("search_query") or "").strip():
-                        search_queries = [str(data.get("search_query") or "").strip()]
-
-                    result = {
-                        "decision": decision,
-                        "reasons": [f"llm_reason: {reason}"],
-                        "complexity": complexity,
-                        "type": data.get("type", "general"),
-                        "task_type": task_type,
-                        "search_required": bool(data.get("search_required", False)),
-                        "search_query": str(data.get("search_query") or ""),
-                        "selected_model": selected_model,
-                        "fallback_models": fallback_models,
-                        "refine_models": refine_models,
-                        "reason": reason,
-                        "raw_llm_response": res.content,
-                        "confidence": confidence,
-                        "suggested_track": suggested_track or None,
-                        "search_queries": search_queries,
-                    }
-                    if self._redis:
-                        try:
-                            await asyncio.to_thread(
-                                self._redis.set,
-                                cache_key,
-                                json.dumps(result, ensure_ascii=False),
-                                cache_ttl,
-                            )
-                        except Exception:
-                            pass
-                    return result
-                except json.JSONDecodeError:
-                    return {
-                        "decision": "fast",
-                        "reasons": ["json_parse_error"],
-                        "complexity": "low",
-                        "type": "general",
-                        "task_type": "conversation",
-                        "raw_llm_response": res.content,
-                        "confidence": 0.35,
-                        "suggested_track": "fast",
-                    }
+                    await asyncio.to_thread(
+                        self._redis.set,
+                        cache_key,
+                        json.dumps(result, ensure_ascii=False),
+                        cache_ttl,
+                    )
+                except Exception:
+                    pass
+            return result
         except Exception as e:
-            return {
-                "decision": "fast",
-                "reasons": [f"llm_analyzer_error: {str(e)}"],
-                "complexity": "low",
-                "type": "general",
-                "task_type": "conversation",
-                "confidence": 0.35,
-                "suggested_track": "fast",
-            }
-            
-        return {
-            "decision": "fast",
-            "reasons": ["analyzer_failed"],
-            "complexity": "low",
-            "type": "general",
-            "task_type": "conversation",
-            "confidence": 0.3,
-            "suggested_track": "fast",
-        }
+            return self._analyzer_heuristic_fallback_result(
+                prompt,
+                [f"llm_analyzer_error: {str(e)}"],
+                None,
+                extra_meta={"analyzer_exception": True},
+            )
 
     def _analyzer_fallback_timeout(self, prompt: str) -> Dict[str, Any]:
         """LLM 预判整体超时：避免长时间卡住 SSE，按启发规则降级。"""
@@ -848,6 +972,17 @@ class DualTrackHarness:
             "selected": unique_candidates[0],
         }
 
+    def _routing_tuning(self) -> Dict[str, Any]:
+        return (self.cfg.get("harness") or {}).get("routing_tuning") or {}
+
+    def _max_review_web_rounds(self) -> int:
+        h = self.cfg.get("harness") or {}
+        rt = h.get("refine_chain_tuning") or {}
+        try:
+            return max(1, min(8, int(rt.get("max_review_web_rounds", 3))))
+        except (TypeError, ValueError):
+            return 3
+
     def apply_confidence_track_guard(self, mode: str, analysis: Dict[str, Any], prompt: str, chosen: str) -> str:
         if (mode or "auto").lower() != "auto":
             return chosen
@@ -857,7 +992,16 @@ class DualTrackHarness:
             cf = float(analysis.get("confidence", 1.0) or 1.0)
         except (TypeError, ValueError):
             cf = 1.0
-        if cf < 0.6 and len((prompt or "").strip()) > 200 and chosen == "fast":
+        rt = self._routing_tuning()
+        try:
+            thr = float(rt.get("confidence_track_guard_threshold", 0.6))
+        except (TypeError, ValueError):
+            thr = 0.6
+        try:
+            min_chars = int(rt.get("confidence_track_guard_min_prompt_chars", 200))
+        except (TypeError, ValueError):
+            min_chars = 200
+        if cf < thr and len((prompt or "").strip()) > min_chars and chosen == "fast":
             analysis["track_upgrade_reason"] = "low_analyzer_confidence"
             return "refine"
         return chosen
@@ -919,6 +1063,10 @@ class DualTrackHarness:
     def _norm_cache_prompt(self, p: str) -> str:
         return re.sub(r"\s+", " ", (p or "").strip().lower())
 
+    def _fast_cache_scope_zset_key(self, pref: str, scope: str) -> str:
+        h = hashlib.sha256((scope or "").encode("utf-8")).hexdigest()
+        return f"{pref}zscope:{h}"
+
     def _fast_cache_key_source(self, options: Dict[str, Any], augmented_prompt: str) -> str:
         """缓存键分为正文相似度键 + 作用域键，作用域需隔离文档/历史/搜索模式/轨道。"""
         opts = options or {}
@@ -934,14 +1082,15 @@ class DualTrackHarness:
         pref = str(fcfg.get("key_prefix") or "harness:fast:v1:")
         thresh = float(fcfg.get("similarity_threshold", 0.92))
         max_scan = int(fcfg.get("max_scan_keys", 400))
+        cheap_min = float(fcfg.get("cheap_ngram_overlap_min", 0.06))
         key = pref + hashlib.sha256(f"{scope}\n{norm}".encode("utf-8")).hexdigest()
-        zkey = pref + "zset"
+        z_scoped = self._fast_cache_scope_zset_key(pref, scope)
 
         def _sync() -> Optional[str]:
             v = self._redis.get(key)
             if v:
                 return str(v)
-            raw = self._redis.zrevrange(zkey, 0, max(0, max_scan - 1))
+            raw = self._redis.zrevrange(z_scoped, 0, max(0, max_scan - 1))
             best_a: Optional[str] = None
             best_r = 0.0
             for row in raw or []:
@@ -950,6 +1099,8 @@ class DualTrackHarness:
                     n2 = str(o.get("n") or "")
                     s2 = str(o.get("s") or "")
                     if s2 != scope:
+                        continue
+                    if cheap_min > 0 and ngram_overlap_ratio(norm, n2) < cheap_min:
                         continue
                     r = semantic_similarity(norm, n2)
                     if r > best_r:
@@ -977,14 +1128,14 @@ class DualTrackHarness:
         ttl = int(fcfg.get("ttl_sec", 86400))
         key = pref + hashlib.sha256(f"{scope}\n{norm}".encode("utf-8")).hexdigest()
         row = json.dumps({"s": scope, "n": norm, "a": answer}, ensure_ascii=False)
-        zkey = pref + "zset"
+        z_scoped = self._fast_cache_scope_zset_key(pref, scope)
 
         def _sync() -> None:
             self._redis.set(key, answer, ex=ttl)
-            self._redis.zadd(zkey, {row: time.time()})
-            size = self._redis.zcard(zkey)
+            self._redis.zadd(z_scoped, {row: time.time()})
+            size = self._redis.zcard(z_scoped)
             if size and int(size) > 200:
-                self._redis.zremrangebyrank(zkey, 0, int(size) - 201)
+                self._redis.zremrangebyrank(z_scoped, 0, int(size) - 201)
 
         try:
             await asyncio.to_thread(_sync)
@@ -1087,6 +1238,13 @@ class DualTrackHarness:
             for tok in (("实时" if not english else "live"), ("今日" if not english else "today")):
                 add_token(tok)
 
+        if any(k in combined for k in ("财报", "季报", "年报", "业绩快报", "营收", "净利润", "每股收益")) or any(
+            k in cl for k in ("earnings", "quarterly earnings", "annual report", "10-k", "10-q", "investor relations")
+        ):
+            add_token(str(datetime.now().year) if english else f"{datetime.now().year}年")
+            if english:
+                add_token("official filing")
+
         if re.search(r"\b(vue|react|python|node|typescript|java|spring|fastapi|django)\b", cl) and re.search(r"\b\d", cl):
             add_token(str(datetime.now().year) if english else f"{datetime.now().year}年")
 
@@ -1164,6 +1322,7 @@ class DualTrackHarness:
                     "provider": adapter.provider,
                     "attempt_index": attempt_idx,
                     "attempt_total": attempt_total,
+                    "meta": dict(SSE_PROTOCOL_META),
                 }
                 started_at = time.perf_counter()
                 emitted_chars = 0
@@ -1173,9 +1332,11 @@ class DualTrackHarness:
                     reasoning = chunk.get("reasoning_content") or ""
                     if content:
                         emitted_chars += len(content)
-                        step = max(1, int(options.get("stream_slice_chars") or 96))
-                        for idx in range(0, len(content), step):
-                            yield {"event": "chunk", "data": {"content": content[idx : idx + step]}}
+                        step = self._stream_slice_chars(options)
+                        stune = (self.cfg.get("harness") or {}).get("stream_tuning") or {}
+                        smart = bool(stune.get("smart_chunk_boundary", True))
+                        for start, end in iter_chunk_spans(content, step, smart=smart):
+                            yield {"event": "chunk", "data": {"content": content[start:end]}}
                             await asyncio.sleep(0)
                     elif reasoning:
                         # 计入非空流，避免仅 reasoning 的模型被误判 EMPTY_STREAM；正文仍只推送 content
@@ -1343,7 +1504,7 @@ class DualTrackHarness:
         search_loops = 0
         rb = (review_body or "").strip()
         overrides = {k: v for k, v in self._track_search_overrides(track).items() if v is not None}
-        for _ in range(3):
+        for _ in range(self._max_review_web_rounds()):
             wm = RE_AGENT_WS.search(rb)
             if not wm:
                 break
@@ -1653,7 +1814,12 @@ class DualTrackHarness:
             cf = float(analysis.get("confidence") or 1.0)
         except (TypeError, ValueError):
             cf = 1.0
-        if mode == "auto" and cf < 0.55:
+        rt_follow = self._routing_tuning()
+        try:
+            cf_follow = float(rt_follow.get("low_confidence_suggested_track_threshold", 0.55))
+        except (TypeError, ValueError):
+            cf_follow = 0.55
+        if mode == "auto" and cf < cf_follow:
             st = norm_suggested_track(str(analysis.get("suggested_track") or ""))
             if st == "agent" and ag_enabled:
                 analysis["track_select_low_confidence"] = True
@@ -1676,12 +1842,17 @@ class DualTrackHarness:
         markers = ("帮我改进", "润色这段", "优化这段", "修改这段文字", "改写下面", "improve this", "polish this", "rewrite this")
         return any(marker.lower() in text.lower() for marker in markers)
 
-    async def _emit_text_chunks(self, text: str, options: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
+    def _stream_slice_chars(self, options: Dict[str, Any]) -> int:
         hcfg = self.cfg.get("harness") or {}
         default_slice = int(hcfg.get("stream_slice_chars", 72))
-        step = max(1, int(options.get("stream_slice_chars") or default_slice))
-        for i in range(0, len(text), step):
-            yield {"event": "chunk", "data": {"content": text[i : i + step]}}
+        return max(1, int(options.get("stream_slice_chars") or default_slice))
+
+    async def _emit_text_chunks(self, text: str, options: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
+        step = self._stream_slice_chars(options)
+        stune = (self.cfg.get("harness") or {}).get("stream_tuning") or {}
+        smart = bool(stune.get("smart_chunk_boundary", True))
+        for start, end in iter_chunk_spans(text, step, smart=smart):
+            yield {"event": "chunk", "data": {"content": text[start:end]}}
             await asyncio.sleep(0)
 
     def _agent_plain_text_should_refine(self, analysis: Dict[str, Any]) -> Tuple[bool, str]:
@@ -1792,6 +1963,74 @@ class DualTrackHarness:
         ):
             yield ev
 
+    async def _consume_agent_stream_for_sync(
+        self,
+        prompt: str,
+        analysis: Dict[str, Any],
+        options: Dict[str, Any],
+        messages: Optional[List[Dict[str, Any]]],
+        trace_id: str,
+        hcfg: Dict[str, Any],
+        _tag,
+    ) -> Tuple[AskResult, List[Step]]:
+        """非流式 API：复用流式 Agent 循环，将 chunk 拼成最终正文供 /api/chat 返回。"""
+        parts: List[str] = []
+        extra_steps: List[Step] = []
+        last_model = "agent"
+        last_provider = "agent"
+        last_latency = 0
+        stream_error: Optional[str] = None
+
+        async for ev in self._run_agent_stream(prompt, analysis, options, messages, trace_id, hcfg, _tag):
+            et = ev.get("event")
+            if et == "chunk":
+                parts.append(str((ev.get("data") or {}).get("content") or ""))
+                continue
+            if et == "step":
+                payload = ev.get("step")
+                if isinstance(payload, dict):
+                    extra_steps.append(
+                        Step(
+                            name=str(payload.get("name") or "step"),
+                            status=str(payload.get("status") or "ok"),
+                            provider=payload.get("provider"),
+                            model=payload.get("model"),
+                            latency_ms=payload.get("latency_ms"),
+                            input_preview=payload.get("input_preview"),
+                            output=payload.get("output") if isinstance(payload.get("output"), str) else None,
+                            error=payload.get("error"),
+                            meta=dict(payload.get("meta") or {}),
+                        )
+                    )
+                    if payload.get("model"):
+                        last_model = str(payload.get("model"))
+                    if payload.get("provider"):
+                        last_provider = str(payload.get("provider"))
+                    if payload.get("latency_ms") is not None:
+                        try:
+                            last_latency = int(payload.get("latency_ms") or 0)
+                        except (TypeError, ValueError):
+                            pass
+                continue
+            if et == "error":
+                stream_error = str(ev.get("error") or "STREAM_ERROR")
+
+        body = "".join(parts)
+        if stream_error:
+            return (
+                AskResult(
+                    False,
+                    body,
+                    last_provider,
+                    last_model,
+                    last_latency,
+                    error=stream_error,
+                    failure_kind="stream",
+                ),
+                extra_steps,
+            )
+        return AskResult(True, body, last_provider, last_model, last_latency), extra_steps
+
     async def _run_agent_stream(
         self,
         prompt: str,
@@ -1858,6 +2097,7 @@ class DualTrackHarness:
         }
         yield {"event": "status", "phase": "agent", "message": "正在分析问题并规划工具调用…"}
 
+        prev_parse_snapshot = ""
         for it in range(max_iter):
             yield {
                 "event": "step",
@@ -1893,6 +2133,35 @@ class DualTrackHarness:
                 else:
                     parse_text = text[: wm0.start()].rstrip()
                     conv[-1]["content"] = parse_text
+
+            ag_tune = (hcfg.get("agent_tuning") or {})
+            if ag_tune.get("stuck_loop_guard", True) and it > 0 and prev_parse_snapshot:
+                try:
+                    sim_thr = float(ag_tune.get("stuck_reply_similarity", 0.96))
+                except (TypeError, ValueError):
+                    sim_thr = 0.96
+                if semantic_similarity(parse_text[:3500], prev_parse_snapshot[:3500]) >= sim_thr:
+                    conv.pop()
+                    nudge = str(
+                        ag_tune.get("stuck_user_nudge")
+                        or "【系统】本轮输出与上一轮高度雷同；请换思路：使用 web_search 获取新证据，或使用 refine_answer 提交草稿。"
+                    )
+                    conv.append({"role": "user", "content": nudge})
+                    prev_parse_snapshot = ""
+                    yield {
+                        "event": "step",
+                        "step": {
+                            "name": "agent_stuck_guard",
+                            "status": "ok",
+                            "meta": _pg(
+                                {"similarity_threshold": sim_thr},
+                                "reasoning",
+                                "检测到输出重复倾向，已注入纠偏提示并放弃本轮 assistant 消息。",
+                            ),
+                        },
+                    }
+                    continue
+            prev_parse_snapshot = parse_text[:3500]
 
             action = parse_agent_action(parse_text)
             action_name = action.get("action") or ""
@@ -2277,7 +2546,7 @@ class DualTrackHarness:
         steps: List[Step] = []
         _tag = self._make_tagger()
 
-        yield {"event": "trace", "trace_id": trace_id}
+        yield {"event": "trace", "trace_id": trace_id, "meta": dict(SSE_PROTOCOL_META)}
         yield {"event": "status", "phase": "analyze", "message": "正在分析问题…"}
 
         yield {
@@ -2335,7 +2604,12 @@ class DualTrackHarness:
         )
         steps.append(step_track)
         yield {"event": "step", "step": step_track.to_dict()}
-        yield {"event": "trace", "trace_id": trace_id, "track": chosen_track}
+        yield {
+            "event": "trace",
+            "trace_id": trace_id,
+            "track": chosen_track,
+            "meta": dict(SSE_PROTOCOL_META),
+        }
         if chosen_track == "fast" and should_search:
             yield {"event": "status", "phase": "search", "message": "正在联网检索（快轨）…"}
             yield {
@@ -2562,7 +2836,7 @@ class DualTrackHarness:
         # 审查前重置前端内容，L3 润色后输出最终版本
         yield {"event": "content_reset"}
 
-        # Layer 2（审查；若输出 <<ACTION: web_search("...")>> 则联网核查后重审，最多 3 轮）
+        # Layer 2（审查；可按 <<ACTION: web_search("...")>> 联网核查后重审；轮数上限见 refine_chain_tuning.max_review_web_rounds）
         yield {"event": "status", "phase": "review", "message": "正在审查答案与必要时联网复核…"}
         yield {
             "event": "step",
@@ -2785,6 +3059,7 @@ class DualTrackHarness:
         if "_fast_cache_identity" not in options:
             options["_fast_cache_identity"] = str(options.get("search_prompt_base") or prompt or "").strip()
         trace_id = options.get("trace_id") or new_trace_id()
+        sync_meta = dict(SYNC_API_META)
         steps: List[Step] = []
         _tag = self._make_tagger()
         runtime = await self._resolve_runtime_context(prompt, mode, options)
@@ -2806,8 +3081,9 @@ class DualTrackHarness:
             )
         )
 
-        if chosen_track == "agent":
-            # 非流式接口暂不跑 Agent 循环，降级为 Refine 三阶段
+        disable_sync_agent = not bool(((hcfg.get("agent") or {}).get("sync_non_stream_api", True)))
+
+        if chosen_track == "agent" and disable_sync_agent:
             chosen_track = "refine"
             analysis = {
                 **analysis,
@@ -2841,6 +3117,20 @@ class DualTrackHarness:
             )
         )
 
+        if chosen_track == "agent":
+            sync_meta["sync_agent"] = True
+            agent_final, agent_steps_extra = await self._consume_agent_stream_for_sync(
+                prompt, analysis, options, messages, trace_id, hcfg, _tag
+            )
+            steps.extend(agent_steps_extra)
+            return {
+                "trace_id": trace_id,
+                "track": "agent",
+                "final": agent_final.to_dict(),
+                "steps": [s.to_dict() for s in steps],
+                "meta": sync_meta,
+            }
+
         if chosen_track == "fast" and should_search:
             prompt, ws_step, abort_err = await self._fast_entry_search_step(
                 prompt, analysis, options, search_reason, search_mandatory=search_mandatory
@@ -2860,6 +3150,7 @@ class DualTrackHarness:
                     "track": chosen_track,
                     "final": fail.to_dict(),
                     "steps": [s.to_dict() for s in steps],
+                    "meta": sync_meta,
                 }
 
         if chosen_track == "fast":
@@ -2872,6 +3163,7 @@ class DualTrackHarness:
                     "track": "fast",
                     "final": AskResult(True, cached, "cache", "redis", 0).to_dict(),
                     "steps": [s.to_dict() for s in steps],
+                    "meta": sync_meta,
                 }
             route = self.route_fast_model(prompt, analysis)
             steps.append(Step(name="fast_route", status="ok", meta=route))
@@ -2897,6 +3189,7 @@ class DualTrackHarness:
                 "track": "fast",
                 "final": res.to_dict(),
                 "steps": [s.to_dict() for s in steps],
+                "meta": sync_meta,
             }
 
         # refine track
@@ -2925,6 +3218,7 @@ class DualTrackHarness:
                 "track": "fast",
                 "final": res.to_dict(),
                 "steps": [s.to_dict() for s in steps],
+                "meta": sync_meta,
             }
 
         l1 = refine_ctx["l1"]
@@ -2995,6 +3289,7 @@ class DualTrackHarness:
                 "track": "refine",
                 "final": r1.to_dict(),
                 "steps": [s.to_dict() for s in steps],
+                "meta": sync_meta,
             }
 
         # Layer 2（含可选联网核查，与流式接口逻辑对齐）
@@ -3054,6 +3349,7 @@ class DualTrackHarness:
                     "content": fallback_text,
                 },
                 "steps": [s.to_dict() for s in steps],
+                "meta": sync_meta,
             }
 
         if l2_polish_recovered:
@@ -3149,6 +3445,7 @@ class DualTrackHarness:
                 "track": "refine",
                 "final": r2.to_dict(),
                 "steps": [s.to_dict() for s in steps],
+                "meta": sync_meta,
             }
 
         return {
@@ -3156,5 +3453,6 @@ class DualTrackHarness:
             "track": "refine",
             "final": r3.to_dict(),
             "steps": [s.to_dict() for s in steps],
+            "meta": sync_meta,
         }
 

@@ -22,6 +22,33 @@ def _get_shared_client() -> httpx.AsyncClient:
         _shared_client = httpx.AsyncClient(limits=_SHARED_LIMITS)
     return _shared_client
 
+def _failure_kind_from_error(exc: BaseException, message: str) -> Optional[str]:
+    """供上层回退链决策：限流不重试同一 key，尽快换模型。"""
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+        c = int(exc.response.status_code)
+        if c == 429:
+            return "rate_limit"
+        if c in (401, 403):
+            return "auth"
+        if c == 404:
+            return "bad_request"
+        if c >= 500:
+            return "server"
+        return "http_error"
+    low = (message or "").lower()
+    if "429" in message or "too many requests" in low:
+        return "rate_limit"
+    if "timeout" in low or "timed out" in low:
+        return "timeout"
+    if "401" in message or "403" in message:
+        return "auth"
+    if "404" in message:
+        return "bad_request"
+    return None
+
+
 @dataclass
 class AskResult:
     success: bool
@@ -33,6 +60,7 @@ class AskResult:
     tokens_out: int = 0
     error: Optional[str] = None
     raw: Optional[Dict[str, Any]] = None
+    failure_kind: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -45,6 +73,7 @@ class AskResult:
             "tokens_out": self.tokens_out,
             "error": self.error,
             "raw": self.raw,
+            "failure_kind": self.failure_kind,
         }
 
 
@@ -119,6 +148,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 model=str(model),
                 latency_ms=0,
                 error=f"Missing API key env: {api_key_env}",
+                failure_kind="config",
             )
 
         timeout_s = float(options.get("request_timeout_s", self.cfg.get("timeout_s", 60)))
@@ -137,6 +167,7 @@ class OpenAICompatAdapter(BaseAdapter):
 
         max_retries = max(1, int(options.get("max_retries", self.cfg.get("max_retries", 3))))
         last_error = None
+        last_failure_kind: Optional[str] = None
         for attempt in range(max_retries):
             try:
                 client = _get_shared_client()
@@ -187,10 +218,11 @@ class OpenAICompatAdapter(BaseAdapter):
                 )
             except Exception as e:
                 last_error = str(e)
-                # Retry on connection errors or server errors, but not on auth errors (except occasionally some proxies flake with 401)
-                # We will log the error but still try to fail fast on 401 unless it's a known flaky API. 
-                # To be safe, we will just break on 401/403/404 as before, but ensure the error message is clear.
+                last_failure_kind = _failure_kind_from_error(e, last_error)
                 if "401" in last_error or "403" in last_error or "404" in last_error:
+                    break
+                # 限流时不浪费内层重试次数，交给 harness 换候选模型
+                if last_failure_kind == "rate_limit":
                     break
                 if attempt < max_retries - 1:
                     await asyncio.sleep(1 * (attempt + 1))
@@ -203,6 +235,7 @@ class OpenAICompatAdapter(BaseAdapter):
             model=str(model),
             latency_ms=t.elapsed_ms(),
             error=last_error or "Unknown error",
+            failure_kind=last_failure_kind,
         )
 
     async def stream(self, prompt: str, options: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None) -> AsyncGenerator[Dict[str, Any], None]:
@@ -284,11 +317,12 @@ class OpenAICompatAdapter(BaseAdapter):
                 break
             except Exception as e:
                 last_error = str(e)
+                fk = _failure_kind_from_error(e, last_error)
                 if "401" in last_error or "403" in last_error or "404" in last_error:
-                    # 对于明确的鉴权或路径错误，不重试，直接抛出
                     raise Exception(f"请求失败: {last_error}")
-                
-                # 针对 502/503/504 以及网络断开等临时错误，进行重试退避
+                if fk == "rate_limit":
+                    raise Exception(f"请求失败: {last_error}")
+
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 * (attempt + 1))
                 else:
