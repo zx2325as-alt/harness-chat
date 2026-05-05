@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 from functools import lru_cache
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
+
+import httpx
+
+from utils import env_get
 
 
-_EMBED_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+_DEFAULT_EMBED_MODEL = "text-embedding-3-large"
+_DEFAULT_BASE_URL = "https://api.n1n.ai/v1"
 
 
 def normalize_text(text: str) -> str:
@@ -62,16 +68,8 @@ def _cosine_sparse(a: Dict[str, float], b: Dict[str, float]) -> float:
 
 @lru_cache(maxsize=1)
 def _load_sentence_transformer():
-    try:
-        from sentence_transformers import SentenceTransformer
-    except Exception:
-        return None
-    try:
-        # 默认只读本地缓存，避免在启动预热/首请求时阻塞等待 HuggingFace
-        #（若本地没有模型，则直接回退到稀疏向量相似度）
-        return SentenceTransformer(_EMBED_MODEL_NAME, local_files_only=True)
-    except Exception:
-        return None
+    # 已弃用：不再使用线下 sentence-transformers。
+    return None
 
 
 def _embedding_vectors(texts: Iterable[str]):
@@ -85,24 +83,13 @@ def _embedding_vectors(texts: Iterable[str]):
         return None
 
 
-async def warm_up_embedding_model() -> None:
+async def warm_up_embedding_model(*, model_cfg: Optional[Dict[str, Any]] = None) -> None:
     """
-    预热 sentence-transformers：触发模型加载 + 一次最小 encode，
-    避免首个文档问答请求在主路径上承担冷启动开销。
+    预热线上 Embeddings：触发一次最小 /v1/embeddings 调用，
+    避免首个文档问答请求承担 DNS/TLS/冷连接开销。
     """
-    import asyncio
-
-    def _warm_sync() -> None:
-        m = _load_sentence_transformer()
-        if m is None:
-            return
-        try:
-            m.encode(["-"], normalize_embeddings=True)
-        except Exception:
-            return
-
     try:
-        await asyncio.to_thread(_warm_sync)
+        await embed_texts(["-"], model_cfg=model_cfg)
     except Exception:
         return
 
@@ -132,6 +119,126 @@ def batch_semantic_similarity(query: str, texts: List[str]) -> List[float]:
         return scores
     qv = _fallback_vector(query)
     return [_cosine_sparse(qv, _fallback_vector(text)) for text in texts]
+
+
+_EMBED_LIMITS = httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=60.0)
+_embed_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_embed_client() -> httpx.AsyncClient:
+    global _embed_client
+    if _embed_client is None or _embed_client.is_closed:
+        _embed_client = httpx.AsyncClient(limits=_EMBED_LIMITS)
+    return _embed_client
+
+
+def _openai_embeddings_url(base_url: str) -> str:
+    u = (base_url or "").strip().rstrip("/")
+    if not u:
+        u = _DEFAULT_BASE_URL
+    if not u.endswith("/v1"):
+        u = u + "/v1"
+    return u + "/embeddings"
+
+
+def _get_api_key_from_model_cfg(cfg: Dict[str, Any]) -> str:
+    api_key = str(cfg.get("api_key") or "").strip()
+    if api_key:
+        return api_key
+    api_key_env = str(cfg.get("api_key_env") or "").strip()
+    if api_key_env and (api_key_env.startswith("sk-") or len(api_key_env) > 30):
+        return api_key_env
+    if api_key_env:
+        return str(env_get(api_key_env) or "").strip()
+    return ""
+
+
+async def embed_texts(
+    texts: List[str],
+    *,
+    model_cfg: Optional[Dict[str, Any]] = None,
+    timeout_s: float = 30.0,
+) -> List[List[float]]:
+    """
+    纯线上 embeddings：OpenAI 兼容 /v1/embeddings。
+    返回 vectors（与 texts 等长）；失败则返回空列表，调用方自行回退。
+    """
+    cfg = dict(model_cfg or {})
+    base_url = str(cfg.get("base_url") or _DEFAULT_BASE_URL)
+    url = _openai_embeddings_url(base_url)
+    model = str(cfg.get("model") or _DEFAULT_EMBED_MODEL)
+    api_key = _get_api_key_from_model_cfg(cfg)
+    headers: Dict[str, str] = {"Content-Type": "application/json", "Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    cleaned = [normalize_text(t) or "-" for t in (texts or [])]
+    if not cleaned:
+        return []
+    body = {"model": model, "input": cleaned}
+    client = _get_embed_client()
+    r = await client.post(url, headers=headers, json=body, timeout=timeout_s)
+    r.raise_for_status()
+    data = r.json()
+    rows = data.get("data")
+    if not isinstance(rows, list):
+        return []
+    out: List[List[float]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        vec = item.get("embedding")
+        if isinstance(vec, list) and vec:
+            try:
+                out.append([float(x) for x in vec])
+            except Exception:
+                out.append([])
+        else:
+            out.append([])
+    return out if len(out) == len(cleaned) else out[: len(cleaned)]
+
+
+def cosine_dense(a: List[float], b: List[float]) -> float:
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    if n <= 0:
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for i in range(n):
+        av = float(a[i])
+        bv = float(b[i])
+        dot += av * bv
+        na += av * av
+        nb += bv * bv
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+async def batch_semantic_similarity_online(
+    query: str,
+    texts: List[str],
+    *,
+    model_cfg: Optional[Dict[str, Any]] = None,
+    timeout_s: float = 30.0,
+) -> List[float]:
+    if not texts:
+        return []
+    try:
+        vecs = await embed_texts([query] + list(texts), model_cfg=model_cfg, timeout_s=timeout_s)
+    except Exception:
+        vecs = []
+    if vecs and len(vecs) >= 1:
+        qv = vecs[0]
+        dvs = vecs[1:]
+        if qv and len(dvs) == len(texts):
+            return [cosine_dense(qv, dv) for dv in dvs]
+    # 回退：稀疏向量相似度（纯本地计算，不依赖模型）
+    qv2 = _fallback_vector(query)
+    return [_cosine_sparse(qv2, _fallback_vector(t)) for t in texts]
 
 
 def ngram_overlap_ratio(left: str, right: str) -> float:

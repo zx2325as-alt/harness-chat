@@ -89,6 +89,17 @@ harness:
   documents:
     bm25_weight: 0.55
     embedding_weight: 0.45
+    # 纯线上 Embeddings（OpenAI 兼容 /v1/embeddings）
+    embedding:
+      enabled: true
+      model_key: "n1n-embedding-3-large"
+      # 只对 BM25 召回的前 N 个做向量化（成本/效果折中）
+      max_items: 40
+      # 每段参与 embedding 的最大字符数（太长会稀释语义 & 增加 token 成本）
+      text_chars: 2000
+      timeout_s: 30
+      # RRF 融合参数：score = 1/(k+rank_bm25)+1/(k+rank_emb)
+      rrf_k: 60
     max_text_chars: 220000
     chunk_size: 7000
     chunk_overlap: 900
@@ -344,6 +355,14 @@ models:
     base_url: "https://api.n1n.ai"
     api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
     model: "BAAI/bge-reranker-v2-m3"
+    timeout_s: 30
+
+  # n1n Embeddings（OpenAI 兼容 /v1/embeddings）
+  n1n-embedding-3-large:
+    provider: "openai_compat"
+    base_url: "https://api.n1n.ai/v1"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "text-embedding-3-large"
     timeout_s: 30
 
   grok-4-20-reasoning:

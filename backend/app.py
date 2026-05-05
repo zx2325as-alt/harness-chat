@@ -31,7 +31,7 @@ from document_extract import (
     extract_document,
 )
 from local_docs import load_folder_documents
-from semantic_utils import batch_semantic_similarity
+from semantic_utils import batch_semantic_similarity, batch_semantic_similarity_online
 from utils import load_yaml, new_trace_id, env_get
 from doc_rerank import rerank_document_chunks
 
@@ -283,20 +283,22 @@ def _rank_document_rows(
     texts = [str(r.get("content") or "") for r in ranked]
     bm = _doc_bm25_scores(query, texts)
     for i, r in enumerate(ranked):
-        r["score"] = float(bm[i]) if i < len(bm) else 0.0
+        r["bm25_score"] = float(bm[i]) if i < len(bm) else 0.0
+        r["score"] = r["bm25_score"]
     ranked.sort(key=lambda x: x.get("score", 0), reverse=True)
     top_n = ranked[:20]
-    emb_scores = batch_semantic_similarity(query, [str(r.get("content") or "")[:2000] for r in top_n])
-    for idx, row in enumerate(top_n):
-        row["embedding_score"] = float(emb_scores[idx]) if idx < len(emb_scores) else 0.0
-        row["score"] = row.get("score", 0.0) * bm25_weight + row.get("embedding_score", 0.0) * embedding_weight
+    # embedding 精排改为线上 async 过程，不在同步函数中做
+    for row in top_n:
+        row["embedding_score"] = 0.0
+        row["score"] = float(row.get("bm25_score") or 0.0)
     for row in top_n:
         name = str(row.get("name") or "")
         head = str(row.get("content") or "")[:800]
         bonus = 0.0
         if query.strip():
             bonus = 0.028 * min(8, _doc_score(query, name) + _doc_score(query, head))
-        row["score"] = float(row.get("score", 0.0)) + bonus
+        row["bonus_score"] = float(bonus)
+        row["score"] = float(row.get("score", 0.0)) + float(bonus)
     top_n.sort(key=lambda x: x.get("score", 0), reverse=True)
     return top_n + ranked[20:]
 
@@ -330,13 +332,64 @@ async def _prepare_documents_context_block_async(prompt: str, options: Dict[str,
     else:
         bw, ew = bw / s, ew / s
 
-    # 将 BM25 计算改为异步执行，避免阻塞 asyncio 事件循环
-    rows = await asyncio.to_thread(_rank_document_rows, options.get("documents"), str(prompt), bm25_weight=bw, embedding_weight=ew)
-    meta: Dict[str, Any] = {"ranked": len(rows)}
+    # 先做 BM25 召回（线程池），再做线上 embedding 精排 + RRF 融合
+    rows = await asyncio.to_thread(
+        _rank_document_rows,
+        options.get("documents"),
+        str(prompt),
+        bm25_weight=bw,
+        embedding_weight=ew,
+    )
+    meta: Dict[str, Any] = {"ranked": len(rows), "fusion": "bm25+embedding_rrf"}
     if not rows:
         return "", meta
 
+    # 线上 embedding（纯线上模型）
     hdoc = (cfg.get("harness") or {}).get("documents") or {}
+    ecfg = (hdoc.get("embedding") or {}) if isinstance(hdoc.get("embedding"), dict) else {}
+    emb_enabled = bool(ecfg.get("enabled", True))
+    emb_model_key = str(ecfg.get("model_key") or "n1n-embedding-3-large").strip()
+    emb_max_items = int(ecfg.get("max_items", 40))
+    emb_text_chars = int(ecfg.get("text_chars", 2000))
+    emb_timeout_s = float(ecfg.get("timeout_s", 30))
+
+    if emb_enabled:
+        model_cfg = (cfg.get("models") or {}).get(emb_model_key) or {}
+        cands = rows[: max(1, min(len(rows), emb_max_items))]
+        texts = [str(r.get("content") or "")[:emb_text_chars] for r in cands]
+        emb_scores = await batch_semantic_similarity_online(
+            str(prompt),
+            texts,
+            model_cfg=model_cfg,
+            timeout_s=emb_timeout_s,
+        )
+        for i, r in enumerate(cands):
+            r["embedding_score"] = float(emb_scores[i]) if i < len(emb_scores) else 0.0
+        # RRF 融合（Top-20）
+        k = float(ecfg.get("rrf_k", 60))
+        bm_order = sorted(range(len(cands)), key=lambda i: float(cands[i].get("bm25_score") or 0.0), reverse=True)
+        emb_order = sorted(range(len(cands)), key=lambda i: float(cands[i].get("embedding_score") or 0.0), reverse=True)
+        bm_rank = {idx: r for r, idx in enumerate(bm_order, start=1)}
+        emb_rank = {idx: r for r, idx in enumerate(emb_order, start=1)}
+        for idx, row in enumerate(cands):
+            rb = float(bm_rank.get(idx, len(cands) + 1))
+            re = float(emb_rank.get(idx, len(cands) + 1))
+            row["rrf_score"] = 1.0 / (k + rb) + 1.0 / (k + re)
+            # 最终 score：RRF + bonus（bonus 仍有效）
+            row["score"] = float(row.get("rrf_score") or 0.0) + float(row.get("bonus_score") or 0.0)
+        cands.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+        # 用融合后的 top20 进入 rerank
+        rows = cands + rows[len(cands) :]
+        meta["embedding"] = {
+            "enabled": True,
+            "model_key": emb_model_key,
+            "max_items": emb_max_items,
+            "text_chars": emb_text_chars,
+            "timeout_s": emb_timeout_s,
+        }
+    else:
+        meta["embedding"] = {"enabled": False}
+
     rr = hdoc.get("rerank") or {}
     if bool(rr.get("enabled", False)):
         model_key = str(rr.get("model") or "gpt-5.5").strip()
@@ -559,6 +612,20 @@ def _validate_harness_models(cfg: Dict[str, Any]) -> None:
     rm = str(sc.get("model") or "").strip()
     if rm and rm not in models:
         errors.append(f"harness.search.relevance_filter.model -> {rm!r}")
+    docs = h.get("documents") or {}
+    emb = docs.get("embedding") or {}
+    if isinstance(emb, dict) and bool(emb.get("enabled", True)):
+        ek = str(emb.get("model_key") or "n1n-embedding-3-large").strip()
+        if ek and ek not in models:
+            errors.append(f"harness.documents.embedding.model_key -> {ek!r}")
+        else:
+            mcfg = (cfg.get("models") or {}).get(ek) or {}
+            m = str(mcfg.get("model") or "").strip()
+            bu = str(mcfg.get("base_url") or "").strip()
+            if not m:
+                errors.append(f"models.{ek}.model (embeddings) -> empty")
+            if not bu:
+                errors.append(f"models.{ek}.base_url (embeddings) -> empty")
     rt = h.get("routing") or {}
     dm = str(rt.get("default_model") or "").strip()
     if dm and dm not in models:
@@ -648,11 +715,13 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def _warmup_startup() -> None:
-        # 异步预热 embedding 模型，避免首个文档问答冷启动卡顿
+        # 异步预热线上 embedding，避免首个文档问答冷启动卡顿
         try:
             from semantic_utils import warm_up_embedding_model
 
-            asyncio.create_task(warm_up_embedding_model())
+            emb_key = str((((cfg.get("harness") or {}).get("documents") or {}).get("embedding") or {}).get("model_key") or "n1n-embedding-3-large").strip()
+            model_cfg = (cfg.get("models") or {}).get(emb_key) or {}
+            asyncio.create_task(warm_up_embedding_model(model_cfg=model_cfg))
         except Exception:
             return
 
