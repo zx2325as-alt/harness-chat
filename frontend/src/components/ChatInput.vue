@@ -151,7 +151,7 @@ import { isSendableComposerState } from "../chatShared.js";
 
 const MODE_OPTIONS = [
   { value: "auto", label: "自动" },
-  { value: "agent", label: "Agent轨" },
+  { value: "agent", label: "Agent 轨（仅流式真 Agent）" },
   { value: "refine", label: "精化轨" },
   { value: "fast", label: "快速轨" },
 ];
@@ -681,7 +681,7 @@ export default {
   display: none;
 }
 .wrap {
-  padding: 10px 16px 16px;
+  padding: 6px 16px 14px;
   background: #1a1f2b;
   border-top: 1px solid #2f3a4d;
   flex-shrink: 0;
@@ -690,12 +690,11 @@ export default {
   width: 100%;
   max-width: min(100%, 980px);
   margin: 0 auto;
-  /* 气泡输入框（参考图2）：大圆角 + 轻边框 + 柔和阴影 */
-  border: 1px solid rgba(61, 77, 100, 0.55);
-  border-radius: 22px;
-  background: rgba(30, 36, 51, 0.92);
-  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.28);
-  padding: 12px 14px 10px;
+  border: 1px solid #3d4d64;
+  border-radius: 14px;
+  background: #252d3d;
+  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.22);
+  padding: 8px 12px 7px;
 }
 .att-row {
   display: flex;
@@ -766,13 +765,11 @@ export default {
 }
 .textarea {
   width: 100%;
-  /* 输入框变大：更接近图2的编辑区 */
-  min-height: 96px;
+  min-height: 52px;
   max-height: 220px;
   resize: vertical;
-  padding: 8px 2px 4px;
+  padding: 4px 2px;
   border: none;
-  border-radius: 14px;
   background: transparent;
   color: #f1f5f9;
   outline: none;
@@ -791,8 +788,9 @@ export default {
   align-items: center;
   gap: 10px;
   flex-wrap: nowrap;
-  padding-top: 10px;
-  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid #2f3545;
+  margin-top: 2px;
 }
 .bar-left {
   display: flex;
@@ -805,9 +803,9 @@ export default {
   flex: 1;
   min-width: 24px;
   min-height: 34px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(47, 53, 69, 0.8);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.12);
+  border: 1px solid #2f3545;
 }
 
 /* 自定义下拉（替代原生 select，避免系统白底菜单） */
@@ -868,9 +866,9 @@ export default {
   min-width: 128px;
   list-style: none;
   border-radius: 10px;
-  border: 1px solid rgba(61, 77, 100, 0.7);
-  background: rgba(30, 36, 51, 0.96);
-  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.55);
+  border: 1px solid #3d4d64;
+  background: #1e2433;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
 }
 .dd-search .dd-list {
   min-width: 100px;
@@ -961,13 +959,6 @@ export default {
   color: #5c6d85;
 }
 @media (max-width: 560px) {
-  .wrap {
-    padding: 6px 10px 10px;
-  }
-  .textarea {
-    min-height: 84px;
-    font-size: 14px;
-  }
   .composer-bar {
     flex-wrap: wrap;
   }

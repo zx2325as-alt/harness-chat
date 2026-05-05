@@ -503,12 +503,10 @@ class DualTrackHarness:
         speculative_search_task = None
         speculative_guess_key = ""
         # 投机预取增加成本评估：过滤命令、示例、过短输入
-        if (
-            any(mark in sig_base.lower() for mark in [m.lower() for m in search_markers])
-            and len(sig_base) > 10
-            and not sig_base.startswith(("/help", "/config", "/clear", "/"))
-            and not any(x in sig_base.lower() for x in ("示例", "example", "test", "demo"))
-        ):
+        if (any(mark in sig_base.lower() for mark in [m.lower() for m in search_markers]) and
+            len(sig_base) > 10 and
+            not sig_base.startswith(('/help', '/config', '/clear', '/')) and
+            not any(x in sig_base.lower() for x in ('示例', 'example', 'test', 'demo'))):
             spec_analysis: Dict[str, Any] = {
                 "search_query": "",
                 "search_queries": [],
