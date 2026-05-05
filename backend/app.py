@@ -11,7 +11,12 @@ if ROOT not in sys.path:
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from .global_log import log_event
+try:
+    # 包方式启动：python -m backend.app
+    from .global_log import log_event  # type: ignore
+except Exception:
+    # 脚本方式启动：直接运行 backend/app.py（无 parent package）
+    from global_log import log_event  # type: ignore
 
 from fastapi import FastAPI, Request, UploadFile, File, Body, HTTPException, Form
 from fastapi.responses import StreamingResponse
