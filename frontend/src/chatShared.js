@@ -30,8 +30,7 @@ export function normalizePayload(payload) {
   ) {
     return payload;
   }
-  // 默认全局不联网：仅当用户手动开启才允许联网
-  return { content: payload, documents: [], searchMode: "off" };
+  return { content: payload, documents: [], searchMode: "auto" };
 }
 
 export function getSessionTitle(session) {
@@ -60,7 +59,7 @@ export function getRunTitle(content) {
   return "新请求";
 }
 
-export function createStepRun(userMsg, documents = [], searchMode = "off") {
+export function createStepRun(userMsg, documents = [], searchMode = "auto") {
   return {
     id: createRunId(),
     title: getRunTitle(userMsg.content),
@@ -85,7 +84,7 @@ export function createPendingAssistant(runId) {
   };
 }
 
-export function createUserMessage(content, documents = [], searchMode = "off") {
+export function createUserMessage(content, documents = [], searchMode = "auto") {
   return {
     id: createMessageId("u"),
     role: "user",

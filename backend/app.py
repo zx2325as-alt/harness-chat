@@ -11,6 +11,8 @@ if ROOT not in sys.path:
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from .global_log import log_event
+
 from fastapi import FastAPI, Request, UploadFile, File, Body, HTTPException, Form
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -909,8 +911,20 @@ def create_app() -> FastAPI:
         options["_documents_context_block"] = block
         options["_documents_context_meta"] = dmeta
         options["_documents_context_block_compact"] = str((dmeta or {}).get("compact_block") or "")
-        result = await harness.run(str(last_prompt), messages=hist, mode=req.mode, options=options)
-        return result
+        try:
+            result = await harness.run(str(last_prompt), messages=hist, mode=req.mode, options=options)
+            return result
+        except Exception as exc:
+            await log_event(
+                "chat_exception",
+                {
+                    "trace_id": str(options.get("trace_id") or ""),
+                    "session_id": str(options.get("session_id") or ""),
+                    "mode": str(req.mode or ""),
+                    "error": str(exc),
+                },
+            )
+            raise
 
     @app.post("/api/chat/stream")
     async def chat_stream(req: ChatRequest, request: Request) -> Any:
@@ -1039,6 +1053,16 @@ def create_app() -> FastAPI:
                     ):
                         await queue.put(ev)
                 except Exception as exc:
+                    await log_event(
+                        "chat_stream_exception",
+                        {
+                            "trace_id": str(trace_id),
+                            "session_id": str(session_id or ""),
+                            "mode": str(req.mode or ""),
+                            "error_code": "SERVER_STREAM_EXCEPTION",
+                            "error": str(exc),
+                        },
+                    )
                     await queue.put(
                         {
                             "event": "error",

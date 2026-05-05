@@ -256,8 +256,7 @@ export default {
       draft: "",
       attachments: [],
       folderLoading: false,
-      // 默认全局不联网：仅当用户手动开启才允许联网
-      searchMode: "off",
+      searchMode: "auto",
       openMenu: null,
       modeOptions: MODE_OPTIONS,
       searchOptions: SEARCH_OPTIONS,
