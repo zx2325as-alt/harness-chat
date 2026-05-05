@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, AsyncGenerator
 
 from model_adapters import AskResult, build_adapter
@@ -35,6 +34,7 @@ from tools.refine_pipeline import compile_agent_fallback_draft, stream_refine_fr
 
 from json_utils import extract_balanced_json_object, strip_markdown_json_fence
 from stream_chunking import iter_chunk_spans
+from refine_shared import Step, _pg, _int_budget, _clean_review_body
 
 
 SSE_PROTOCOL_META: Dict[str, Any] = {"protocol_version": 1, "stream_schema": "harness-v1"}
@@ -72,14 +72,6 @@ def _format_messages_snippet(messages: Optional[List[Dict[str, Any]]], n: int = 
     return "\n".join(reversed(picked))
 
 
-def _pg(meta: Optional[Dict[str, Any]], phase_group: str, event_summary: str) -> Dict[str, Any]:
-    """为步骤 meta 注入前端分组与叙事摘要。"""
-    m = dict(meta or {})
-    m["phase_group"] = phase_group
-    m["event_summary"] = event_summary
-    return m
-
-
 def _analyze_step_summary(analysis: Dict[str, Any]) -> str:
     tt = str(analysis.get("task_type") or "通用")
     cx = str(analysis.get("complexity") or "—")
@@ -96,14 +88,6 @@ def _track_select_summary(chosen: str, intended: str, analysis: Dict[str, Any]) 
     if intended and str(intended) != str(chosen):
         return f"原计划「{names.get(intended, intended)}」，实际执行「{base}」。{extra}".strip()
     return f"执行路径：「{base}」。{extra}".strip()
-
-
-def _int_budget(options: Optional[Dict[str, Any]], key: str, default: int, *, minimum: int, maximum: int) -> int:
-    try:
-        value = int((options or {}).get(key, default))
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, min(maximum, value))
 
 
 def _build_layer1_prompt(
@@ -141,35 +125,16 @@ def _build_layer2_prompt(
         "请先识别你自己对初稿仍不确定、需要补证据的地方，再输出修正版答案；"
         "修正版正文中不要保留“问题清单/修正后答案/仍不确定处”等元语言标题。\n"
         "（请勿在答案正文中间单独使用行首「仍不确定处：」作为小节标题，以免后处理误截断。）\n"
+        "\n【强制格式】修正版答案正文必须用分隔符包裹：\n"
+        "<<<FINAL_ANSWER>>>\n"
+        "<修正版答案正文>\n"
+        "<<<END_FINAL_ANSWER>>>\n"
         "\n如需核实实时数据，可在审查结论中单行输出：<<ACTION: web_search(\"查询词\")>>\n"
     )
     ht = _format_messages_snippet(messages, 4, max_chars=max_history_chars)
     if ht:
         l2_prompt = f"【近期对话上下文参考】\n{ht}\n\n" + l2_prompt
     return l2_prompt
-
-
-def _clean_review_body(review_body: str) -> str:
-    text = str(review_body or "").strip()
-    if not text:
-        return ""
-
-    m = re.search(r"(?is)(?:修正版答案|最终答案|答案正文|修正后答案)\s*[:：]\s*", text)
-    if m:
-        rest = text[m.end() :]
-        parts = re.split(r"(?is)(?:\n\s*)(?:仍不确定处|不确定点|问题清单)\s*[:：]", rest, maxsplit=1)
-        body = parts[0].strip()
-        if body:
-            return body
-
-    text = re.sub(r"(?is)^\s*初稿问题清单\s*[:：].*?(?=\n\s*(?:修正版答案|最终答案)|\Z)", "", text)
-    # 仅裁掉「正文末尾」的元信息块，避免误删正文中间的合法用语
-    tail_pat = re.compile(r"(?is)(\n\s*(?:仍不确定处|不确定点|问题清单)\s*[:：].*)$")
-    m2 = tail_pat.search(text)
-    if m2 is not None and m2.start() >= max(24, int(len(text) * 0.22)):
-        text = text[: m2.start()].strip()
-
-    return text.strip()
 
 
 def _build_layer3_prompt(prompt: str, instruction: str, review_body: str) -> str:
@@ -179,50 +144,6 @@ def _build_layer3_prompt(prompt: str, instruction: str, review_body: str) -> str
         f"【原始问题】\n{prompt.strip()}\n\n"
         f"【审查层答案】\n{review_clean}\n"
     )
-
-
-@dataclass
-class Step:
-    name: str
-    status: str  # "ok" | "error" | "skipped"
-    provider: Optional[str] = None
-    model: Optional[str] = None
-    latency_ms: Optional[int] = None
-    input_preview: Optional[str] = None
-    output: Optional[str] = None
-    error: Optional[str] = None
-    meta: Optional[Dict[str, Any]] = None
-
-    def _step_id(self) -> str:
-        meta = self.meta or {}
-        if meta.get("step_id"):
-            return str(meta["step_id"])
-        pg = str(meta.get("phase_group") or meta.get("pipeline_phase") or "")
-        if self.name == "agent_iteration" and meta.get("i") is not None:
-            return f"{self.name}:{meta.get('i')}"
-        if self.name == "review_web_search" and meta.get("review_round") is not None:
-            return f"{self.name}:{pg}:{meta.get('review_round')}"
-        if self.name == "agent_web_search" and meta.get("query"):
-            return f"{self.name}:{meta.get('query')}"
-        return f"{self.name}:{pg}" if pg else self.name
-
-    def to_dict(self) -> Dict[str, Any]:
-        meta = dict(self.meta or {})
-        sid = self._step_id()
-        meta.setdefault("step_id", sid)
-        meta.setdefault("parent_id", meta.get("phase_group") or meta.get("pipeline_phase") or "")
-        return {
-            "step_id": sid,
-            "name": self.name,
-            "status": self.status,
-            "provider": self.provider,
-            "model": self.model,
-            "latency_ms": self.latency_ms,
-            "input_preview": self.input_preview,
-            "output": self.output,
-            "error": self.error,
-            "meta": meta,
-        }
 
 
 class ModelRegistry:
@@ -452,6 +373,8 @@ class DualTrackHarness:
             s = str(x or "").strip()
             if s and s not in out:
                 out.append(s)
+        # 严格过滤未注册模型，避免主循环因配置错误直接崩链
+        out = [m for m in out if self.registry.is_registered(m)]
         return out or [routing_default or "gpt-5.5"]
 
     def _fast_cache_scope(self, options: Dict[str, Any]) -> str:
@@ -1311,6 +1234,7 @@ class DualTrackHarness:
         self, candidates: List[str], prompt: str, options: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
         last_error = ""
+        last_error_code = ""
         filtered = [c for c in (candidates or []) if c]
         attempt_total = max(1, len(filtered))
         for attempt_idx, mk in enumerate(filtered):
@@ -1361,13 +1285,25 @@ class DualTrackHarness:
                 return
             except Exception as e:
                 last_error = str(e)
-                yield {"event": "model_error", "model": mk, "error": last_error}
+                low = last_error.lower()
+                if "429" in last_error or "too many requests" in low or "rate limit" in low:
+                    last_error_code = "RATE_LIMIT"
+                elif "timeout" in low or "timed out" in low:
+                    last_error_code = "TIMEOUT"
+                elif "502" in last_error or "503" in last_error or "504" in last_error or "bad gateway" in low:
+                    last_error_code = "UPSTREAM_5XX"
+                elif "401" in last_error or "403" in last_error:
+                    last_error_code = "AUTH"
+                else:
+                    last_error_code = "MODEL_STREAM_ERROR"
+                yield {"event": "model_error", "model": mk, "error": last_error, "error_code": last_error_code}
                 continue
 
         yield {
             "event": "error",
             "error": f"All fallback models failed in stream. Last error: {last_error or 'unknown'}",
             "error_code": "STREAM_FALLBACK_EXHAUSTED",
+            "last_error_code": last_error_code or None,
         }
 
     def _session_search_redis_ttl(self, options: Dict[str, Any]) -> int:
@@ -1397,6 +1333,104 @@ class DualTrackHarness:
             return True
         return False
 
+    def _effective_relevance_filter_sync(self, options: Dict[str, Any]) -> bool:
+        """是否对本请求同步跑检索相关性过滤（可显式覆盖；否则由 sync_default_mode + 当前轨决定）。"""
+        v = options.get("relevance_filter_sync")
+        if v is True:
+            return True
+        if v is False:
+            return False
+        h = self.cfg.get("harness") or {}
+        rcfg = (h.get("search") or {}).get("relevance_filter") or {}
+        mode = str(rcfg.get("sync_default_mode", "quality_tracks")).strip().lower()
+        if mode in ("always", "all", "true", "1"):
+            return True
+        if mode in ("never", "none", "false", "0"):
+            return False
+        track = str(options.get("_runtime_track") or "").strip().lower()
+        raw = rcfg.get("sync_tracks") or ["refine", "agent"]
+        allowed = {str(x).strip().lower() for x in raw if str(x).strip()}
+        return track in allowed
+
+    def _relevance_needs_reapply(self, sr: Dict[str, Any]) -> bool:
+        """会话/内存缓存中仍为 deferred 或未成功过滤时，需要补跑。"""
+        if sr.get("error") or not (sr.get("sources") or []):
+            return False
+        m = sr.get("relevance_filter_meta")
+        if not m:
+            return True
+        if m.get("deferred"):
+            return True
+        if m.get("error"):
+            return True
+        try:
+            checked = int(m.get("checked") or 0)
+        except (TypeError, ValueError):
+            checked = 0
+        if checked > 0 or m.get("batches") is not None:
+            return False
+        return True
+
+    async def _apply_relevance_filter_inplace(self, sr: Dict[str, Any], options: Dict[str, Any]) -> None:
+        from search_relevance import filter_sources_by_relevance, rebuild_context_from_sources
+
+        h = self.cfg.get("harness") or {}
+        rcfg = (h.get("search") or {}).get("relevance_filter") or {}
+        uq = str(options.get("search_prompt_base") or "")[:6000]
+        mk = str(rcfg.get("model") or "gpt-5.5")
+        context_chars = _int_budget(options, "search_context_chars", 6000, minimum=1500, maximum=12000)
+        kept, fmeta = await filter_sources_by_relevance(
+            self,
+            uq,
+            list(sr.get("sources") or []),
+            model_key=mk,
+            options=options,
+        )
+        if kept and len(kept) != len(sr.get("sources") or []):
+            sr["sources"] = kept
+            sr["context"] = rebuild_context_from_sources(
+                kept, datetime.now().isoformat(timespec="seconds"), max_total_chars=context_chars
+            )
+        sr["relevance_filter_meta"] = fmeta
+
+    async def _ensure_relevance_filtered(
+        self,
+        sr: Dict[str, Any],
+        options: Dict[str, Any],
+        *,
+        vq: str,
+        cache_key: str,
+        request_cache: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """对 deferred/未过滤的检索结果补跑相关性过滤，并写回请求内缓存与会话 Redis。"""
+        out = dict(sr)
+        h = self.cfg.get("harness") or {}
+        rcfg = (h.get("search") or {}).get("relevance_filter") or {}
+        if not rcfg.get("enabled", False):
+            return out
+        if not self._effective_relevance_filter_sync(options):
+            return out
+        if not self._relevance_needs_reapply(out):
+            return out
+        try:
+            await self._apply_relevance_filter_inplace(out, options)
+        except Exception as e:
+            out["relevance_filter_meta"] = {**(out.get("relevance_filter_meta") or {}), "reapply_error": str(e)}
+            return out
+        request_cache[cache_key] = dict(out)
+        session_id = str(options.get("session_id") or "").strip()
+        if self._redis and session_id:
+            try:
+                await asyncio.to_thread(
+                    self._redis.set,
+                    self._session_search_cache_key(session_id, vq),
+                    json.dumps(out, ensure_ascii=False),
+                    self._session_search_redis_ttl(options),
+                )
+            except Exception:
+                pass
+        return out
+
     async def perform_web_search(self, query: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         options = options or {}
         vq, fc, reason = validate_search_query((query or "").strip())
@@ -1413,10 +1447,14 @@ class DualTrackHarness:
             }
         cache = options.setdefault("_request_search_cache", {})
         cache_key = self._normalized_search_key(vq)
-        if cache_key in cache:
-            return dict(cache[cache_key])
-
         session_id = str(options.get("session_id") or "").strip()
+
+        if cache_key in cache:
+            out = await self._ensure_relevance_filtered(
+                dict(cache[cache_key]), options, vq=vq, cache_key=cache_key, request_cache=cache
+            )
+            return out
+
         if self._redis and session_id:
             try:
                 cached = await asyncio.to_thread(self._redis.get, self._session_search_cache_key(session_id, vq))
@@ -1424,7 +1462,10 @@ class DualTrackHarness:
                     data = json.loads(cached)
                     data["cached"] = True
                     cache[cache_key] = data
-                    return dict(data)
+                    out = await self._ensure_relevance_filtered(
+                        data, options, vq=vq, cache_key=cache_key, request_cache=cache
+                    )
+                    return out
             except Exception:
                 pass
 
@@ -1441,7 +1482,8 @@ class DualTrackHarness:
         if not rcfg.get("enabled", False):
             cache[cache_key] = dict(sr)
             return sr
-        if not bool(options.get("relevance_filter_sync", False)):
+
+        if not self._effective_relevance_filter_sync(options):
             sr["relevance_filter_meta"] = {"deferred": True}
             cache[cache_key] = dict(sr)
             if self._redis and session_id:
@@ -1455,25 +1497,9 @@ class DualTrackHarness:
                 except Exception:
                     pass
             return sr
-        try:
-            from search_relevance import filter_sources_by_relevance, rebuild_context_from_sources
 
-            uq = str(options.get("search_prompt_base") or "")[:6000]
-            mk = str(rcfg.get("model") or "gpt-5.5")
-            context_chars = _int_budget(options, "search_context_chars", 6000, minimum=1500, maximum=12000)
-            kept, fmeta = await filter_sources_by_relevance(
-                self,
-                uq,
-                list(sr.get("sources") or []),
-                model_key=mk,
-                options=options,
-            )
-            if kept and len(kept) != len(sr.get("sources") or []):
-                sr["sources"] = kept
-                sr["context"] = rebuild_context_from_sources(
-                    kept, datetime.now().isoformat(timespec="seconds"), max_total_chars=context_chars
-                )
-            sr["relevance_filter_meta"] = fmeta
+        try:
+            await self._apply_relevance_filter_inplace(sr, options)
         except Exception as e:
             sr["relevance_filter_meta"] = {"error": str(e)}
         cache[cache_key] = dict(sr)
@@ -1871,7 +1897,7 @@ class DualTrackHarness:
             return True, "search_required"
         if si in ("required", "freshness_required"):
             return True, f"search_intent_{si}"
-        if analysis.get("manual_hits") and cx == "high":
+        if analysis.get("manual_hits"):
             return True, "manual_keyword_trigger"
         raw_type = str(analysis.get("type") or "").lower()
         if raw_type == "web_search":
@@ -1897,7 +1923,7 @@ class DualTrackHarness:
         if sm and sm in rk:
             return sm
         tpl = hcfg.get("task_model_templates") or {}
-        rev = (tpl.get("reasoning") or {}).get("review") or []
+        rev = ((tpl.get("reasoning") or {}).get("refine_models") or {}).get("review") or []
         if isinstance(rev, list) and rev:
             first = str(rev[0]).strip()
             if first:
@@ -1905,7 +1931,7 @@ class DualTrackHarness:
         am = str(agent_model or "").strip()
         if am:
             return am
-        routing = self.cfg.get("routing") or {}
+        routing = hcfg.get("routing") or {}
         default_model = str(routing.get("default_model") or "gpt-5.5").strip()
         dm = routing.get("default_models") or [default_model]
         if isinstance(dm, list) and dm:

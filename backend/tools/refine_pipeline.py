@@ -21,7 +21,7 @@ async def stream_refine_from_draft(
     meta_extra: 写入各 step.meta，用于区分 agent 工具调用 / 兜底等。
     extra_review_context: 可选自检文本，仅注入审查层 prompt，不进入最终用户可见草稿。
     """
-    from harness import Step, _clean_review_body, _int_budget, _pg  # 运行时导入，避免与 harness 顶层循环依赖
+    from refine_shared import Step, _clean_review_body, _int_budget, _pg
 
     extra_meta = dict(meta_extra or {})
     chain = hcfg.get("refine_chain") or {}

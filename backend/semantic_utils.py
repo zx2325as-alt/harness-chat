@@ -83,6 +83,28 @@ def _embedding_vectors(texts: Iterable[str]):
         return None
 
 
+async def warm_up_embedding_model() -> None:
+    """
+    预热 sentence-transformers：触发模型加载 + 一次最小 encode，
+    避免首个文档问答请求在主路径上承担冷启动开销。
+    """
+    import asyncio
+
+    def _warm_sync() -> None:
+        m = _load_sentence_transformer()
+        if m is None:
+            return
+        try:
+            m.encode(["-"], normalize_embeddings=True)
+        except Exception:
+            return
+
+    try:
+        await asyncio.to_thread(_warm_sync)
+    except Exception:
+        return
+
+
 def semantic_similarity(left: str, right: str) -> float:
     emb = _embedding_vectors([left, right])
     if emb is not None and len(emb) == 2:

@@ -59,6 +59,12 @@ harness:
     relevance_filter:
       enabled: true
       model: "gpt-5.5"
+      # 效果优先：全轨同步跑检索摘要相关性过滤（可改 quality_tracks + sync_tracks 省小模型调用）
+      sync_default_mode: always
+      sync_tracks:
+        - refine
+        - agent
+        - fast
     session_cache_ttl_s: 1800
     session_cache_ttl_freshness_s: 600
     # 会话内检索结果 Redis TTL：强时效 < 显式联网 < 默认（秒）
@@ -87,6 +93,12 @@ harness:
     chunk_overlap: 900
     max_pdf_pages: 100
     max_sheet_rows: 2500
+    rerank:
+      enabled: true
+      # 优先使用专用重排序模型（走 /v1/rerank），失败再回退到 chat 模型
+      model: "bge-reranker-v2-m3"
+      max_items: 12
+      top_k: 8
 
   fast_answer_cache:
     enabled: false
@@ -254,9 +266,15 @@ harness:
         目标：找错误、补漏洞、加深度；指出不确定之处并给出修正建议。
         请输出：
         1) 初稿问题清单（要点化）
-        2) 修正版答案（尽量严谨）
+        2) 修正版答案（尽量严谨，必须用下列分隔符包裹正文，便于服务器稳定提取）
         3) 仍不确定处与需要补充信息
-        请将修正版答案作为独立正文输出，不要在正文里保留“问题清单”“修正版答案”“仍不确定处”等元批注标题。
+        
+        【关键格式约束】修正版答案必须严格按如下格式输出（分隔符独占一行）：
+        <<<FINAL_ANSWER>>>
+        <这里是给用户看的完整修正版答案正文>
+        <<<END_FINAL_ANSWER>>>
+        
+        你仍然可以在审查结论中单行输出动作：<<ACTION: web_search("查询词")>>（不要放进 FINAL_ANSWER 分隔符内）。
     # Layer 3: polish (format, coherence)
     layer3:
       name: "polish"
@@ -317,6 +335,15 @@ models:
     api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
     model: "gpt-5.5"
     timeout_s: 180
+
+  # n1n Rerank API: https://api.n1n.ai/v1/rerank
+  # docs 示例模型：BAAI/bge-reranker-v2-m3
+  bge-reranker-v2-m3:
+    provider: "n1n_rerank"
+    base_url: "https://api.n1n.ai"
+    api_key: "sk-WnCeeu7sBfIFHIQmkgy6ZsTwNF6BiQ0sGf61CKTLr1IQ5lCU"
+    model: "BAAI/bge-reranker-v2-m3"
+    timeout_s: 30
 
   grok-4-20-reasoning:
     provider: "openai_compat"

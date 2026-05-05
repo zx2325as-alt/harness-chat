@@ -33,6 +33,7 @@ from document_extract import (
 from local_docs import load_folder_documents
 from semantic_utils import batch_semantic_similarity
 from utils import load_yaml, new_trace_id, env_get
+from doc_rerank import rerank_document_chunks
 
 
 CONFIG_PATH = os.path.join(ROOT, "config.yaml")
@@ -247,6 +248,115 @@ def _documents_context(
     if len(pieces) == 1:
         return ""
     return "\n".join(pieces)
+
+
+def _rank_document_rows(
+    documents: Any,
+    query: str,
+    *,
+    bm25_weight: float,
+    embedding_weight: float,
+) -> List[Dict[str, Any]]:
+    if not isinstance(documents, list) or not documents:
+        return []
+    ranked: List[Dict[str, Any]] = []
+    for idx, doc in enumerate(documents, start=1):
+        if not isinstance(doc, dict):
+            continue
+        name = doc.get("name") or f"文档{idx}"
+        chunks = doc.get("chunks") or []
+        if isinstance(chunks, list) and chunks:
+            for c in chunks:
+                if not isinstance(c, dict):
+                    continue
+                content = str(c.get("content") or "")
+                if content:
+                    ranked.append({"name": name, "content": content, "score": 0.0, "chunk": c.get("index")})
+        else:
+            content = str(doc.get("content") or "")
+            if content:
+                ranked.append({"name": name, "content": content, "score": 0.0, "chunk": None})
+    if not ranked:
+        return []
+    if not query:
+        return ranked
+    texts = [str(r.get("content") or "") for r in ranked]
+    bm = _doc_bm25_scores(query, texts)
+    for i, r in enumerate(ranked):
+        r["score"] = float(bm[i]) if i < len(bm) else 0.0
+    ranked.sort(key=lambda x: x.get("score", 0), reverse=True)
+    top_n = ranked[:20]
+    emb_scores = batch_semantic_similarity(query, [str(r.get("content") or "")[:2000] for r in top_n])
+    for idx, row in enumerate(top_n):
+        row["embedding_score"] = float(emb_scores[idx]) if idx < len(emb_scores) else 0.0
+        row["score"] = row.get("score", 0.0) * bm25_weight + row.get("embedding_score", 0.0) * embedding_weight
+    for row in top_n:
+        name = str(row.get("name") or "")
+        head = str(row.get("content") or "")[:800]
+        bonus = 0.0
+        if query.strip():
+            bonus = 0.028 * min(8, _doc_score(query, name) + _doc_score(query, head))
+        row["score"] = float(row.get("score", 0.0)) + bonus
+    top_n.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return top_n + ranked[20:]
+
+
+def _format_documents_context_from_rows(rows: List[Dict[str, Any]], *, max_total_chars: int) -> str:
+    if not rows:
+        return ""
+    pieces = ["【已上传文档内容】"]
+    used = 0
+    for idx, row in enumerate(rows, start=1):
+        content = str(row.get("content") or "")
+        if not content:
+            continue
+        remain = max_total_chars - used
+        if remain <= 0:
+            break
+        clipped = content[:remain]
+        used += len(clipped)
+        chunk_label = f" · 片段 {row.get('chunk')}" if row.get("chunk") is not None else ""
+        pieces.append(f"\n【文档 {idx}: {row.get('name')}{chunk_label}】\n{clipped}")
+    return "\n".join(pieces) if len(pieces) > 1 else ""
+
+
+async def _prepare_documents_context_block_async(prompt: str, options: Dict[str, Any], harness: DualTrackHarness, cfg: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    doc_budget = _int_option(options, "doc_context_chars", 40_000, minimum=2_000, maximum=60_000)
+    bw = float(options.get("_doc_bm25_weight", 0.55))
+    ew = float(options.get("_doc_embedding_weight", 0.45))
+    s = bw + ew
+    if s <= 0:
+        bw, ew = 0.55, 0.45
+    else:
+        bw, ew = bw / s, ew / s
+
+    rows = await asyncio.to_thread(_rank_document_rows, options.get("documents"), str(prompt), bm25_weight=bw, embedding_weight=ew)
+    meta: Dict[str, Any] = {"ranked": len(rows)}
+    if not rows:
+        return "", meta
+
+    hdoc = (cfg.get("harness") or {}).get("documents") or {}
+    rr = hdoc.get("rerank") or {}
+    if bool(rr.get("enabled", False)):
+        model_key = str(rr.get("model") or "gpt-5.5").strip()
+        max_items = int(rr.get("max_items", 12))
+        top_k = int(rr.get("top_k", 8))
+        picked, rmeta = await rerank_document_chunks(
+            harness,
+            str(prompt),
+            rows,
+            model_key=model_key,
+            max_items=max_items,
+            top_k=top_k,
+            options=options,
+        )
+        meta["rerank"] = rmeta
+        rows = picked
+    else:
+        rows = rows[:8]
+
+    block = _format_documents_context_from_rows(rows, max_total_chars=doc_budget)
+    return block, meta
 
 
 def _int_option(options: Dict[str, Any], key: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -481,6 +591,13 @@ def _validate_harness_models(cfg: Dict[str, Any]) -> None:
                     s = str(mk or "").strip()
                     if s and s not in models:
                         print(f"Warning: task_model_templates.{tt}.refine_models.{pool} unknown model: {s!r}")
+    allowed_tt = {"conversation", "generation", "reasoning", "code"}
+    for tt in (h.get("task_model_templates") or {}).keys():
+        if str(tt) not in allowed_tt:
+            print(
+                f"Warning: task_model_templates has unknown task_type key {tt!r}; "
+                "_merge_task_model_templates will fall back to conversation template."
+            )
 
 
 def _warn_analyzer_timeout_budget(cfg: Dict[str, Any]) -> None:
@@ -522,6 +639,16 @@ def create_app() -> FastAPI:
     )
 
     harness = DualTrackHarness(cfg, redis_client=redis_client)
+
+    @app.on_event("startup")
+    async def _warmup_startup() -> None:
+        # 异步预热 embedding 模型，避免首个文档问答冷启动卡顿
+        try:
+            from semantic_utils import warm_up_embedding_model
+
+            asyncio.create_task(warm_up_embedding_model())
+        except Exception:
+            return
 
     @app.post("/api/documents/parse")
     async def parse_documents(
@@ -664,9 +791,9 @@ def create_app() -> FastAPI:
         hdoc = (cfg.get("harness") or {}).get("documents") or {}
         options["_doc_bm25_weight"] = float(hdoc.get("bm25_weight", 0.55))
         options["_doc_embedding_weight"] = float(hdoc.get("embedding_weight", 0.45))
-        options["_documents_context_block"] = await asyncio.to_thread(
-            _prepare_documents_context_block, str(last_prompt), options
-        )
+        block, dmeta = await _prepare_documents_context_block_async(str(last_prompt), options, harness, cfg)
+        options["_documents_context_block"] = block
+        options["_documents_context_meta"] = dmeta
         result = await harness.run(str(last_prompt), messages=hist, mode=req.mode, options=options)
         return result
 
@@ -713,9 +840,9 @@ def create_app() -> FastAPI:
         hdoc = (cfg.get("harness") or {}).get("documents") or {}
         options["_doc_bm25_weight"] = float(hdoc.get("bm25_weight", 0.55))
         options["_doc_embedding_weight"] = float(hdoc.get("embedding_weight", 0.45))
-        options["_documents_context_block"] = await asyncio.to_thread(
-            _prepare_documents_context_block, str(last_prompt_str), options
-        )
+        block2, dmeta2 = await _prepare_documents_context_block_async(str(last_prompt_str), options, harness, cfg)
+        options["_documents_context_block"] = block2
+        options["_documents_context_meta"] = dmeta2
 
         client_run_id = str(options.get("client_run_id") or "").strip()
         stream_connect_attempt = _int_option(options, "stream_connect_attempt", 0, minimum=0, maximum=20)
