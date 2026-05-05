@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+
+# 确保无论 cwd / PYTHONPATH 如何，都能加载与本文件同目录下的 harness、semantic_utils 等模块
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request, UploadFile, File, Body, HTTPException, Form
@@ -23,7 +30,6 @@ from semantic_utils import batch_semantic_similarity
 from utils import load_yaml, new_trace_id, env_get
 
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(ROOT, "config.yaml")
 
 
