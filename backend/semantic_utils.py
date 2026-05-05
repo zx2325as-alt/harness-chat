@@ -123,6 +123,7 @@ def batch_semantic_similarity(query: str, texts: List[str]) -> List[float]:
 
 _EMBED_LIMITS = httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=60.0)
 _embed_client: Optional[httpx.AsyncClient] = None
+_embed_sem: Optional[asyncio.Semaphore] = None
 
 
 def _get_embed_client() -> httpx.AsyncClient:
@@ -130,6 +131,14 @@ def _get_embed_client() -> httpx.AsyncClient:
     if _embed_client is None or _embed_client.is_closed:
         _embed_client = httpx.AsyncClient(limits=_EMBED_LIMITS)
     return _embed_client
+
+
+def _get_embed_semaphore() -> asyncio.Semaphore:
+    global _embed_sem
+    # 纯线上 embeddings：限制并发，避免瞬时峰值导致 429 → 全链降级
+    if _embed_sem is None:
+        _embed_sem = asyncio.Semaphore(8)
+    return _embed_sem
 
 
 def _openai_embeddings_url(base_url: str) -> str:
@@ -177,7 +186,8 @@ async def embed_texts(
         return []
     body = {"model": model, "input": cleaned}
     client = _get_embed_client()
-    r = await client.post(url, headers=headers, json=body, timeout=timeout_s)
+    async with _get_embed_semaphore():
+        r = await client.post(url, headers=headers, json=body, timeout=timeout_s)
     r.raise_for_status()
     data = r.json()
     rows = data.get("data")

@@ -103,8 +103,10 @@ class SearchService:
         }
 
         t0 = time.perf_counter()
-        # 单次 HTTP 等待上限：夹在 timeout_s 与 timeout_s_max 之间（原先 max 会把两档都抬高）
-        http_timeout = max(3.0, min(float(self.timeout_s_max), float(self.timeout_s)))
+        # 单次 HTTP 等待上限：夹在 timeout_s 与 timeout_s_max 之间（timeout_s_max 用作硬上限）
+        base_t = max(3.0, float(self.timeout_s))
+        hard_t = max(3.0, float(self.timeout_s_max))
+        http_timeout = min(hard_t, base_t)
         try:
             async with httpx.AsyncClient(timeout=http_timeout) as client:
                 r = await client.post(TAVILY_SEARCH_URL, json=body)

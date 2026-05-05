@@ -192,14 +192,25 @@ class DualTrackHarness:
             return d
         return _tag
 
-    def _track_search_overrides(self, track: str) -> Dict[str, Any]:
+    def _track_search_overrides(self, track: str, analysis: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         search_cfg = (self.cfg.get("harness") or {}).get("search") or {}
         by_track = search_cfg.get("by_track") or {}
         base = by_track.get(track) or {}
-        return {
+        ov = {
             "override_max_results": base.get("max_results"),
             "override_search_depth": base.get("search_depth"),
         }
+        # 强时效/强制检索：二次提升深度与条数（效果优先）
+        si = str((analysis or {}).get("search_intent") or "none").lower()
+        if si in ("freshness_required", "required"):
+            try:
+                ov["override_max_results"] = max(int(ov.get("override_max_results") or 0), 12 if track == "fast" else 15)
+            except Exception:
+                ov["override_max_results"] = 12 if track == "fast" else 15
+            depth = str(ov.get("override_search_depth") or "basic").lower()
+            if depth in ("basic", "fast", "ultra-fast"):
+                ov["override_search_depth"] = "advanced"
+        return ov
 
     def _normalized_search_key(self, query: str) -> str:
         return normalize_text(query).lower()
@@ -260,6 +271,16 @@ class DualTrackHarness:
             f"{block}"
         )
 
+    def _attach_documents_compact_to_prompt(self, prompt: str, options: Optional[Dict[str, Any]]) -> str:
+        block = str((options or {}).get("_documents_context_block_compact") or "").strip()
+        if not block:
+            return prompt
+        return (
+            f"{prompt}\n\n"
+            "【参考文档指针】以下为可能相关的片段来源与短摘录；仅在需要引用具体证据时使用，并尽量标注 文档名#片段。\n\n"
+            f"{block}"
+        )
+
     def _build_refine_layer1_prompt(
         self,
         prompt: str,
@@ -291,7 +312,8 @@ class DualTrackHarness:
         extra_review_context: str = "",
     ) -> str:
         prompt = _build_layer2_prompt(
-            self._attach_documents_to_prompt(question, options),
+            # 审查层用“指针版”文档上下文，减少重复注入导致的 token 压力
+            self._attach_documents_compact_to_prompt(question, options),
             instruction,
             draft_answer,
             messages,
@@ -316,7 +338,8 @@ class DualTrackHarness:
         max_history_chars: int = 2000,
     ) -> str:
         return _build_layer3_prompt(
-            self._attach_documents_to_prompt(question, options),
+            # 润色层同样使用“指针版”，避免再次注入全文档块
+            self._attach_documents_compact_to_prompt(question, options),
             instruction,
             _clean_review_body(review_body),
             messages=messages,
@@ -494,7 +517,8 @@ class DualTrackHarness:
                 guessed_query = normalize_text(sig_base)
             if guessed_query:
                 speculative_guess_key = self._normalized_search_key(guessed_query)
-                sub_opts = {**options, **{k: v for k, v in self._track_search_overrides("fast").items() if v is not None}}
+                # 注意：此处 analysis 尚未产出，只能使用 spec_analysis 作为 intent 参考
+                sub_opts = {**options, **{k: v for k, v in self._track_search_overrides("fast", spec_analysis).items() if v is not None}}
                 speculative_search_task = asyncio.create_task(self.perform_web_search(guessed_query, sub_opts))
         try:
             analysis = await asyncio.wait_for(
@@ -522,6 +546,10 @@ class DualTrackHarness:
                 chosen_track = nt
 
         should_search, search_reason = self.should_search(prompt, analysis, options)
+        # 路由显式要求：即便 should_search 未命中，也允许快轨入口注入一次联网摘要
+        if bool(analysis.get("force_entry_search")):
+            should_search = True
+            search_reason = search_reason or "force_entry_search"
         search_mandatory = self._search_mandatory(analysis, options)
         if self._should_force_relevance_filter_sync(analysis, options):
             options["relevance_filter_sync"] = True
@@ -619,6 +647,7 @@ class DualTrackHarness:
             search_queries = [str(item or "").strip() for item in raw_search_queries if str(item or "").strip()]
         elif str(data.get("search_query") or "").strip():
             search_queries = [str(data.get("search_query") or "").strip()]
+        freshness_hint = str(data.get("freshness_hint") or "").strip()
         return {
             "decision": decision,
             "reasons": [f"llm_reason: {reason}"],
@@ -635,6 +664,7 @@ class DualTrackHarness:
             "confidence": confidence,
             "suggested_track": suggested_track or None,
             "search_queries": search_queries,
+            "freshness_hint": freshness_hint,
         }
 
     def _analyzer_heuristic_fallback_result(
@@ -730,7 +760,7 @@ class DualTrackHarness:
             "下列文本本应是一段 JSON 路由判定，但可能损坏。"
             "请只输出一个合法 JSON 对象，键需包含："
             "complexity, decision, task_type, type, search_required, search_query, confidence, "
-            "suggested_track, selected_model, fallback_models, refine_models, reason。"
+            "suggested_track, selected_model, fallback_models, refine_models, freshness_hint, reason。"
             "不要 markdown 围栏，不要解释。\n\n"
             f"<<<BROKEN>>>\n{snippet}\n<<<END>>>"
         )
@@ -1046,6 +1076,7 @@ class DualTrackHarness:
                         continue
                     if cheap_min > 0 and ngram_overlap_ratio(norm, n2) < cheap_min:
                         continue
+                    # 仅用于 fast cache 相似检索：本地稀疏相似足够，避免依赖任何线上 embedding
                     r = semantic_similarity(norm, n2)
                     if r > best_r:
                         best_r = r
@@ -1206,6 +1237,13 @@ class DualTrackHarness:
             # 上限：避免过度扩展 query
             base = f"{base} " + " ".join(extras[:2])
         base = base.strip()
+        # analyzer 可选提示：freshness_hint（如“2026-05/今天/本周/最新版本号”）→ 强化 query 的时间锚点
+        fh = str(analysis.get("freshness_hint") or "").strip()
+        if fh and fh.lower() not in base.lower():
+            # 仅取前 2 个 token，避免污染
+            toks = [t for t in re.split(r"[\s,，;；/\\]+", fh) if t][:2]
+            if toks:
+                base = (base + " " + " ".join(toks)).strip()
         if str(analysis.get("search_intent") or "").lower() == "freshness_required":
             y = datetime.now().year
             year_tok = str(y) if english else f"{y}年"
@@ -1221,11 +1259,21 @@ class DualTrackHarness:
         opts = options or {}
         user_anchor = str(opts.get("search_prompt_base") or "").strip()
         anchor_block = f"【用户原话】\n{user_anchor}\n\n" if user_anchor else ""
+        # 短答场景减少“强制引用”要求；仅在数值/来源敏感时仍强制
+        oi = str(opts.get("output_intent") or "").strip().lower()
+        force_cite = True
+        if oi == "fast" and not bool(opts.get("numeric_sensitive")) and not bool(opts.get("source_sensitive")):
+            force_cite = False
+        cite_line = (
+            "请在答复中对采用的检索内容标注来源序号（如 [1]），并在文末列出引用链接。\n\n"
+            if force_cite
+            else "如使用了检索内容，可选地标注来源序号（如 [1]），并在文末附上链接。\n\n"
+        )
         return (
             f"{search_context}\n"
             "【要求】只把与用户所指实体/时间范围一致的片段当作证据；不一致则说明不确定。\n\n"
             f"{anchor_block}"
-            "请在答复中对采用的检索内容标注来源序号（如 [1]），并在文末列出引用链接。\n\n"
+            f"{cite_line}"
             f"【用户问题】\n{prompt}"
         )
 
@@ -1322,6 +1370,16 @@ class DualTrackHarness:
                 else:
                     last_error_code = "MODEL_STREAM_ERROR"
                 yield {"event": "model_error", "model": mk, "error": last_error, "error_code": last_error_code}
+                # 更可解释：显式告诉前端发生了模型切换
+                if attempt_idx + 1 < len(filtered):
+                    yield {
+                        "event": "model_switch",
+                        "from_model": mk,
+                        "to_model": filtered[attempt_idx + 1],
+                        "reason": last_error_code or "error",
+                        "attempt_index": attempt_idx,
+                        "attempt_total": attempt_total,
+                    }
                 continue
 
         yield {
@@ -1679,7 +1737,7 @@ class DualTrackHarness:
         hard_err = None
         fallback_from = None
         total_latency_ms = 0
-        overrides = self._track_search_overrides("fast")
+        overrides = self._track_search_overrides("fast", analysis)
         sub_opts = {**options, **{k: v for k, v in overrides.items() if v is not None}}
         results = await asyncio.gather(*[self.perform_web_search(q, sub_opts) for q in queries[:4]])
         seen_urls = set()
@@ -1799,7 +1857,7 @@ class DualTrackHarness:
         vq, fc, vreason = validate_search_query(raw_q)
         if fc:
             return f"\n【入口联网】检索词未通过校验（{vreason or fc}），请依赖常识与后续审查层按需检索。\n"
-        overrides = self._track_search_overrides("refine")
+        overrides = self._track_search_overrides("refine", analysis)
         sub_opts = {**options, **{k: v for k, v in overrides.items() if v is not None}}
         results = await asyncio.gather(*[self.perform_web_search(q, sub_opts) for q in queries[:4]])
         err = next((item.get("error") for item in results if item.get("error")), None)
@@ -1831,14 +1889,18 @@ class DualTrackHarness:
         hcfg = self.cfg.get("harness") or {}
         ag_enabled = bool((hcfg.get("agent") or {}).get("enabled", True))
         if mode == "fast":
+            analysis["route_rule"] = "mode_fast"
             return "fast"
         if mode == "refine":
+            analysis["route_rule"] = "mode_refine"
             return "refine"
         if mode == "agent":
             if ag_enabled:
+                analysis["route_rule"] = "mode_agent"
                 return "agent"
             analysis["agent_disabled_fallback"] = True
             analysis["fallback_reason"] = "agent_disabled_by_config"
+            analysis["route_rule"] = "mode_agent_disabled_fallback_refine"
             return "refine"
 
         if mode == "auto" and analysis.get("high_risk_domain"):
@@ -1847,8 +1909,10 @@ class DualTrackHarness:
             if si_h in ("none", "optional"):
                 analysis["search_intent"] = "required"
             if ag_enabled:
+                analysis["route_rule"] = "auto_high_risk_agent"
                 return "agent"
             analysis["fallback_reason"] = analysis.get("fallback_reason") or "high_risk_agent_disabled"
+            analysis["route_rule"] = "auto_high_risk_refine"
             return "refine"
 
         tt = str(analysis.get("task_type") or "").strip().lower()
@@ -1860,32 +1924,44 @@ class DualTrackHarness:
         si = str(analysis.get("search_intent") or "none").lower()
 
         if oi == "fast":
+            analysis["route_rule"] = "output_intent_fast"
             return "fast"
         if oi == "deep":
             if ag_enabled and tt in ("reasoning", "code"):
+                analysis["route_rule"] = "output_intent_deep_agent"
                 return "agent"
+            analysis["route_rule"] = "output_intent_deep_refine"
             return "refine"
 
         if si in ("required", "freshness_required"):
             if ag_enabled and tt in ("reasoning", "code"):
+                analysis["route_rule"] = f"search_intent_{si}_agent"
                 return "agent"
+            analysis["route_rule"] = f"search_intent_{si}_refine"
             return "refine"
 
         if si == "explicit" and tt == "conversation" and cx == "low":
             dec = str(analysis.get("decision") or "fast").lower()
             if dec == "fast":
-                return "refine"
+                # 显式联网但低复杂度：优先保留快轨速度，同时在快轨入口注入联网摘要提升正确性
+                analysis["force_entry_search"] = True
+                analysis["route_rule"] = "explicit_search_lowcx_fast_with_entry_search"
+                return "fast"
 
         if ag_enabled and tt in ("reasoning", "code"):
+            analysis["route_rule"] = "task_type_reasoning_or_code_agent"
             return "agent"
         if tt in ("reasoning", "code") and not ag_enabled:
             analysis["fallback_reason"] = "agent_disabled_by_config"
             analysis["agent_disabled_fallback"] = True
+            analysis["route_rule"] = "task_type_reasoning_or_code_agent_disabled_fallback_refine"
             return "refine"
 
         if cx == "low" and tt == "conversation":
+            analysis["route_rule"] = "lowcx_conversation_fast"
             return "fast"
         if tt == "generation":
+            analysis["route_rule"] = "task_type_generation_refine"
             return "refine"
         try:
             cf = float(analysis.get("confidence") or 1.0)
@@ -1900,14 +1976,18 @@ class DualTrackHarness:
             st = norm_suggested_track(str(analysis.get("suggested_track") or ""))
             if st == "agent" and ag_enabled:
                 analysis["track_select_low_confidence"] = True
+                analysis["route_rule"] = "low_confidence_follow_agent"
                 return "agent"
             if st == "refine":
                 analysis["track_select_low_confidence"] = True
+                analysis["route_rule"] = "low_confidence_follow_refine"
                 return "refine"
             if st == "fast":
                 analysis["track_select_low_confidence"] = True
+                analysis["route_rule"] = "low_confidence_follow_fast"
                 return "fast"
         dec = str(analysis.get("decision") or "fast").lower()
+        analysis["route_rule"] = f"decision_{dec}"
         return "refine" if dec == "refine" else "fast"
 
     def _should_skip_refine_draft(self, prompt: str, analysis: Dict[str, Any], options: Dict[str, Any]) -> bool:
@@ -1922,7 +2002,18 @@ class DualTrackHarness:
     def _stream_slice_chars(self, options: Dict[str, Any]) -> int:
         hcfg = self.cfg.get("harness") or {}
         default_slice = int(hcfg.get("stream_slice_chars", 72))
-        return max(1, int(options.get("stream_slice_chars") or default_slice))
+        v = int(options.get("stream_slice_chars") or default_slice)
+        # 中文更细粒度；英文/代码可更大粒度减少事件数
+        probe = str(options.get("search_prompt_base") or options.get("_fast_cache_identity") or "")
+        if probe:
+            zh = len(re.findall(r"[\u4e00-\u9fff]", probe))
+            total = max(1, len(probe))
+            ratio = zh / float(total)
+            if ratio >= 0.18:
+                v = min(v, 64)
+            elif ratio <= 0.03 and total >= 120:
+                v = max(v, 96)
+        return max(1, v)
 
     async def _emit_text_chunks(self, text: str, options: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
         step = self._stream_slice_chars(options)
@@ -2229,8 +2320,48 @@ class DualTrackHarness:
                     sim_thr = float(ag_tune.get("stuck_reply_similarity", 0.96))
                 except (TypeError, ValueError):
                     sim_thr = 0.96
-                if semantic_similarity(parse_text[:3500], prev_parse_snapshot[:3500]) >= sim_thr:
+                # Agent 卡死检测：优先 ngram overlap（中文更稳），再用稀疏相似补充
+                snap_a = parse_text[:3500]
+                snap_b = prev_parse_snapshot[:3500]
+                ov = ngram_overlap_ratio(snap_a, snap_b)
+                sim = semantic_similarity(snap_a, snap_b)
+                if max(ov, sim) >= sim_thr:
                     conv.pop()
+                    lo = options.get("_agent_loop_ctx") or {}
+                    try:
+                        stuck_hits = int(lo.get("stuck_hits") or 0) + 1
+                    except (TypeError, ValueError):
+                        stuck_hits = 1
+                    lo["stuck_hits"] = stuck_hits
+                    options["_agent_loop_ctx"] = lo
+                    # 连续多次重复：直接走兜底草稿 -> Refine 全链，避免无限纠偏
+                    if stuck_hits >= int(ag_tune.get("stuck_abort_after", 3) or 3):
+                        draft_fb = compile_agent_fallback_draft(conv, prompt)
+                        yield {
+                            "event": "step",
+                            "step": {
+                                "name": "agent_stuck_abort",
+                                "status": "ok",
+                                "meta": _pg(
+                                    {"stuck_hits": stuck_hits, "similarity_threshold": sim_thr},
+                                    "reasoning",
+                                    "多轮输出重复，已提前终止 Agent 循环并进入 Refine 兜底。",
+                                ),
+                            },
+                        }
+                        async for ev in stream_refine_from_draft(
+                            self,
+                            prompt,
+                            draft_fb,
+                            options,
+                            messages,
+                            trace_id,
+                            hcfg,
+                            analysis,
+                            meta_extra={"agent_fallback": True, "reason": "stuck_loop_abort"},
+                        ):
+                            yield ev
+                        return
                     nudge = str(
                         ag_tune.get("stuck_user_nudge")
                         or "【系统】本轮输出与上一轮高度雷同；请换思路：使用 web_search 获取新证据，或使用 refine_answer 提交草稿。"
@@ -2243,7 +2374,7 @@ class DualTrackHarness:
                             "name": "agent_stuck_guard",
                             "status": "ok",
                             "meta": _pg(
-                                {"similarity_threshold": sim_thr},
+                                {"similarity_threshold": sim_thr, "stuck_hits": stuck_hits},
                                 "reasoning",
                                 "检测到输出重复倾向，已注入纠偏提示并放弃本轮 assistant 消息。",
                             ),
@@ -2439,7 +2570,7 @@ class DualTrackHarness:
                         ),
                     },
                 }
-                track_overrides = self._track_search_overrides("agent")
+                track_overrides = self._track_search_overrides("agent", analysis)
                 sr = await self.tools.web_search(vq, {**options, **{k: v for k, v in track_overrides.items() if v is not None}})
                 ctx = (sr.get("context") or "")[:12000]
                 n_ok = len(sr.get("sources") or [])
@@ -2636,6 +2767,7 @@ class DualTrackHarness:
         _tag = self._make_tagger()
 
         yield {"event": "trace", "trace_id": trace_id, "meta": dict(SSE_PROTOCOL_META)}
+        yield {"event": "protocol_meta", "meta": dict(SSE_PROTOCOL_META)}
         yield {"event": "status", "phase": "analyze", "message": "正在分析问题…"}
 
         yield {

@@ -36,6 +36,7 @@ harness:
   agent_tuning:
     stuck_loop_guard: true
     stuck_reply_similarity: 0.88  # 降低阈值，更早检测重复
+    stuck_abort_after: 3  # 连续重复触发次数达到阈值后，直接终止 Agent 并进入 Refine 兜底
 
   search:
     tavily_api_key: "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"
@@ -100,6 +101,8 @@ harness:
       timeout_s: 30
       # RRF 融合参数：score = 1/(k+rank_bm25)+1/(k+rank_emb)
       rrf_k: 60
+    compact:
+      max_items: 8  # Refine L2/L3 使用“文档指针版”上下文的条数
     max_text_chars: 220000
     chunk_size: 7000
     chunk_overlap: 900
@@ -182,6 +185,7 @@ harness:
         "decision": "fast 或 refine",
         "task_type": "conversation | generation | reasoning | code",
         "type": "general | web_search | document_qa | code | math_logic | writing",
+        "freshness_hint": "如问题隐含强时效（今天/本周/2026-05/最新版本号等），给出简短提示；否则为空字符串",
         "search_required": true 或 false,
         "search_query": "若需要联网搜索，给出最适合搜索引擎的短查询词；否则为空字符串",
         "confidence": 0.85,

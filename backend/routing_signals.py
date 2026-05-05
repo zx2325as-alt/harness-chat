@@ -258,6 +258,10 @@ def merge_signals_into_analysis(
     out["high_risk_domain"] = hr
     out["high_risk_hits"] = hits
     out.update(sensitivity)
+    # LLM analyzer 可选字段：freshness_hint（如“今天/本周/2026-05/最新版本号”），用于提升隐含时效意图识别
+    fh = str(analysis.get("freshness_hint") or "").strip()
+    if fh and str(out.get("search_intent") or "none").lower() in ("none", "optional", "explicit", ""):
+        out["search_intent"] = "freshness_required"
     cur_si = str(out.get("search_intent") or "none").lower()
     if (out.get("numeric_sensitive") or out.get("source_sensitive")) and cur_si in (
         "none",
@@ -296,6 +300,16 @@ def reasoning_keyword_boost(prompt: str) -> Tuple[bool, str]:
         "P vs NP",
         "时间复杂度",
         "空间复杂度",
+        "正则",
+        "regex",
+        "SQL",
+        "数据库",
+        "查询优化",
+        "索引",
+        "Explain",
+        "执行计划",
+        "数据分析",
+        "可视化",
     )
     if any(k in t for k in logic_kw):
         return True, "logic_keywords"

@@ -322,6 +322,25 @@ def _format_documents_context_from_rows(rows: List[Dict[str, Any]], *, max_total
     return "\n".join(pieces) if len(pieces) > 1 else ""
 
 
+def _format_documents_context_compact(rows: List[Dict[str, Any]], *, max_items: int = 8) -> str:
+    """
+    供审查/润色层使用的“指针版”文档上下文：只给片段来源+短摘录，
+    减少 token 压力并保持可追溯。
+    """
+    if not rows:
+        return ""
+    picked = rows[: max(1, min(int(max_items or 8), len(rows)))]
+    lines = ["【参考文档指针】以下为可引用片段的来源与短摘录（如需请在答案中标注 文档名#片段）。"]
+    for i, r in enumerate(picked, start=1):
+        name = str(r.get("name") or "")
+        chunk = r.get("chunk")
+        label = f"{name}#{chunk}" if chunk is not None else name
+        snip = str(r.get("content") or "").strip()
+        snip = re.sub(r"\s+", " ", snip)[:220]
+        lines.append(f"{i}. {label}: {snip}{'…' if len(snip) >= 220 else ''}")
+    return "\n".join(lines)
+
+
 async def _prepare_documents_context_block_async(prompt: str, options: Dict[str, Any], harness: DualTrackHarness, cfg: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     doc_budget = _int_option(options, "doc_context_chars", 40_000, minimum=2_000, maximum=60_000)
     bw = float(options.get("_doc_bm25_weight", 0.55))
@@ -363,18 +382,22 @@ async def _prepare_documents_context_block_async(prompt: str, options: Dict[str,
             model_cfg=model_cfg,
             timeout_s=emb_timeout_s,
         )
+        # 严格：若返回长度不一致，直接回退到 BM25（避免 silent 错排）
+        if not isinstance(emb_scores, list) or len(emb_scores) != len(cands):
+            emb_scores = []
         for i, r in enumerate(cands):
             r["embedding_score"] = float(emb_scores[i]) if i < len(emb_scores) else 0.0
         # RRF 融合（Top-20）
         k = float(ecfg.get("rrf_k", 60))
         bm_order = sorted(range(len(cands)), key=lambda i: float(cands[i].get("bm25_score") or 0.0), reverse=True)
         emb_order = sorted(range(len(cands)), key=lambda i: float(cands[i].get("embedding_score") or 0.0), reverse=True)
-        bm_rank = {idx: r for r, idx in enumerate(bm_order, start=1)}
-        emb_rank = {idx: r for r, idx in enumerate(emb_order, start=1)}
-        for idx, row in enumerate(cands):
-            rb = float(bm_rank.get(idx, len(cands) + 1))
-            re = float(emb_rank.get(idx, len(cands) + 1))
-            row["rrf_score"] = 1.0 / (k + rb) + 1.0 / (k + re)
+        # doc_i(0-based) -> rank(1-based)
+        bm_rank = {doc_i: rank for rank, doc_i in enumerate(bm_order, start=1)}
+        emb_rank = {doc_i: rank for rank, doc_i in enumerate(emb_order, start=1)}
+        for doc_i, row in enumerate(cands):
+            rb = float(bm_rank.get(doc_i, len(cands) + 1))
+            re = float(emb_rank.get(doc_i, len(cands) + 1))
+            row["rrf_score"] = (1.0 / (k + rb)) + (1.0 / (k + re))
             # 最终 score：RRF + bonus（bonus 仍有效）
             row["score"] = float(row.get("rrf_score") or 0.0) + float(row.get("bonus_score") or 0.0)
         cands.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
@@ -410,6 +433,11 @@ async def _prepare_documents_context_block_async(prompt: str, options: Dict[str,
         rows = rows[:8]
 
     block = _format_documents_context_from_rows(rows, max_total_chars=doc_budget)
+    # 给 Refine L2/L3 的指针版（减少重复注入带来的 token 压力）
+    compact_max = int(((hdoc.get("compact") or {}) if isinstance(hdoc.get("compact"), dict) else {}).get("max_items", 8))
+    compact_block = _format_documents_context_compact(rows, max_items=compact_max)
+    meta["compact"] = {"max_items": compact_max}
+    meta["compact_block"] = compact_block
     return block, meta
 
 
@@ -613,6 +641,11 @@ def _validate_harness_models(cfg: Dict[str, Any]) -> None:
     if rm and rm not in models:
         errors.append(f"harness.search.relevance_filter.model -> {rm!r}")
     docs = h.get("documents") or {}
+    rr = docs.get("rerank") or {}
+    if isinstance(rr, dict) and bool(rr.get("enabled", False)):
+        rk = str(rr.get("model") or "").strip()
+        if rk and rk not in models:
+            errors.append(f"harness.documents.rerank.model -> {rk!r}")
     emb = docs.get("embedding") or {}
     if isinstance(emb, dict) and bool(emb.get("enabled", True)):
         ek = str(emb.get("model_key") or "n1n-embedding-3-large").strip()
@@ -686,6 +719,12 @@ def _warn_analyzer_timeout_budget(cfg: Dict[str, Any]) -> None:
     attempts = max(1, 1 + max(0, retries))
     floor = req_t * attempts
     if total < floor:
+        # 效果优先：若预算缺口超过 20%，直接阻断启动，避免“半残配置”导致路由质量不稳定
+        if floor > 0 and (floor - total) / float(floor) > 0.2:
+            raise ValueError(
+                "config.yaml analyzer 超时预算不自洽："
+                f"analyzer_total_timeout_s={total}s < request_timeout_s×(retries+1)={floor}s（缺口>20%）"
+            )
         print(
             f"Warning: harness.complexity.analyzer_total_timeout_s ({total}s) is below "
             f"analyzer_request_timeout_s × (analyzer_max_retries+1) = {floor}s; "
@@ -869,6 +908,7 @@ def create_app() -> FastAPI:
         block, dmeta = await _prepare_documents_context_block_async(str(last_prompt), options, harness, cfg)
         options["_documents_context_block"] = block
         options["_documents_context_meta"] = dmeta
+        options["_documents_context_block_compact"] = str((dmeta or {}).get("compact_block") or "")
         result = await harness.run(str(last_prompt), messages=hist, mode=req.mode, options=options)
         return result
 
@@ -918,6 +958,7 @@ def create_app() -> FastAPI:
         block2, dmeta2 = await _prepare_documents_context_block_async(str(last_prompt_str), options, harness, cfg)
         options["_documents_context_block"] = block2
         options["_documents_context_meta"] = dmeta2
+        options["_documents_context_block_compact"] = str((dmeta2 or {}).get("compact_block") or "")
 
         client_run_id = str(options.get("client_run_id") or "").strip()
         stream_connect_attempt = _int_option(options, "stream_connect_attempt", 0, minimum=0, maximum=20)
