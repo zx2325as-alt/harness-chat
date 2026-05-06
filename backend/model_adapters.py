@@ -26,6 +26,17 @@ def _get_shared_client() -> httpx.AsyncClient:
     return _shared_client
 
 
+async def _reset_shared_client() -> None:
+    """遇到连接复用导致的 RemoteProtocolError/断连时，重建连接池以恢复稳定性。"""
+    global _shared_client
+    try:
+        if _shared_client is not None and not _shared_client.is_closed:
+            await _shared_client.aclose()
+    except Exception:
+        pass
+    _shared_client = None
+
+
 def _trace_enabled() -> bool:
     v = str(os.getenv("MODEL_TRACE") or "").strip().lower()
     return v not in ("", "0", "false", "no", "off")
@@ -148,6 +159,61 @@ def _system_language_message(prompt: str, messages: Optional[List[Dict[str, Any]
     if is_probably_english(probe):
         return {"role": "system", "content": "Please answer in the same language as the user, defaulting to English."}
     return {"role": "system", "content": "请使用与用户相同的语言回答；若用户主要使用中文，则默认用中文回答。"}
+
+
+async def _iter_openai_sse_stream(
+    response: httpx.Response,
+    *,
+    trace_id: str,
+    model: str,
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """解析 chat/completions 的 SSE 行，产出增量文本（含 reasoning_content）。"""
+    response.raise_for_status()
+    async for line in response.aiter_lines():
+        line = line.strip()
+        if not line:
+            continue
+        if not line.startswith("data:"):
+            await _trace_write(
+                {
+                    "kind": "stream_anomaly",
+                    "trace_id": trace_id,
+                    "type": "non_data_line",
+                    "sample": line[:120],
+                }
+            )
+            continue
+        data_str = line[5:].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            data = json.loads(data_str)
+            delta = data.get("choices", [{}])[0].get("delta", {})
+            content = delta.get("content", "")
+            reasoning_content = delta.get("reasoning_content", "")
+            if reasoning_content and not content:
+                await _trace_write(
+                    {
+                        "kind": "stream_anomaly",
+                        "trace_id": trace_id,
+                        "type": "reasoning_only_delta",
+                        "model": str(model),
+                    }
+                )
+            if content or reasoning_content:
+                yield {
+                    "content": content or "",
+                    "reasoning_content": reasoning_content or "",
+                }
+        except json.JSONDecodeError:
+            await _trace_write(
+                {
+                    "kind": "stream_anomaly",
+                    "trace_id": trace_id,
+                    "type": "json_decode_error",
+                    "sample": data_str[:120],
+                }
+            )
 
 
 class OpenAICompatAdapter(BaseAdapter):
@@ -373,66 +439,41 @@ class OpenAICompatAdapter(BaseAdapter):
         )
         for attempt in range(max_retries):
             try:
-                # We don't retry extensively on stream, just let it fail if it fails immediately
-                client = _get_shared_client()
-                async with client.stream("POST", url, headers=headers, json=body, timeout=timeout_s) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if not line.startswith("data:"):
-                            await _trace_write(
-                                {
-                                    "kind": "stream_anomaly",
-                                    "trace_id": trace_id,
-                                    "type": "non_data_line",
-                                    "sample": line[:120],
-                                }
-                            )
-                            continue
-                        data_str = line[5:].strip()
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            data = json.loads(data_str)
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-
-                            # Standard text delta
-                            content = delta.get("content", "")
-
-                            # Handle Reasoning/Think models (like DeepSeek) that might return reasoning_content
-                            reasoning_content = delta.get("reasoning_content", "")
-
-                            if reasoning_content and not content:
-                                await _trace_write(
-                                    {
-                                        "kind": "stream_anomaly",
-                                        "trace_id": trace_id,
-                                        "type": "reasoning_only_delta",
-                                        "model": str(model),
-                                    }
-                                )
-
-                            if content or reasoning_content:
-                                yield {
-                                    "content": content or "",
-                                    "reasoning_content": reasoning_content or "",
-                                }
-                        except json.JSONDecodeError:
-                            await _trace_write(
-                                {
-                                    "kind": "stream_anomaly",
-                                    "trace_id": trace_id,
-                                    "type": "json_decode_error",
-                                    "sample": data_str[:120],
-                                }
-                            )
+                # 流式请求不要用全局复用 client：长连接更容易在网关侧被静默断开，
+                # 复用坏连接会出现「Server disconnected without sending a response」且重试无效。
+                # 这里每次 attempt 使用独立 AsyncClient，并强制 Connection: close，稳定性优先。
+                stream_headers = dict(headers)
+                stream_headers["Connection"] = "close"
+                stream_headers.setdefault("Accept", "text/event-stream")
+                async with httpx.AsyncClient(limits=_SHARED_LIMITS) as client:
+                    async with client.stream(
+                        "POST",
+                        url,
+                        headers=stream_headers,
+                        json=body,
+                        timeout=timeout_s,
+                    ) as response:
+                        async for chunk in _iter_openai_sse_stream(
+                            response, trace_id=trace_id, model=str(model)
+                        ):
+                            yield chunk
                 # 如果成功执行完流，跳出重试循环
                 break
             except Exception as e:
                 last_error = str(e)
                 fk = _failure_kind_from_error(e, last_error)
+                low = (last_error or "").lower()
+                if ("server disconnected without sending a response" in low) or ("remoteprotocolerror" in low):
+                    await _trace_write(
+                        {
+                            "kind": "stream_anomaly",
+                            "trace_id": trace_id,
+                            "type": "reset_shared_client",
+                            "reason": "server_disconnected",
+                            "attempt": attempt,
+                        }
+                    )
+                    await _reset_shared_client()
                 if "401" in last_error or "403" in last_error or "404" in last_error:
                     await _trace_write(
                         {
