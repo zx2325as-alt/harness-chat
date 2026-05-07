@@ -1,42 +1,58 @@
 <template>
   <div class="msg" :class="{ user: role === 'user', assistant: role !== 'user' }">
-    <div class="bubble" :class="{ 'user-bubble': role === 'user' }">
-      <div class="meta" v-if="role !== 'user' && meta && !meta.pending">
-        <span v-if="meta.track" class="pill" :title="metaTitle">{{ meta.track }}</span>
-        <span v-if="meta.provider" class="pill">{{ meta.provider }}</span>
-        <span v-if="meta.model" class="pill" :title="'末段模型: ' + meta.model">{{ meta.model }}</span>
-        <span v-if="meta.latency_ms != null" class="pill">{{ meta.latency_ms }}ms</span>
-        <span v-if="meta.streaming" class="pill active">生成中</span>
-        <span v-if="meta.success === false" class="pill danger">失败</span>
-        <button
-          v-if="!meta.streaming && role === 'assistant'"
-          type="button"
-          class="pill btn-copy"
-          title="复制全文"
-          @click="onCopy"
-        >
-          复制
-        </button>
-      </div>
-      <div v-if="role === 'assistant' && meta?.model_chain && !meta?.pending" class="model-chain">
-        {{ meta.model_chain }}
-      </div>
-
-      <div class="content markdown-body">
-        <div v-if="Array.isArray(content)" class="multimodal-content">
-          <template v-for="(part, idx) in content" :key="idx">
-            <div v-if="part.type === 'text'" v-html="renderMarkdown(part.text)"></div>
-            <img v-if="part.type === 'image_url'" :src="part.image_url.url" class="chat-img" alt="" />
-          </template>
+    <div class="msg-stack">
+      <div class="bubble" :class="{ 'user-bubble': role === 'user' }">
+        <div class="meta" v-if="role !== 'user' && meta && !meta.pending">
+          <span v-if="meta.track" class="pill" :title="metaTitle">{{ meta.track }}</span>
+          <span v-if="meta.provider" class="pill">{{ meta.provider }}</span>
+          <span v-if="meta.model" class="pill" :title="'末段模型: ' + meta.model">{{ meta.model }}</span>
+          <span v-if="meta.latency_ms != null" class="pill">{{ meta.latency_ms }}ms</span>
+          <span v-if="meta.streaming" class="pill active">生成中</span>
+          <span v-if="meta.success === false" class="pill danger">失败</span>
         </div>
-        <pre v-else-if="meta?.streaming" class="stream-plain">{{ textContent }}</pre>
-        <div v-else v-html="renderedContent"></div>
+        <div v-if="role === 'assistant' && meta?.model_chain && !meta?.pending" class="model-chain">
+          {{ meta.model_chain }}
+        </div>
+
+        <div class="content markdown-body">
+          <div v-if="Array.isArray(content)" class="multimodal-content">
+            <template v-for="(part, idx) in content" :key="idx">
+              <div v-if="part.type === 'text'" v-html="renderMarkdown(part.text)"></div>
+              <img v-if="part.type === 'image_url'" :src="part.image_url.url" class="chat-img" alt="" />
+            </template>
+          </div>
+          <pre v-else-if="meta?.streaming" class="stream-plain">{{ textContent }}</pre>
+          <div v-else v-html="renderedContent"></div>
+        </div>
       </div>
 
-      <div class="actions" v-if="!meta?.pending && !meta?.streaming && role !== 'system'">
-        <button class="action-btn" v-if="role === 'user'" @click="$emit('edit')">编辑</button>
-        <button class="action-btn" v-if="role === 'assistant'" @click="$emit('regenerate')">重新生成</button>
-        <button v-if="role === 'assistant' && meta?.stopped" class="action-btn" @click="$emit('retry')">重试</button>
+      <!-- 参考网页聊天：操作区在气泡下方；用户消息右对齐 -->
+      <div
+        v-if="showUnderActions"
+        class="under-actions"
+        :class="{ 'under-user': role === 'user', 'under-assistant': role !== 'user' }"
+      >
+        <template v-if="role === 'user'">
+          <button type="button" class="under-btn" title="复制" aria-label="复制" @click="onCopy">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="9" y="9" width="13" height="13" rx="2" />
+              <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+            </svg>
+          </button>
+          <button type="button" class="under-btn under-btn-text" title="编辑" @click="$emit('edit')">编辑</button>
+        </template>
+        <template v-else>
+          <button type="button" class="under-btn" title="复制全文" aria-label="复制" @click="onCopy">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="9" y="9" width="13" height="13" rx="2" />
+              <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+            </svg>
+          </button>
+          <button type="button" class="under-btn under-btn-text" @click="$emit('regenerate')">重新生成</button>
+          <button v-if="meta?.stopped" type="button" class="under-btn under-btn-text" @click="$emit('retry')">
+            重试
+          </button>
+        </template>
       </div>
     </div>
   </div>
@@ -68,6 +84,9 @@ export default {
     renderedContent() {
       return this.renderMarkdown(this.textContent || "");
     },
+    showUnderActions() {
+      return !this.meta?.pending && !this.meta?.streaming && this.role !== "system";
+    },
   },
   methods: {
     renderMarkdown(text) {
@@ -97,7 +116,7 @@ export default {
 <style scoped>
 .msg {
   display: flex;
-  margin: 18px 0;
+  margin: 14px 0;
 }
 .msg.user {
   justify-content: flex-end;
@@ -105,15 +124,30 @@ export default {
 .msg.assistant {
   justify-content: flex-start;
 }
+.msg-stack {
+  display: flex;
+  flex-direction: column;
+  max-width: 100%;
+  align-items: stretch;
+}
+.msg.user .msg-stack {
+  align-items: flex-end;
+}
 .bubble {
-  max-width: min(92%, 720px);
+  max-width: min(88%, 680px);
+}
+.msg.assistant .bubble:not(.user-bubble) {
+  padding: 0 4px 0 0;
+}
+.msg.user .bubble {
+  max-width: min(82%, 520px);
 }
 .bubble.user-bubble {
-  background: #2f3a4d;
-  padding: 10px 16px;
-  border-radius: 18px;
-  border-bottom-right-radius: 6px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  background: #2d3a52;
+  padding: 8px 14px;
+  border-radius: 16px;
+  border-bottom-right-radius: 5px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
 }
 .meta {
   display: flex;
@@ -137,15 +171,6 @@ export default {
   background: rgba(99, 102, 241, 0.22);
   color: #c7d2fe;
 }
-.pill.btn-copy {
-  cursor: pointer;
-  border: 1px solid #3d4d64;
-  background: #1e2433;
-}
-.pill.btn-copy:hover {
-  border-color: rgba(129, 140, 248, 0.45);
-  color: #c7d2fe;
-}
 .model-chain {
   font-size: 11px;
   color: #64748b;
@@ -155,8 +180,8 @@ export default {
   word-break: break-word;
 }
 .content {
-  line-height: 1.7;
-  font-size: 15px;
+  line-height: 1.65;
+  font-size: 14px;
   color: #e2e8f0;
 }
 .stream-plain {
@@ -177,28 +202,46 @@ export default {
   border-radius: 10px;
   margin-top: 10px;
 }
-.actions {
+
+.under-actions {
   display: flex;
-  gap: 8px;
-  margin-top: 10px;
-  opacity: 0;
-  transition: opacity 0.15s;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 0 2px;
 }
-.msg:hover .actions {
-  opacity: 1;
+.under-user {
+  justify-content: flex-end;
 }
-.action-btn {
-  font-size: 12px;
-  padding: 4px 10px;
+.under-assistant {
+  justify-content: flex-start;
+}
+.under-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 6px;
+  border: none;
   border-radius: 8px;
-  border: 1px solid #3d4d64;
-  background: #232a38;
-  color: #94a3b8;
+  background: transparent;
+  color: #64748b;
   cursor: pointer;
+  transition: color 0.15s, background 0.15s;
 }
-.action-btn:hover {
-  border-color: rgba(129, 140, 248, 0.45);
-  color: #c7d2fe;
+.under-btn:hover {
+  color: #94a3b8;
+  background: rgba(255, 255, 255, 0.06);
+}
+.under-btn-text {
+  min-width: unset;
+  padding: 0 8px;
+  font-size: 12px;
+  color: #64748b;
+}
+.under-btn-text:hover {
+  color: #a5b4fc;
 }
 
 .content.markdown-body :deep(h1),
@@ -245,7 +288,6 @@ export default {
   color: #a5b4fc;
 }
 
-/* KaTeX 深色气泡可读性 */
 .content.markdown-body :deep(.katex),
 .content.markdown-body :deep(.katex-display) {
   color: #e8eef7;

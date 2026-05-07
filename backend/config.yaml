@@ -12,6 +12,7 @@ harness:
   default_mode: "auto"
   # 非流式兜底与 Agent 直接输出时的字符切片；中文界面可略小于默认 96 以更顺滑
   stream_slice_chars: 72
+  # 全局禁止联网（可由配置页写入 config.runtime.yaml）。对话里选「关闭联网」对本条消息同样禁止检索且会清除预判中的联网意图。
   web_search:
     globally_disabled: false
   features:
@@ -63,8 +64,8 @@ harness:
     include_answer: false
     relevance_filter:
       enabled: true
-      model: "gpt-5.5"
-      # 仅质量轨道同步过滤，fast 轨异步过滤以提升响应速度1111111111111111
+      model: "claude-sonnet-4-6"
+      # 仅质量轨道同步过滤，fast 轨异步过滤以提升响应速度
       sync_default_mode: quality_tracks
       sync_tracks:
         - refine
@@ -149,7 +150,7 @@ harness:
         review: ["gpt-5.5", "claude-sonnet-4-6-thinking"]
         polish: ["claude-opus-4-7", "gpt-5.5"]
     conversation:
-      selected_model: "gpt-5.5"
+      selected_model: "claude-sonnet-4-6"
       fallback_models: ["deepseek-v4-flash", "grok-4.2"]
 
   complexity:
@@ -167,7 +168,7 @@ harness:
       - "deepseek-v4-pro"
     # 启用大模型进行预判
     use_llm_analyzer: true
-    analyzer_model: "gpt-5.5" # 预判使用的模型，需在 models 下注册，要求速度快且能输出 JSON
+    analyzer_model: "claude-sonnet-4-6" # 预判使用的模型，需在 models 下注册，要求速度快且能输出 JSON
     analyzer_prompt: |
       你是一个高级的大模型路由调度中枢。请分析以下用户输入的复杂度和意图，并从可用模型池中为用户自主选择最合适的大模型。
       
@@ -237,7 +238,7 @@ harness:
     enabled: true
     # 非流式 /api/chat 是否跑完整 Agent 循环（与 SSE 效果对齐）；false 时仍降级 Refine
     sync_non_stream_api: true
-    model: "gpt-5.5"
+    model: "claude-sonnet-4-6"
     # 覆写默认 agent.model；未列出的 task_type 仍用 model
     model_by_task_type:
       code: "claude-sonnet-4-6"
@@ -255,7 +256,7 @@ harness:
 
   routing:
     # 无规则命中时按顺序尝试，优先使用兼顾速度与质量的模型，失败则自动向后降级
-    default_model: "gpt-5.5"
+    default_model: "claude-sonnet-4-6"
     default_models:
       - "gpt-5.5"
       - "claude-sonnet-4-6"

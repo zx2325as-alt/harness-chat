@@ -22,24 +22,26 @@
         class="textarea"
         :disabled="uiBusy"
         v-model="draft"
-        placeholder="输入问题…（Enter 发送，Shift+Enter 换行）"
-        rows="2"
+        placeholder="给 Harness 发送消息…（Enter 发送，Shift+Enter 换行）"
+        rows="3"
         @keydown.enter.exact.prevent="send"
       />
 
-      <div class="composer-bar" ref="dropRoot">
-        <div class="bar-left">
+      <div class="composer-footer" ref="dropRoot">
+        <div class="footer-left">
           <div class="dd" :class="{ open: openMenu === 'mode' }">
             <button
               type="button"
-              class="dd-trigger"
+              class="dd-trigger dd-trigger-pill"
               :disabled="uiBusy"
               :title="modeHint"
               aria-haspopup="listbox"
               :aria-expanded="openMenu === 'mode'"
               @click.stop="toggleMenu('mode')"
             >
-              <span class="dd-prefix">轨道</span>
+              <svg class="dd-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                <path d="M4 7h16M7 12h10M9 17h6" />
+              </svg>
               <span class="dd-value">{{ modeLabel }}</span>
               <svg class="dd-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M6 9l6 6 6-6" />
@@ -66,12 +68,15 @@
               type="button"
               class="dd-trigger dd-trigger-pill"
               :disabled="uiBusy || globalSearchDisabled"
-              :title="searchModeHint"
+              :title="globalSearchDisabled ? '服务端已全局禁止联网（可在配置页关闭）；发送时为关闭检索。' : searchModeHint"
               aria-haspopup="listbox"
               :aria-expanded="openMenu === 'search'"
               @click.stop="toggleMenu('search')"
             >
-              <span class="dd-prefix">搜索</span>
+              <svg class="dd-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18" stroke-linecap="round" />
+              </svg>
               <span class="dd-value">{{ searchLabel }}</span>
               <svg class="dd-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M6 9l6 6 6-6" />
@@ -93,8 +98,8 @@
             </transition>
           </div>
         </div>
-        <div class="bar-fill" aria-hidden="true" />
-        <div class="bar-right">
+
+        <div class="footer-right">
           <input
             ref="fileInput"
             type="file"
@@ -103,16 +108,14 @@
             :accept="fileAccept"
             @change="onFileChange"
           />
-          <button type="button" class="ico" :disabled="uiBusy" title="上传文件" @click="$refs.fileInput.click()">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path
-                d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"
-              />
+          <button type="button" class="ico ico-attach" :disabled="uiBusy" title="上传文件" @click="$refs.fileInput.click()">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+              <path d="M21.44 11.05l-9.19 9.19a5.5 5.5 0 01-7.78-7.78l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2.5 2.5 0 01-3.54-3.54l8.2-8.19" />
             </svg>
           </button>
           <button type="button" class="ico folder-btn" :disabled="uiBusy" title="读本地文件夹" @click="readLocalFolder">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+              <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" />
               <path d="M8 13h8" />
             </svg>
           </button>
@@ -121,13 +124,7 @@
               <rect x="7" y="7" width="10" height="10" rx="1" />
             </svg>
           </button>
-          <button
-            type="button"
-            class="send"
-            :disabled="!canSend"
-            :title="sendTitle"
-            @click="send"
-          >
+          <button type="button" class="send" :disabled="!canSend" :title="sendTitle" @click="send">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7z" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
             </svg>
@@ -139,7 +136,7 @@
         <span v-else-if="folderLoading">正在读取本地文件夹…</span>
         <span v-else-if="hasParsingAttachment">文档仍在解析中，完成后才能发送</span>
         <span v-else-if="hasImageAttachment">图片目前不会进入模型，请先移除图片或改传文档/文本</span>
-        <span v-else-if="globalSearchDisabled">服务器已全局禁止联网；搜索选项已锁定为关闭并与配置同步。</span>
+        <span v-else-if="globalSearchDisabled">服务端「全局禁止联网」已开启，搜索选项已与配置同步锁定；可在配置页取消勾选并保存后恢复。</span>
         <span v-else>支持上传文件，也支持直接读取服务端本地文件夹中的文档与代码文件</span>
       </div>
     </div>
@@ -152,7 +149,7 @@ import { isSendableComposerState } from "../chatShared.js";
 
 const MODE_OPTIONS = [
   { value: "auto", label: "自动" },
-  { value: "agent", label: "Agent 轨（仅流式真 Agent）" },
+  { value: "agent", label: "Agent轨" },
   { value: "refine", label: "精化轨" },
   { value: "fast", label: "快速轨" },
 ];
@@ -250,7 +247,7 @@ export default {
   props: {
     busy: { type: Boolean, default: false },
     mode: { type: String, default: "auto" },
-    /** 服务端 harness.web_search.globally_disabled：强制关闭搜索并不允许切换 */
+    /** 来自服务端 harness.web_search.globally_disabled，保存配置后与聊天区同步 */
     globalSearchDisabled: { type: Boolean, default: false },
   },
   emits: ["send", "stop", "update:mode"],
@@ -262,6 +259,7 @@ export default {
       searchMode: "auto",
       openMenu: null,
       modeOptions: MODE_OPTIONS,
+      searchOptions: SEARCH_OPTIONS,
       _parseControllers: new Set(),
       _parseControllerByAttachmentId: new Map(),
     };
@@ -298,23 +296,14 @@ export default {
       return MODE_OPTIONS.find((o) => o.value === this.mode)?.label ?? this.mode;
     },
     modeHint() {
-      return "Agent 真循环仅在流式接口可用；同步 /api/chat 即使选择 Agent 也会降级为 Refine。";
+      return "auto：由预判自动选 fast/refine/agent，不会被「同步接口降级」替换。Agent：完整工具循环仅在流式 /api/chat/stream；若关闭 agent.sync_non_stream_api，则非流式 /api/chat 可能降为 Refine（与 auto 无关）。";
     },
     searchLabel() {
       if (this.globalSearchDisabled) return "关闭（全局锁定）";
       return SEARCH_OPTIONS.find((o) => o.value === this.searchMode)?.label ?? this.searchMode;
     },
-    searchOptions() {
-      if (this.globalSearchDisabled) {
-        return [{ value: "off", label: "关闭（全局锁定）" }];
-      }
-      return SEARCH_OPTIONS;
-    },
     searchModeHint() {
-      if (this.globalSearchDisabled) {
-        return "服务器配置已全局禁止联网；无法在此开启搜索。";
-      }
-      return "仅影响「快速轨」入口是否做前置联网检索；精化轨 / Agent 仍按内部逻辑按需搜索。";
+      return "关闭联网：本条消息优先级最高，全轨道（含 auto）均不发起检索，Agent 的 web_search 与审查层联网也会跳过并提示。开启/自动：按服务端逻辑；若配置页启用「全局禁止联网」，则始终不检索。";
     },
     fileAccept() {
       return FILE_ACCEPT;
@@ -326,11 +315,8 @@ export default {
     },
     globalSearchDisabled: {
       immediate: true,
-      handler(on) {
-        if (on) {
-          this.searchMode = "off";
-          if (this.openMenu === "search") this.openMenu = null;
-        }
+      handler(v) {
+        if (v) this.searchMode = "off";
       },
     },
   },
@@ -366,12 +352,12 @@ export default {
       this.searchMode = value;
       this.openMenu = null;
     },
+    /** 父组件在 GET /api/config 刷新后调用，保证搜索开关与服务器一致 */
     syncFromServerConfig(config) {
-      const g = Boolean(config?.harness?.web_search?.globally_disabled);
-      if (g) {
+      if (config?.harness?.web_search?.globally_disabled) {
         this.searchMode = "off";
-        if (this.openMenu === "search") this.openMenu = null;
       }
+      this.openMenu = null;
     },
     statusLabel(s) {
       if (s === "ok") return "已解析";
@@ -795,16 +781,16 @@ export default {
 }
 .textarea {
   width: 100%;
-  min-height: 52px;
+  min-height: 56px;
   max-height: 220px;
   resize: vertical;
-  padding: 4px 2px;
+  padding: 6px 4px 10px;
   border: none;
   background: transparent;
   color: #f1f5f9;
   outline: none;
-  line-height: 1.5;
-  font-size: 15px;
+  line-height: 1.55;
+  font-size: 14px;
   font-family: inherit;
 }
 .textarea::placeholder {
@@ -813,29 +799,29 @@ export default {
 .textarea:disabled {
   opacity: 0.6;
 }
-.composer-bar {
+.composer-footer {
   display: flex;
   align-items: center;
-  gap: 10px;
+  justify-content: space-between;
+  gap: 12px;
   flex-wrap: nowrap;
-  padding-top: 8px;
+  padding-top: 10px;
+  margin-top: 4px;
   border-top: 1px solid #2f3545;
-  margin-top: 2px;
 }
-.bar-left {
+.footer-left {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
   flex-wrap: wrap;
+  min-width: 0;
 }
-.bar-fill {
-  flex: 1;
-  min-width: 24px;
-  min-height: 34px;
-  border-radius: 10px;
-  background: rgba(0, 0, 0, 0.12);
-  border: 1px solid #2f3545;
+.footer-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 /* 自定义下拉（替代原生 select，避免系统白底菜单） */
@@ -865,6 +851,18 @@ export default {
   line-height: 1.25;
   transition: border-color 0.15s ease, background 0.15s ease;
 }
+.dd-trigger-pill {
+  padding: 6px 12px 6px 10px;
+  background: rgba(30, 36, 51, 0.95);
+}
+.dd-ico {
+  flex-shrink: 0;
+  color: #64748b;
+  opacity: 0.95;
+}
+.dd-trigger:hover:not(:disabled) .dd-ico {
+  color: #94a3b8;
+}
 .dd-trigger:hover:not(:disabled) {
   border-color: #4b5c78;
   background: #252d3d;
@@ -873,13 +871,12 @@ export default {
   opacity: 0.45;
   cursor: not-allowed;
 }
-.dd-prefix {
-  color: #94a3b8;
-  font-weight: 500;
-}
 .dd-value {
   font-weight: 600;
-  min-width: 3em;
+  max-width: 11em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   text-align: left;
 }
 .dd-chev {
@@ -934,15 +931,9 @@ export default {
   transform: translateY(6px);
 }
 
-.bar-right {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
-}
 .ico {
-  width: 36px;
-  height: 36px;
+  width: 34px;
+  height: 34px;
   border-radius: 10px;
   border: 1px solid #353f52;
   background: #1e2433;
@@ -951,6 +942,9 @@ export default {
   align-items: center;
   justify-content: center;
   cursor: pointer;
+}
+.ico-attach {
+  border-radius: 999px;
 }
 .ico:hover:not(:disabled) {
   background: #2f3a4d;
@@ -966,8 +960,8 @@ export default {
   background: rgba(248, 113, 113, 0.1);
 }
 .send {
-  width: 36px;
-  height: 36px;
+  width: 34px;
+  height: 34px;
   border-radius: 999px;
   border: none;
   background: linear-gradient(135deg, #4f46e5, #6366f1);
@@ -993,11 +987,11 @@ export default {
   color: #5c6d85;
 }
 @media (max-width: 560px) {
-  .composer-bar {
+  .composer-footer {
     flex-wrap: wrap;
   }
-  .bar-fill {
-    display: none;
+  .footer-right {
+    margin-left: auto;
   }
 }
 </style>

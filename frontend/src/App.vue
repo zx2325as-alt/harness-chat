@@ -4,7 +4,7 @@
       <div class="brand">
         <div class="dot" />
         <div class="title">Harness Chat</div>
-        <div class="subtitle">{{ chatHeadSubtitle }}</div>
+        <div class="subtitle">Harness：Fast / Refine / Agent</div>
       </div>
       <div class="actions">
         <button class="tab" :class="{ active: view === 'chat' }" @click="view = 'chat'">聊天</button>
@@ -46,6 +46,10 @@
       <main class="main" :class="{ 'no-right': hideRightPanel }" :style="mainGridStyle">
         <section class="left">
           <div v-if="view === 'chat'" class="chat">
+            <header class="chat-head">
+              <div class="chat-head-title">{{ chatHeadTitle }}</div>
+              <div class="chat-head-badge" :title="'当前发送使用的路由模式：' + modeHeadBadge">{{ modeHeadBadge }}</div>
+            </header>
             <div v-if="chatBanner" class="chat-banner" role="status">{{ chatBanner }}</div>
             <div class="messages" ref="msgRef">
               <ChatMessage
@@ -184,12 +188,26 @@ export default {
     interactionBusy() {
       return this.busy || this._sessionTxnDepth > 0;
     },
-    globalWebSearchDisabled() {
-      return Boolean(this.config?.harness?.web_search?.globally_disabled);
+    chatHeadTitle() {
+      if (!this.currentSession) return "新对话";
+      return this.getSessionTitle(this.currentSession);
     },
-    chatHeadSubtitle() {
-      const base = "Harness：Fast / Refine / Agent";
-      return this.globalWebSearchDisabled ? `${base} · 全局离线` : base;
+    modeHeadBadge() {
+      const m = {
+        auto: "自动轨道",
+        fast: "快速轨",
+        refine: "精化轨",
+        agent: "Agent 轨",
+      };
+      const base = m[this.mode] || this.mode || "自动轨道";
+      if (this.globalWebSearchDisabled) {
+        return `${base} · 全局离线`;
+      }
+      return base;
+    },
+    globalWebSearchDisabled() {
+      const ws = this.config?.harness?.web_search;
+      return Boolean(ws && ws.globally_disabled);
     },
     currentSession() {
       return this.sessions.find(s => s.id === this.currentSessionId) || null;
@@ -419,14 +437,18 @@ export default {
         this.configLoading = false;
       }
     },
+    /** 配置刷新/保存后：聊天区轨道、联网锁定与输入组件对齐服务端 harness */
     applyHarnessUiFromConfig() {
       const dm = this.config?.harness?.default_mode;
-      const allowed = new Set(["auto", "fast", "refine", "agent"]);
-      if (typeof dm === "string" && allowed.has(dm)) {
-        this.mode = dm;
+      if (dm && ["auto", "fast", "refine", "agent"].includes(String(dm).toLowerCase())) {
+        this.mode = String(dm).toLowerCase();
       }
       this.$nextTick(() => {
-        this.$refs.chatInput?.syncFromServerConfig?.(this.config);
+        try {
+          this.$refs.chatInput?.syncFromServerConfig?.(this.config);
+        } catch (_) {
+          /* ignore */
+        }
       });
     },
     scrollToBottom() {
@@ -544,6 +566,12 @@ export default {
         const meta = st.meta || {};
         if (st.name === "track_select" && meta.agent_disabled_fallback) {
           this.chatBanner = "您选择了 Agent 轨，但当前配置已关闭 Agent，已自动使用精化轨。";
+        }
+        if (st.name === "web_search_policy" && st.status === "skipped") {
+          this.chatBanner =
+            meta.reason ||
+            (typeof meta.event_summary === "string" && meta.event_summary) ||
+            "当前请求已禁止联网，预判中的联网意图已忽略，后续不会调用检索 API。";
         }
         if (st.name === "web_search" && (meta.degraded || meta.failure_code) && st.status === "ok") {
           this.chatBanner =
@@ -1318,6 +1346,43 @@ export default {
   flex-direction: column;
   min-height: 0;
 }
+.chat-head {
+  flex-shrink: 0;
+  padding: 12px 24px 10px;
+  border-bottom: 1px solid #2f3a4d;
+  background: linear-gradient(180deg, #1e2433 0%, #1a1f2b 100%);
+}
+.chat-head-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  color: #f1f5f9;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-head-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #93c5fd;
+  background: rgba(59, 130, 246, 0.14);
+  border: 1px solid rgba(59, 130, 246, 0.28);
+}
+.chat-head-badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 2px;
+  background: linear-gradient(135deg, #60a5fa, #a78bfa);
+  transform: rotate(45deg);
+}
 .chat-banner {
   flex-shrink: 0;
   margin: 0 16px 0;
@@ -1332,7 +1397,7 @@ export default {
 .messages {
   flex: 1;
   overflow: auto;
-  padding: 20px 24px;
+  padding: 16px 24px 20px;
   background: linear-gradient(180deg, #161b26 0%, #1a1f2b 160px);
 }
 .config {

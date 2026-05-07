@@ -485,7 +485,12 @@ class DualTrackHarness:
         return out[:4]
 
     async def _resolve_runtime_context(self, prompt: str, mode: str, options: Dict[str, Any]) -> Dict[str, Any]:
+        options = options or {}
         hcfg = self.cfg.get("harness") or {}
+        blk, breason = self._web_search_blocked(options, hcfg)
+        options["_web_search_blocked"] = blk
+        options["_web_search_block_reason"] = breason
+
         default_mode = hcfg.get("default_mode", "auto")
         mode = (mode or default_mode).lower()
         if mode not in ("auto", "fast", "refine", "agent"):
@@ -502,11 +507,14 @@ class DualTrackHarness:
             search_markers = ("联网", "搜索", "查证", "最新", "今天", "实时", "weather", "news", "stock")
         speculative_search_task = None
         speculative_guess_key = ""
-        # 投机预取增加成本评估：过滤命令、示例、过短输入
-        if (any(mark in sig_base.lower() for mark in [m.lower() for m in search_markers]) and
-            len(sig_base) > 10 and
-            not sig_base.startswith(('/help', '/config', '/clear', '/')) and
-            not any(x in sig_base.lower() for x in ('示例', 'example', 'test', 'demo'))):
+        # 投机预取增加成本评估：过滤命令、示例、过短输入（禁止联网时不启动）
+        if (
+            not blk
+            and any(mark in sig_base.lower() for mark in [m.lower() for m in search_markers])
+            and len(sig_base) > 10
+            and not sig_base.startswith(('/help', '/config', '/clear', '/'))
+            and not any(x in sig_base.lower() for x in ('示例', 'example', 'test', 'demo'))
+        ):
             spec_analysis: Dict[str, Any] = {
                 "search_query": "",
                 "search_queries": [],
@@ -531,6 +539,8 @@ class DualTrackHarness:
         analysis = self._postprocess_analysis(sig_base, analysis)
         signals = derive_user_signals(sig_base, options)
         analysis = merge_signals_into_analysis(analysis, signals, sig_base)
+        if blk:
+            analysis = self._coerce_analysis_when_web_blocked(analysis, options)
 
         intended_track = self._resolve_track(mode, analysis, options)
         chosen_track = self.apply_confidence_track_guard(mode, analysis, sig_base, intended_track)
@@ -546,11 +556,13 @@ class DualTrackHarness:
                 chosen_track = nt
 
         should_search, search_reason = self.should_search(prompt, analysis, options)
-        # 路由显式要求：即便 should_search 未命中，也允许快轨入口注入一次联网摘要
-        if bool(analysis.get("force_entry_search")):
+        # 路由显式要求：即便 should_search 未命中，也允许快轨入口注入一次联网摘要（禁止联网时不生效）
+        if bool(analysis.get("force_entry_search")) and not blk:
             should_search = True
             search_reason = search_reason or "force_entry_search"
         search_mandatory = self._search_mandatory(analysis, options)
+        if blk:
+            search_mandatory = False
         if self._should_force_relevance_filter_sync(analysis, options):
             options["relevance_filter_sync"] = True
         if speculative_search_task:
@@ -1123,8 +1135,39 @@ class DualTrackHarness:
         t = float(lay.get("temperature", 0.2))
         return {**base, "temperature": t}
 
+    def _web_search_blocked(self, options: Dict[str, Any], hcfg: Dict[str, Any]) -> Tuple[bool, str]:
+        """用户在对话中选「关闭联网」或配置全局禁止时，禁止一切联网（高于预判/轨道内的联网意图）。"""
+        opts = options or {}
+        sm = str(opts.get("search_mode") or opts.get("search") or "auto").strip().lower()
+        if sm in ("off", "false", "0", "disabled", "none"):
+            return True, "用户在对话中选择「关闭联网」，本请求禁止一切联网检索（优先级高于预判与轨道逻辑）。"
+        wcfg = hcfg.get("web_search") if isinstance(hcfg.get("web_search"), dict) else {}
+        if bool(wcfg.get("globally_disabled")) or bool(hcfg.get("force_disable_web_search")):
+            return True, "已在服务器配置中启用「全局禁止联网」（harness.web_search.globally_disabled）。"
+        return False, ""
+
+    def _coerce_analysis_when_web_blocked(self, analysis: Dict[str, Any], options: Dict[str, Any]) -> Dict[str, Any]:
+        """清除会导致路由/入口检索的联网信号，避免轨道仍尝试联网。"""
+        if not options.get("_web_search_blocked"):
+            return analysis
+        out = dict(analysis)
+        out["web_search_blocked"] = True
+        out["search_required"] = False
+        out["force_entry_search"] = False
+        si = str(out.get("search_intent") or "none").lower()
+        if si in ("explicit", "required", "freshness_required"):
+            out["search_intent"] = "none"
+            rs = list(out.get("reasons") or [])
+            rs.append("search_intent_cleared_due_to_web_block")
+            out["reasons"] = rs
+        if str(out.get("type") or "").lower() == "web_search":
+            out["type"] = "general"
+        return out
+
     def should_search(self, prompt: str, analysis: Dict[str, Any], options: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         opts = options or {}
+        if opts.get("_web_search_blocked"):
+            return False, str(opts.get("_web_search_block_reason") or "联网已禁用")
         mode = str(opts.get("search_mode") or opts.get("search") or "auto").lower()
         if mode in ("off", "false", "0", "disabled"):
             return False, "手动关闭联网搜索"
@@ -1406,6 +1449,8 @@ class DualTrackHarness:
         return max(60, base)
 
     def _search_mandatory(self, analysis: Dict[str, Any], options: Dict[str, Any]) -> bool:
+        if options.get("_web_search_blocked"):
+            return False
         si = str(analysis.get("search_intent") or "none").lower()
         if si in ("required", "freshness_required"):
             return True
@@ -1516,14 +1561,13 @@ class DualTrackHarness:
 
     async def perform_web_search(self, query: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         options = options or {}
-        h0 = self.cfg.get("harness") or {}
-        wsc = h0.get("web_search") or {}
-        if isinstance(wsc, dict) and bool(wsc.get("globally_disabled")):
+        if options.get("_web_search_blocked"):
+            msg = str(options.get("_web_search_block_reason") or "联网已禁用")
             return {
                 "context": "",
                 "sources": [],
-                "error": "已在服务器配置中启用「全局禁止联网」（harness.web_search.globally_disabled）。",
-                "failure_code": "web_search_globally_disabled",
+                "error": msg,
+                "failure_code": "WEB_SEARCH_BLOCKED",
                 "degraded": False,
                 "provider_used": "none",
                 "latency_ms": 0,
@@ -1625,6 +1669,9 @@ class DualTrackHarness:
         extra_ctx = ""
         search_loops = 0
         rb = (review_body or "").strip()
+        if options.get("_web_search_blocked"):
+            yield {"kind": "complete", "review_body": rb, "search_loops": 0}
+            return
         # 智能停止：连续多轮“无新增信息”则提前终止，减少无效联网与重复审查
         stagnant_rounds = 0
         last_sources_sig = ""
@@ -1701,6 +1748,17 @@ class DualTrackHarness:
         Fast 轨入口联网：校验 query、区分强制/可选失败策略。
         返回 (更新后的 prompt, step, 若需中止整条流则非空 error 文案)。
         """
+        if options.get("_web_search_blocked"):
+            st = Step(
+                name="web_search",
+                status="skipped",
+                meta=_pg(
+                    {"reason": options.get("_web_search_block_reason")},
+                    "search",
+                    str(options.get("_web_search_block_reason") or "快轨入口联网已跳过"),
+                ),
+            )
+            return prompt, st, None
         queries = self._build_search_queries(prompt, analysis, options)
         raw_q = queries[0] if queries else self.build_search_query(prompt, analysis, options)
         vq, fc, vreason = validate_search_query(raw_q)
@@ -1865,6 +1923,8 @@ class DualTrackHarness:
         options: Dict[str, Any],
     ) -> str:
         """Refine 轨：显式联网意图下 Layer1 前轻量检索，失败仅注入说明、不中止。"""
+        if options.get("_web_search_blocked"):
+            return f"\n【入口联网】已跳过：{options.get('_web_search_block_reason') or '当前请求禁止联网'}。\n"
         queries = self._build_search_queries(prompt, analysis, options)
         raw_q = queries[0] if queries else self.build_search_query(prompt, analysis, options)
         vq, fc, vreason = validate_search_query(raw_q)
@@ -2375,10 +2435,13 @@ class DualTrackHarness:
                         ):
                             yield ev
                         return
-                    nudge = str(
-                        ag_tune.get("stuck_user_nudge")
-                        or "【系统】本轮输出与上一轮高度雷同；请换思路：使用 web_search 获取新证据，或使用 refine_answer 提交草稿。"
-                    )
+                    if options.get("_web_search_blocked"):
+                        nudge = "【系统】本轮输出与上一轮高度雷同；当前已禁止联网，请换思路继续推理，或使用 refine_answer 提交草稿。"
+                    else:
+                        nudge = str(
+                            ag_tune.get("stuck_user_nudge")
+                            or "【系统】本轮输出与上一轮高度雷同；请换思路：使用 web_search 获取新证据，或使用 refine_answer 提交草稿。"
+                        )
                     conv.append({"role": "user", "content": nudge})
                     prev_parse_snapshot = ""
                     yield {
@@ -2526,6 +2589,26 @@ class DualTrackHarness:
                 return
 
             if action_name == "web_search":
+                if options.get("_web_search_blocked"):
+                    yield {
+                        "event": "step",
+                        "step": {
+                            "name": "agent_web_search",
+                            "status": "skipped",
+                            "meta": _pg(
+                                {"reason": "web_search_blocked", "detail": options.get("_web_search_block_reason")},
+                                "reasoning",
+                                str(options.get("_web_search_block_reason") or "当前请求禁止联网，已跳过 web_search。"),
+                            ),
+                        },
+                    }
+                    conv.append(
+                        {
+                            "role": "user",
+                            "content": f"【系统】{options.get('_web_search_block_reason') or '当前禁止联网'}；请在不检索的前提下继续推理或直接给出结论。",
+                        }
+                    )
+                    continue
                 query = (action.get("query") or "").strip()
                 lo = options.get("_agent_loop_ctx") or {}
                 history_queries = list(lo.get("all_queries") or [])
@@ -2838,6 +2921,19 @@ class DualTrackHarness:
         )
         steps.append(step_track)
         yield {"event": "step", "step": step_track.to_dict()}
+        if options.get("_web_search_blocked"):
+            yield {
+                "event": "step",
+                "step": {
+                    "name": "web_search_policy",
+                    "status": "skipped",
+                    "meta": _pg(
+                        {"blocked": True, "reason": options.get("_web_search_block_reason")},
+                        "intake",
+                        str(options.get("_web_search_block_reason") or "已禁止联网检索"),
+                    ),
+                },
+            }
         yield {
             "event": "trace",
             "trace_id": trace_id,
@@ -3357,6 +3453,19 @@ class DualTrackHarness:
                 ),
             )
         )
+
+        if options.get("_web_search_blocked"):
+            steps.append(
+                Step(
+                    name="web_search_policy",
+                    status="skipped",
+                    meta=_pg(
+                        {"blocked": True, "reason": options.get("_web_search_block_reason")},
+                        "intake",
+                        str(options.get("_web_search_block_reason") or "已禁止联网检索"),
+                    ),
+                )
+            )
 
         if chosen_track == "agent":
             sync_meta["sync_agent"] = True

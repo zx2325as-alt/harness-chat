@@ -9,12 +9,12 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import copy
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request, UploadFile, File, Body, HTTPException, Form
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import copy
 import json
 import asyncio
 import math

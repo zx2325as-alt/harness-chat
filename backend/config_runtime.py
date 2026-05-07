@@ -1,5 +1,6 @@
 """
-运行时配置：在 config.yaml 上叠加 config.runtime.yaml，API 可持久化 harness 片段（剔除密钥字段）。
+运行时配置叠加：在 config.yaml 之上合并 config.runtime.yaml，
+并通过 API 持久化修改（不写回密钥字段）。
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ SECRET_KEY_SUFFIXES: tuple[str, ...] = ("_api_key", "_secret", "_token")
 SECRET_EXACT: Set[str] = {
     "api_key",
     "tavily_api_key",
-    "extra_headers",
+    "extra_headers",  # 可能含鉴权头
 }
 
 
@@ -33,6 +34,7 @@ def _is_secret_key(name: str) -> bool:
 
 
 def deep_merge(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    """将 src 合并进 dst（就地修改 dst）。dict 递归，其它类型覆盖。"""
     for k, v in (src or {}).items():
         if k in dst and isinstance(dst[k], dict) and isinstance(v, dict):
             deep_merge(dst[k], v)
@@ -42,6 +44,7 @@ def deep_merge(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def strip_secrets_from_mapping(obj: Any) -> Any:
+    """用于 API 响应：删除密钥类字段。"""
     if isinstance(obj, dict):
         out: Dict[str, Any] = {}
         for k, v in obj.items():
@@ -55,6 +58,7 @@ def strip_secrets_from_mapping(obj: Any) -> Any:
 
 
 def sanitize_harness_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
+    """写入前剔除客户端传入的密钥字段（防止误覆盖）。"""
     return strip_secrets_from_mapping(patch)  # type: ignore[return-value]
 
 
@@ -70,7 +74,13 @@ def dump_yaml(path: str, data: Dict[str, Any]) -> None:
     if parent:
         os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        yaml.safe_dump(
+            data,
+            f,
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=False,
+        )
 
 
 def apply_runtime_file_to_cfg(cfg: Dict[str, Any], runtime_path: str) -> None:
@@ -80,6 +90,7 @@ def apply_runtime_file_to_cfg(cfg: Dict[str, Any], runtime_path: str) -> None:
 
 
 def persist_harness_patch(runtime_path: str, harness_patch: Dict[str, Any]) -> None:
+    """将本次 harness 增量合并进磁盘上的 runtime 文件。"""
     root = load_yaml_if_exists(runtime_path)
     deep_merge(root.setdefault("harness", {}), harness_patch)
     dump_yaml(runtime_path, root)
