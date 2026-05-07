@@ -1516,6 +1516,19 @@ class DualTrackHarness:
 
     async def perform_web_search(self, query: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         options = options or {}
+        h0 = self.cfg.get("harness") or {}
+        wsc = h0.get("web_search") or {}
+        if isinstance(wsc, dict) and bool(wsc.get("globally_disabled")):
+            return {
+                "context": "",
+                "sources": [],
+                "error": "已在服务器配置中启用「全局禁止联网」（harness.web_search.globally_disabled）。",
+                "failure_code": "web_search_globally_disabled",
+                "degraded": False,
+                "provider_used": "none",
+                "latency_ms": 0,
+                "attempts": [],
+            }
         vq, fc, reason = validate_search_query((query or "").strip())
         if fc:
             return {

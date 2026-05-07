@@ -4,7 +4,7 @@
       <div class="brand">
         <div class="dot" />
         <div class="title">Harness Chat</div>
-        <div class="subtitle">Harness：Fast / Refine / Agent</div>
+        <div class="subtitle">{{ chatHeadSubtitle }}</div>
       </div>
       <div class="actions">
         <button class="tab" :class="{ active: view === 'chat' }" @click="view = 'chat'">聊天</button>
@@ -64,6 +64,7 @@
               ref="chatInput"
               :busy="interactionBusy"
               :mode="mode"
+              :global-search-disabled="globalWebSearchDisabled"
               @update:mode="mode = $event"
               @send="onSend"
               @stop="onStop"
@@ -182,6 +183,13 @@ export default {
     },
     interactionBusy() {
       return this.busy || this._sessionTxnDepth > 0;
+    },
+    globalWebSearchDisabled() {
+      return Boolean(this.config?.harness?.web_search?.globally_disabled);
+    },
+    chatHeadSubtitle() {
+      const base = "Harness：Fast / Refine / Agent";
+      return this.globalWebSearchDisabled ? `${base} · 全局离线` : base;
     },
     currentSession() {
       return this.sessions.find(s => s.id === this.currentSessionId) || null;
@@ -404,11 +412,22 @@ export default {
         const r = await fetch(`${API_BASE}/api/config`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         this.config = await r.json();
+        this.applyHarnessUiFromConfig();
       } catch (e) {
         this.configError = String(e && e.message ? e.message : e);
       } finally {
         this.configLoading = false;
       }
+    },
+    applyHarnessUiFromConfig() {
+      const dm = this.config?.harness?.default_mode;
+      const allowed = new Set(["auto", "fast", "refine", "agent"]);
+      if (typeof dm === "string" && allowed.has(dm)) {
+        this.mode = dm;
+      }
+      this.$nextTick(() => {
+        this.$refs.chatInput?.syncFromServerConfig?.(this.config);
+      });
     },
     scrollToBottom() {
       this.$nextTick(() => {

@@ -12,6 +12,8 @@ harness:
   default_mode: "auto"
   # 非流式兜底与 Agent 直接输出时的字符切片；中文界面可略小于默认 96 以更顺滑
   stream_slice_chars: 72
+  web_search:
+    globally_disabled: false
   features:
     # 预判 JSON 损坏时追加一次「仅修 JSON」的短调用（质量优先）
     analyzer_json_repair: true

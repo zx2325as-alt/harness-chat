@@ -61,11 +61,11 @@
             </transition>
           </div>
 
-          <div class="dd dd-search" :class="{ open: openMenu === 'search' }">
+          <div class="dd dd-search" :class="{ open: openMenu === 'search', locked: globalSearchDisabled }">
             <button
               type="button"
-              class="dd-trigger"
-              :disabled="uiBusy"
+              class="dd-trigger dd-trigger-pill"
+              :disabled="uiBusy || globalSearchDisabled"
               :title="searchModeHint"
               aria-haspopup="listbox"
               :aria-expanded="openMenu === 'search'"
@@ -139,6 +139,7 @@
         <span v-else-if="folderLoading">正在读取本地文件夹…</span>
         <span v-else-if="hasParsingAttachment">文档仍在解析中，完成后才能发送</span>
         <span v-else-if="hasImageAttachment">图片目前不会进入模型，请先移除图片或改传文档/文本</span>
+        <span v-else-if="globalSearchDisabled">服务器已全局禁止联网；搜索选项已锁定为关闭并与配置同步。</span>
         <span v-else>支持上传文件，也支持直接读取服务端本地文件夹中的文档与代码文件</span>
       </div>
     </div>
@@ -249,6 +250,8 @@ export default {
   props: {
     busy: { type: Boolean, default: false },
     mode: { type: String, default: "auto" },
+    /** 服务端 harness.web_search.globally_disabled：强制关闭搜索并不允许切换 */
+    globalSearchDisabled: { type: Boolean, default: false },
   },
   emits: ["send", "stop", "update:mode"],
   data() {
@@ -259,7 +262,6 @@ export default {
       searchMode: "auto",
       openMenu: null,
       modeOptions: MODE_OPTIONS,
-      searchOptions: SEARCH_OPTIONS,
       _parseControllers: new Set(),
       _parseControllerByAttachmentId: new Map(),
     };
@@ -299,9 +301,19 @@ export default {
       return "Agent 真循环仅在流式接口可用；同步 /api/chat 即使选择 Agent 也会降级为 Refine。";
     },
     searchLabel() {
+      if (this.globalSearchDisabled) return "关闭（全局锁定）";
       return SEARCH_OPTIONS.find((o) => o.value === this.searchMode)?.label ?? this.searchMode;
     },
+    searchOptions() {
+      if (this.globalSearchDisabled) {
+        return [{ value: "off", label: "关闭（全局锁定）" }];
+      }
+      return SEARCH_OPTIONS;
+    },
     searchModeHint() {
+      if (this.globalSearchDisabled) {
+        return "服务器配置已全局禁止联网；无法在此开启搜索。";
+      }
       return "仅影响「快速轨」入口是否做前置联网检索；精化轨 / Agent 仍按内部逻辑按需搜索。";
     },
     fileAccept() {
@@ -311,6 +323,15 @@ export default {
   watch: {
     busy(v) {
       if (v) this.openMenu = null;
+    },
+    globalSearchDisabled: {
+      immediate: true,
+      handler(on) {
+        if (on) {
+          this.searchMode = "off";
+          if (this.openMenu === "search") this.openMenu = null;
+        }
+      },
     },
   },
   mounted() {
@@ -333,6 +354,7 @@ export default {
     },
     toggleMenu(which) {
       if (this.uiBusy) return;
+      if (which === "search" && this.globalSearchDisabled) return;
       this.openMenu = this.openMenu === which ? null : which;
     },
     pickMode(value) {
@@ -340,8 +362,16 @@ export default {
       this.openMenu = null;
     },
     pickSearch(value) {
+      if (this.globalSearchDisabled && value !== "off") return;
       this.searchMode = value;
       this.openMenu = null;
+    },
+    syncFromServerConfig(config) {
+      const g = Boolean(config?.harness?.web_search?.globally_disabled);
+      if (g) {
+        this.searchMode = "off";
+        if (this.openMenu === "search") this.openMenu = null;
+      }
     },
     statusLabel(s) {
       if (s === "ok") return "已解析";
@@ -809,6 +839,10 @@ export default {
 }
 
 /* 自定义下拉（替代原生 select，避免系统白底菜单） */
+.dd-search.locked .dd-trigger-pill {
+  opacity: 0.72;
+  cursor: not-allowed;
+}
 .dd {
   position: relative;
   z-index: 1;

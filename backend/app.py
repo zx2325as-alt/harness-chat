@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, Request, UploadFile, File, Body, HTTPException, Form
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+import copy
 import json
 import asyncio
 import math
@@ -34,9 +35,18 @@ from local_docs import load_folder_documents
 from semantic_utils import batch_semantic_similarity, batch_semantic_similarity_online
 from utils import load_yaml, new_trace_id, env_get
 from doc_rerank import rerank_document_chunks
+from config_runtime import (
+    apply_runtime_file_to_cfg,
+    deep_merge,
+    persist_harness_patch,
+    redact_models_for_api,
+    sanitize_harness_patch,
+    strip_secrets_from_mapping,
+)
 
 
 CONFIG_PATH = os.path.join(ROOT, "config.yaml")
+CONFIG_RUNTIME_PATH = os.path.join(ROOT, "config.runtime.yaml")
 
 
 redis_client = None
@@ -91,6 +101,12 @@ class ChatResponse(BaseModel):
     final: AskOut
     steps: List[StepOut]
     meta: Optional[Dict[str, Any]] = None
+
+
+class HarnessRuntimePatch(BaseModel):
+    """合并进 harness 的配置片段（不含密钥字段；写入 config.runtime.yaml）。"""
+
+    harness: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _content_to_text(content: Any) -> str:
@@ -735,6 +751,7 @@ def _warn_analyzer_timeout_budget(cfg: Dict[str, Any]) -> None:
 def create_app() -> FastAPI:
     global redis_client
     cfg = load_yaml(CONFIG_PATH)
+    apply_runtime_file_to_cfg(cfg, CONFIG_RUNTIME_PATH)
     configure_document_limits((cfg.get("harness") or {}).get("documents"))
     _warn_analyzer_timeout_budget(cfg)
     _validate_harness_models(cfg)
@@ -875,18 +892,66 @@ def create_app() -> FastAPI:
 
     @app.get("/api/config")
     async def get_config() -> Dict[str, Any]:
-        # expose safe subset for UI
         h = cfg.get("harness") or {}
         ag = h.get("agent") or {}
         return {
-            "harness": {
+            "harness": strip_secrets_from_mapping(copy.deepcopy(h)),
+            "harness_summary": {
                 "default_mode": h.get("default_mode", "auto"),
-                "complexity": h.get("complexity", {}),
-                "routing": h.get("routing", {}),
-                "refine_chain": h.get("refine_chain", {}),
-                "agent": {"enabled": bool(ag.get("enabled", True)), "max_iterations": ag.get("max_iterations", 5)},
+                "complexity": strip_secrets_from_mapping(copy.deepcopy(h.get("complexity") or {})),
+                "routing": strip_secrets_from_mapping(copy.deepcopy(h.get("routing") or {})),
+                "refine_chain": strip_secrets_from_mapping(copy.deepcopy(h.get("refine_chain") or {})),
+                "agent": {
+                    "enabled": bool(ag.get("enabled", True)),
+                    "max_iterations": ag.get("max_iterations", 5),
+                    "sync_non_stream_api": bool(ag.get("sync_non_stream_api", True)),
+                    "model": ag.get("model"),
+                },
             },
             "models": list((cfg.get("models") or {}).keys()),
+            "models_detail": redact_models_for_api(cfg.get("models") or {}),
+            "server": strip_secrets_from_mapping(copy.deepcopy(cfg.get("server") or {})),
+            "runtime_overlay_path": os.path.basename(CONFIG_RUNTIME_PATH),
+            "runtime_overlay_active": os.path.isfile(CONFIG_RUNTIME_PATH),
+            "routing_notes": {
+                "auto": "mode=auto 由预判模型在 fast/refine/agent 中选择轨道，本身不会被「同步接口降级」替换。",
+                "sync_api_agent": "仅当使用非流式 POST /api/chat 且 harness.agent.sync_non_stream_api=false 时，即使用户选了 Agent 轨也会降为 Refine；流式 POST /api/chat/stream 不受影响。",
+            },
+        }
+
+    @app.put("/api/config/runtime")
+    async def put_runtime_config(body: HarnessRuntimePatch) -> Dict[str, Any]:
+        patch_in = body.harness or {}
+        patch = sanitize_harness_patch(patch_in)
+        if not patch:
+            raise HTTPException(status_code=400, detail="harness 片段为空或仅含被过滤的密钥字段")
+        h0 = copy.deepcopy(cfg.get("harness") or {})
+        try:
+            deep_merge(cfg.setdefault("harness", {}), patch)
+            configure_document_limits((cfg.get("harness") or {}).get("documents"))
+            _warn_analyzer_timeout_budget(cfg)
+            _validate_harness_models(cfg)
+        except ValueError as e:
+            cfg["harness"] = h0
+            configure_document_limits((cfg.get("harness") or {}).get("documents"))
+            raise HTTPException(status_code=400, detail=str(e))
+        except HTTPException:
+            cfg["harness"] = h0
+            configure_document_limits((cfg.get("harness") or {}).get("documents"))
+            raise
+        except Exception as e:
+            cfg["harness"] = h0
+            configure_document_limits((cfg.get("harness") or {}).get("documents"))
+            raise HTTPException(status_code=500, detail=str(e))
+        try:
+            persist_harness_patch(CONFIG_RUNTIME_PATH, patch)
+        except OSError as e:
+            cfg["harness"] = h0
+            configure_document_limits((cfg.get("harness") or {}).get("documents"))
+            raise HTTPException(status_code=500, detail=f"写入运行时配置失败: {e}")
+        return {
+            "ok": True,
+            "message": "已合并到当前进程中的配置，并已写入 config.runtime.yaml（下次启动仍会叠加在 config.yaml 之上）。",
         }
 
     @app.post("/api/chat", response_model=ChatResponse)
