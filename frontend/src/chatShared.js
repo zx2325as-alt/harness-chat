@@ -241,6 +241,7 @@ export function computeModelChain(run) {
   const labels = {
     refine_layer1_draft: "初稿",
     refine_layer2_review: "审查",
+    refine_quality_review: "结构化审查",
     refine_layer3_polish: "润色",
     agent_iteration: "Agent",
     fast_route: "快轨",

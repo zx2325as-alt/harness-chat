@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 import redis
 
 from harness import DualTrackHarness
+from chunk_channels import chunk_writes_history
 from document_extract import (
     SUPPORTED_DOCUMENT_EXTS,
     configure_document_limits,
@@ -34,6 +35,8 @@ from document_extract import (
 from local_docs import load_folder_documents
 from semantic_utils import batch_semantic_similarity, batch_semantic_similarity_online
 from utils import load_yaml, new_trace_id, env_get
+from runtime_metrics import emit_product_metric
+from sse_public import normalize_stream_event_step
 from doc_rerank import rerank_document_chunks
 from config_runtime import (
     apply_runtime_file_to_cfg,
@@ -55,6 +58,18 @@ DEFAULT_MAX_UPLOAD_FILES = 6
 DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 DEFAULT_REDIS_HISTORY_ITEMS = 40
 
+# /api/feedback 事件名 → 第十六章用户质量指标（写入 observability JSONL）
+_FEEDBACK_PRODUCT_METRICS = {
+    "thumb_down": "thumb_down_rate",
+    "regenerate": "retry_rate",
+    "retry": "retry_rate",
+    "followup": "followup_rate",
+    "conversation_abandon": "conversation_abandon_rate",
+    "session_abandon": "conversation_abandon_rate",
+    "clear_context": "conversation_abandon_rate",
+}
+
+
 class Message(BaseModel):
     role: str
     content: Any
@@ -65,7 +80,7 @@ class ChatRequest(BaseModel):
     messages: List[Message] = Field(default_factory=list, description="Historical conversation messages")
     mode: str = Field(
         default="auto",
-        description="auto | fast | refine | agent（当前真 Agent 循环仅在 /api/chat/stream 提供；/api/chat 选择 agent 时会自动降级为 refine）",
+        description="auto | fast | refine | agent（同步 /api/chat 与 SSE /api/chat/stream 共用同一 Runtime，含完整 Agent 循环）",
     )
     options: Dict[str, Any] = Field(default_factory=dict)
 
@@ -495,9 +510,19 @@ def _capture_stream_text(final_answer: str, event: Dict[str, Any]) -> Tuple[str,
         return "", False
     if evt == "chunk":
         data = event.get("data", {})
-        if "content" in data:
+        if "content" in data and chunk_writes_history(data):
             final_answer += str(data["content"])
     return final_answer, evt == "error_terminal"
+
+
+def _sse_client_public_event(event: Dict[str, Any]) -> bool:
+    """不向浏览器暴露 model_switch / 带 internal 的模型起止等实现细节（仍保留 chunk、step、error）。"""
+    ev = str(event.get("event") or "")
+    if ev == "model_switch":
+        return False
+    if ev in ("model_start", "model_end") and event.get("internal") is True:
+        return False
+    return True
 
 
 def _init_redis_client(cfg: Dict[str, Any]) -> Optional[redis.Redis]:
@@ -640,7 +665,7 @@ def _normalise_stream_event(event: Dict[str, Any]) -> Dict[str, Any]:
             meta["parent_id"] = meta.get("phase_group") or meta.get("pipeline_phase") or ""
         step["meta"] = meta
         event = {**event, "step": step}
-    return event
+    return normalize_stream_event_step(event)
 
 
 def _validate_harness_models(cfg: Dict[str, Any]) -> None:
@@ -886,6 +911,16 @@ def create_app() -> FastAPI:
                 await asyncio.to_thread(redis_client.xadd, "harness:feedback", stream_payload, maxlen=5000, approximate=True)
             log_path = os.path.join(ROOT, "feedback.log")
             await asyncio.to_thread(_append_feedback_line, log_path, line)
+            pm = _FEEDBACK_PRODUCT_METRICS.get(ev)
+            if pm:
+                hcfg = (cfg.get("harness") or {}) if isinstance(cfg.get("harness"), dict) else {}
+                emit_product_metric(
+                    hcfg,
+                    pm,
+                    trace_id=payload.get("trace_id"),
+                    session_id=payload.get("session_id"),
+                    feedback_event=ev,
+                )
         except Exception as e:
             return {"ok": False, "error": str(e)}
         return {"ok": True}
@@ -904,7 +939,6 @@ def create_app() -> FastAPI:
                 "agent": {
                     "enabled": bool(ag.get("enabled", True)),
                     "max_iterations": ag.get("max_iterations", 5),
-                    "sync_non_stream_api": bool(ag.get("sync_non_stream_api", True)),
                     "model": ag.get("model"),
                 },
             },
@@ -914,8 +948,8 @@ def create_app() -> FastAPI:
             "runtime_overlay_path": os.path.basename(CONFIG_RUNTIME_PATH),
             "runtime_overlay_active": os.path.isfile(CONFIG_RUNTIME_PATH),
             "routing_notes": {
-                "auto": "mode=auto 由预判模型在 fast/refine/agent 中选择轨道，本身不会被「同步接口降级」替换。",
-                "sync_api_agent": "仅当使用非流式 POST /api/chat 且 harness.agent.sync_non_stream_api=false 时，即使用户选了 Agent 轨也会降为 Refine；流式 POST /api/chat/stream 不受影响。",
+                "auto": "mode=auto 由 Capability Planner 与调度解析首执轨；质量闭环可在运行中单调升级 fast→refine→agent。",
+                "sync_api_agent": "非流式 POST /api/chat 与流式 SSE 共用同一 Runtime（execute_runtime→run_stream），不会在同步接口单独把 Agent 降为 Refine。",
             },
         }
 
@@ -1149,6 +1183,9 @@ def create_app() -> FastAPI:
                         break
 
                     event = _normalise_stream_event(event)
+
+                    if not _sse_client_public_event(event):
+                        continue
 
                     final_answer, event_failed = _capture_stream_text(final_answer, event)
                     if event.get("event") == "content_reset":

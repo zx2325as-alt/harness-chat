@@ -202,8 +202,11 @@ const STEP_LABELS = {
   web_search: "联网搜索",
   fast_route: "快速轨路由",
   refine_layer1_draft: "初稿层",
+  refine_draft: "初稿层",
   refine_layer2_review: "审查层",
+  refine_quality_review: "结构化审查",
   refine_layer3_polish: "润色层",
+  refine_finalize: "终稿排版",
   refine_disabled_fallback_fast: "精化关闭 · 降级快速轨",
   review_web_search: "审查 · 联网核查",
   refine_entry_web_search: "精化轨 · 入口轻量联网",
@@ -349,8 +352,16 @@ export default {
         agent_refine_answer: "polishing",
         agent_postprocess_bundle: "polishing",
         refine_layer1_draft: "refine",
+        refine_draft: "refine",
         refine_layer2_review: "refine",
+        refine_quality_review: "refine",
         refine_layer3_polish: "refine",
+        refine_finalize: "refine",
+        refine_runtime_generate: "refine",
+        refine_runtime_critic: "refine",
+        refine_runtime_repair: "refine",
+        refine_runtime_verify: "refine",
+        refine_runtime_finalize: "refine",
         review_web_search: "refine",
       };
       return table[n] || "other";
@@ -405,13 +416,13 @@ export default {
         return "idle";
       }
       if (role === "review") {
-        const s = pick("refine_layer2_review");
+        const s = pick("refine_runtime_critic") || pick("refine_quality_review") || pick("refine_layer2_review");
         if (!s) return "idle";
         if (s.status === "running") return "run";
         if (s.status === "error") return "err";
         return "ok";
       }
-      const s = pick("refine_layer3_polish");
+      const s = pick("refine_runtime_finalize") || pick("refine_finalize") || pick("refine_layer3_polish");
       if (!s) return "idle";
       if (s.status === "running") return "run";
       if (s.status === "error") return "err";
@@ -421,20 +432,20 @@ export default {
       const steps = this._flattenStepsForPipe(stepsWrap);
       const pick = (name) => steps.find((s) => s.name === name);
       if (layer === "draft") {
-        const s = pick("refine_layer1_draft");
+        const s = pick("refine_runtime_generate") || pick("refine_draft") || pick("refine_layer1_draft");
         if (!s) return "idle";
         if (s.status === "running") return "run";
         if (s.status === "error") return "err";
         return "ok";
       }
       if (layer === "review") {
-        const s = pick("refine_layer2_review");
+        const s = pick("refine_runtime_critic") || pick("refine_quality_review") || pick("refine_layer2_review");
         if (!s) return "idle";
         if (s.status === "running") return "run";
         if (s.status === "error") return "err";
         return "ok";
       }
-      const s = pick("refine_layer3_polish");
+      const s = pick("refine_runtime_finalize") || pick("refine_finalize") || pick("refine_layer3_polish");
       if (!s) return "idle";
       if (s.status === "running") return "run";
       if (s.status === "error") return "err";
@@ -679,7 +690,7 @@ export default {
           break;
         case "agent_web_search":
           this._line(rows, "查询词", m.query);
-          if (m.from === "agent") this._line(rows, "触发方式", "Agent <<ACTION: web_search>>");
+          if (m.from === "agent") this._line(rows, "触发方式", "Agent JSON：{\"action\":\"web_search\",...}");
           if (Array.isArray(m.sources)) this._line(rows, "返回条目", String(m.sources.length));
           break;
         case "fast_route":
@@ -705,8 +716,11 @@ export default {
           if (m.agent_fallback) this._line(rows, "来源", "Agent 迭代兜底");
           break;
         case "refine_layer1_draft":
+        case "refine_draft":
         case "refine_layer2_review":
+        case "refine_quality_review":
         case "refine_layer3_polish":
+        case "refine_finalize":
           if (m.phase) this._line(rows, "环节", m.phase);
           if (Array.isArray(m.candidates)) this._line(rows, "候选模型", m.candidates.join("、"));
           if (Array.isArray(m.attempts)) this._line(rows, "尝试次数", m.attempts.length);

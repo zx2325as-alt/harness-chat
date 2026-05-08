@@ -23,7 +23,7 @@
         :disabled="uiBusy"
         v-model="draft"
         placeholder="给 Harness 发送消息…（Enter 发送，Shift+Enter 换行）"
-        rows="3"
+        rows="5"
         @keydown.enter.exact.prevent="send"
       />
 
@@ -296,7 +296,7 @@ export default {
       return MODE_OPTIONS.find((o) => o.value === this.mode)?.label ?? this.mode;
     },
     modeHint() {
-      return "auto：由预判自动选 fast/refine/agent，不会被「同步接口降级」替换。Agent：完整工具循环仅在流式 /api/chat/stream；若关闭 agent.sync_non_stream_api，则非流式 /api/chat 可能降为 Refine（与 auto 无关）。";
+      return "auto：由预判与 Capability Planner 参与首执轨选择；运行中可由后置 critic 单调升级。同步 POST /api/chat 与 SSE /api/chat/stream 共用同一 Runtime，Agent 轨在非流式下同样执行完整循环（注意超时与客户端等待）。";
     },
     searchLabel() {
       if (this.globalSearchDisabled) return "关闭（全局锁定）";
@@ -704,7 +704,7 @@ export default {
 }
 .composer {
   width: 100%;
-  max-width: min(100%, 980px);
+  max-width: min(100%, 1080px);
   margin: 0 auto;
   border: 1px solid #3d4d64;
   border-radius: 14px;
@@ -781,8 +781,8 @@ export default {
 }
 .textarea {
   width: 100%;
-  min-height: 56px;
-  max-height: 220px;
+  min-height: 92px;
+  max-height: 280px;
   resize: vertical;
   padding: 6px 4px 10px;
   border: none;

@@ -5,6 +5,29 @@ harness:
     globally_disabled: true
   features:
     analyzer_json_repair: true
+  runtime_orchestrator:
+    enabled: true
+    max_escalations: 2
+    auto_initial_track_policy: fast_first
+    rollout_stages:
+      fast_quality_gate: true
+      unified_critic: true
+      refine_critic_runtime: true
+      agent_progress_evaluator: true
+    fast_quality_gate:
+      enabled: true
+      min_draft_chars: 48
+      score_threshold: 7.5
+      hallucination_risk_threshold: 0.4
+      completeness_threshold: 0.7
+      disable_cache_on_high_risk: true
+    search_budget_per_request: 24
+    refine_pipeline:
+      mode: critic_runtime
+      critic_model_key: ""
+    observability:
+      metrics_jsonl_path: ""
+      metrics_sqlite_path: data/runtime_metrics.sqlite
   routing_tuning:
     confidence_track_guard_threshold: 0.52
     confidence_track_guard_min_prompt_chars: 150
@@ -15,9 +38,18 @@ harness:
     smart_chunk_boundary: true
     emit_content_reset: true
   agent_tuning:
-    stuck_loop_guard: true
-    stuck_reply_similarity: 0.88
-    stuck_abort_after: 3
+    progress_eval:
+      enabled: true
+      every_n_iterations: 2
+      max_calls_per_request: 4
+      low_progress_abort_after: 2
+      min_progress_score: 0.22
+      min_delta_vs_previous: 0.1
+      progress_score_delta_threshold: 0.05
+      progress_delta_low_abort_after: 2
+      goal_resolve_progress_threshold: 0.55
+      goal_resolve_delta_threshold: 0.2
+      model_key: ""
   search:
     provider: tavily
     fallback: duckduckgo
@@ -185,7 +217,6 @@ harness:
     - 精化轨
   agent:
     enabled: true
-    sync_non_stream_api: true
     model: claude-sonnet-4-6
     model_by_task_type:
       code: claude-sonnet-4-6
@@ -213,6 +244,8 @@ harness:
     - grok-4.2
   refine_chain:
     enabled: true
+    repair:
+      temperature: 0.15
     layer1:
       name: draft
       temperature: 0.2
@@ -250,7 +283,7 @@ harness:
         <<<END_FINAL_ANSWER>>>
 
 
-        你仍然可以在审查结论中单行输出动作：<<ACTION: web_search("查询词")>>（不要放进 FINAL_ANSWER 分隔符内）。
+        如需补充检索，仅在审查结论中非 FINAL 区域输出单行 JSON：{"action":"web_search","query":"查询词","reason":"为何检索","priority":"high"}
 
         '
     layer3:

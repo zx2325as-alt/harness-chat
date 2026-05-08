@@ -1,6 +1,5 @@
 /logs/
-/backend/__pycache__
 /frontend/node_modules
-frontend/dist/
 /frontend/dist/
 __pycache__/
+/backend/data/

@@ -58,8 +58,15 @@ def strip_secrets_from_mapping(obj: Any) -> Any:
 
 
 def sanitize_harness_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
-    """写入前剔除客户端传入的密钥字段（防止误覆盖）。"""
-    return strip_secrets_from_mapping(patch)  # type: ignore[return-value]
+    """写入前剔除客户端传入的密钥字段（防止误覆盖）；移除已废弃字段。"""
+    out = strip_secrets_from_mapping(patch)  # type: ignore[assignment]
+    if isinstance(out, dict):
+        ag = out.get("agent")
+        if isinstance(ag, dict) and "sync_non_stream_api" in ag:
+            ag2 = dict(ag)
+            ag2.pop("sync_non_stream_api", None)
+            out["agent"] = ag2
+    return out  # type: ignore[return-value]
 
 
 def load_yaml_if_exists(path: str) -> Dict[str, Any]:

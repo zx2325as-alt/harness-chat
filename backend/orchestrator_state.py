@@ -1,0 +1,169 @@
+"""
+Capability Planner + ExecutionState 引导启动。
+轨道真相源：runtime_state.ExecutionState.current_track（与 options["_runtime_track"] 同步）。
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from runtime_state import ExecutionState, is_strict_track_upgrade
+
+__all__ = [
+    "ExecutionState",
+    "apply_capability_planner",
+    "bootstrap_execution_state",
+    "record_track_escalation",
+    "can_escalate",
+]
+
+
+def _risk_level_from_analysis(analysis: Dict[str, Any]) -> str:
+    if analysis.get("high_risk_domain"):
+        return "high"
+    if analysis.get("numeric_sensitive") or analysis.get("source_sensitive"):
+        return "medium-high"
+    if str(analysis.get("complexity") or "low").lower() == "high":
+        return "medium"
+    return "low"
+
+
+def _search_policy_from_analysis(analysis: Dict[str, Any]) -> str:
+    si = str(analysis.get("search_intent") or "none").lower()
+    if si in ("required", "freshness_required"):
+        return "required"
+    if si == "explicit":
+        return "explicit"
+    if analysis.get("search_required"):
+        return "suggested"
+    return "optional"
+
+
+def _compact_history_tail(messages: Optional[List[Dict[str, Any]]], max_turns: int = 8) -> List[Dict[str, Any]]:
+    if not messages:
+        return []
+    out: List[Dict[str, Any]] = []
+    for m in messages[-max_turns:]:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        c = m.get("content")
+        text = c if isinstance(c, str) else str(c or "")[:400]
+        out.append({"role": role, "chars": len(text), "preview": text[:160]})
+    return out
+
+
+def _history_turns_compact(messages: Optional[List[Dict[str, Any]]], max_turns: int = 12, max_chars: int = 2000) -> List[Dict[str, Any]]:
+    """ExecutionState.history：保留角色与截断正文（与 digest 互补）。"""
+    if not messages:
+        return []
+    out: List[Dict[str, Any]] = []
+    for m in messages[-max_turns:]:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role not in ("user", "assistant", "system"):
+            continue
+        c = m.get("content")
+        text = c if isinstance(c, str) else str(c or "")
+        out.append({"role": role, "content": text[:max_chars], "chars": len(text)})
+    return out
+
+
+def _documents_snapshot(documents: Any, *, limit: int = 24) -> List[Dict[str, Any]]:
+    if not isinstance(documents, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    keys = ("name", "id", "status", "type", "mime", "size", "uri")
+    for d in documents[:limit]:
+        if isinstance(d, dict):
+            out.append({k: d.get(k) for k in keys if k in d and d.get(k) is not None})
+    return out
+
+
+def _compact_documents_meta(documents: Any) -> List[Dict[str, Any]]:
+    if not isinstance(documents, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for d in documents[:16]:
+        if isinstance(d, dict):
+            out.append({"name": d.get("name"), "status": d.get("status")})
+    return out
+
+
+def apply_capability_planner(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Capability Planner：产出 capability_plan（能力与检索策略），作为首执轨道的主要输入。
+    首执轨道由 DualTrackHarness.resolve_initial_track_from_planner（读 capability_plan + mode）解析；
+    运行中真相源为 ExecutionState.current_track，可由质量闭环单调升级。
+    """
+    cx = str(analysis.get("complexity") or "low").lower()
+    if cx not in ("low", "medium", "high"):
+        cx = "medium"
+    plan = {
+        "capability_level": cx,
+        "response_style": str(analysis.get("response_style") or "normal").lower(),
+        "search_policy": _search_policy_from_analysis(analysis),
+        "risk_level": _risk_level_from_analysis(analysis),
+    }
+    analysis["capability_plan"] = plan
+    return plan
+
+
+def bootstrap_execution_state(
+    trace_id: str,
+    prompt: str,
+    initial_track: str,
+    analysis: Dict[str, Any],
+    options: Dict[str, Any],
+    *,
+    max_escalations: int = 2,
+    messages: Optional[List[Dict[str, Any]]] = None,
+) -> ExecutionState:
+    lims = list(analysis.get("limitations") or [])
+    hist = str(options.get("_history_signature") or "")[:4000]
+    docs = str(options.get("_documents_signature") or "")[:4000]
+    bud = options.get("_search_budget_remaining")
+    st = ExecutionState(
+        request_id=trace_id,
+        prompt=(prompt or "")[:8000],
+        history_digest=hist,
+        documents_digest=docs,
+        history=_history_turns_compact(messages),
+        documents=_documents_snapshot(options.get("documents")),
+        history_tail=_compact_history_tail(messages),
+        documents_meta=_compact_documents_meta(options.get("documents")),
+        initial_track=str(initial_track).strip().lower(),
+        current_track=str(initial_track).strip().lower(),
+        limitations=lims,
+        search_budget=bud if isinstance(bud, int) else None,
+        search_budget_remaining=bud if isinstance(bud, int) else None,
+        max_escalations=max(1, min(8, int(max_escalations))),
+    )
+    options["_execution_state"] = st
+    options["_runtime_track"] = st.current_track
+    return st
+
+
+def record_track_escalation(options: Dict[str, Any], from_track: str, to_track: str) -> bool:
+    """仅在严格升级（fast→refine→agent）时更新状态并计入 escalation_count。"""
+    ft = str(from_track).strip().lower()
+    tt = str(to_track).strip().lower()
+    if not is_strict_track_upgrade(ft, tt):
+        return False
+    st: Optional[ExecutionState] = options.get("_execution_state")
+    if not isinstance(st, ExecutionState):
+        return False
+    st.escalation_count += 1
+    st.current_track = tt
+    st.escalation_path.append(f"{ft}->{tt}")
+    options["_runtime_track"] = st.current_track
+    return True
+
+
+def can_escalate(options: Dict[str, Any]) -> bool:
+    st: Optional[ExecutionState] = options.get("_execution_state")
+    if not isinstance(st, ExecutionState):
+        return True
+    return st.escalation_count < st.max_escalations

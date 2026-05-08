@@ -323,7 +323,7 @@ h2.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,
     <div class="item-num">C5</div>
     <div class="item-body">
       <p class="item-title">search.max_results: 8 → 按轨道动态调整</p>
-      <p class="item-desc">Fast 轨需要的是快速摘要，4-5 条足够；Refine 轨 Layer2 审查可能需要更多来源，10-12 条更合适；Agent 轨每轮搜索结果会注入 conv，过多会撑爆上下文，4-6 条为宜。按 chosen_track 分别传入 override_max_results 参数到 SearchService.search。</p>
+      <p class="item-desc">Fast 轨需要的是快速摘要，4-5 条足够；Refine 轨 Layer2 审查可能需要更多来源，10-12 条更合适；Agent 轨每轮搜索结果会注入 conv，过多会撑爆上下文，4-6 条为宜。按 runtime_track（fast/refine/agent）分别传入 override_max_results 参数到 SearchService.search。</p>
       <div class="item-tags"><span class="tag t-qual">检索效率</span></div>
     </div>
     <div class="item-meta">质量/成本均衡</div>
@@ -341,7 +341,7 @@ h2.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,
     <div class="item-num">C7</div>
     <div class="item-body">
       <p class="item-title">Tavily search_depth: basic → 按需 advanced</p>
-      <p class="item-desc">basic 模式检索速度快但内容浅，适合 Fast 轨；Refine 轨和 Agent 轨的搜索用 advanced 可以获得更深入的内容摘要，对需要事实核查的任务效果明显（Tavily advanced 会实际爬取页面而非只用摘要索引）。按 chosen_track 传入 override_search_depth。</p>
+      <p class="item-desc">basic 模式检索速度快但内容浅，适合 Fast 轨；Refine 轨和 Agent 轨的搜索用 advanced 可以获得更深入的内容摘要，对需要事实核查的任务效果明显（Tavily advanced 会实际爬取页面而非只用摘要索引）。按 runtime_track 传入 override_search_depth。</p>
       <div class="item-tags"><span class="tag t-qual">检索深度</span></div>
     </div>
     <div class="item-meta">Refine/Agent +</div>

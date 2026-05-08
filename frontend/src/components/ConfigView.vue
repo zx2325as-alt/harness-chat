@@ -332,7 +332,7 @@
               <label class="field">
                 <span class="field-label">refine_chain_tuning.max_review_web_rounds</span>
                 <input v-model.number="refineChainTuning.max_review_web_rounds" type="number" min="1" max="8" class="inp inp-fill" />
-                <span class="field-help">审查层中 <code>&lt;&lt;ACTION: web_search(...)&gt;&gt;</code> 触发的外查与再审最大轮数（1～8）。数字越大越「较真」，但响应越慢。</span>
+                <span class="field-help">审查层通过 JSON 工具协议（例如 <code v-pre>{"action":"web_search","query":"..."}</code>）触发的外查与再审最大轮数（1～8）。数字越大越「较真」，但响应越慢。</span>
               </label>
             </div>
           </article>
@@ -350,18 +350,13 @@
             </header>
             <div class="pipeline-step-body">
               <p class="step-blurb">
-                <strong>Agent 轨</strong>以「思考—工具—观察」循环执行，可多次联网或调用封装能力。<strong>max_iterations</strong> 与按复杂度分解的上限控制最长循环；<strong>stuck_*</strong> 在模型反复输出雷同内容时强制中止并走兜底，避免空转刷账单。
+                <strong>Agent 轨</strong>以「思考—工具—观察」循环执行，可多次联网或调用封装能力。<strong>max_iterations</strong> 与按复杂度分解的上限控制最长循环；<strong>progress_eval</strong> 在进度停滞时中止并走 Refine 兜底，避免空转。
               </p>
               <label class="row-check">
                 <input v-model="agent.enabled" type="checkbox" />
                 <span>agent.enabled</span>
               </label>
               <span class="field-help block">关闭后需要 Agent 的场景往往退回精化链或其它兜底，复杂工具链能力会受限。</span>
-              <label class="row-check">
-                <input v-model="agent.sync_non_stream_api" type="checkbox" />
-                <span>sync_non_stream_api</span>
-              </label>
-              <span class="field-help block">仅影响<strong>非流式</strong> <code>POST /api/chat</code>：关闭时即使用户选 Agent 也会降为 Refine；<strong>流式 SSE 不受影响</strong>。</span>
               <label class="field">
                 <span class="field-label">model</span>
                 <select v-model="agent.model" class="inp inp-fill">
@@ -395,20 +390,22 @@
                 <span class="field-help">与预判给出的 complexity 联动；高档任务允许更多轮工具调用，但也更容易耗时。</span>
               </label>
               <div class="divider" />
+              <span class="field-help block">Agent 空转中止由「进度评估」主导（后端 evaluate_agent_progress），不再使用相邻轮次文本相似度守卫。</span>
               <label class="row-check">
-                <input v-model="agentTuning.stuck_loop_guard" type="checkbox" />
-                <span>stuck_loop_guard</span>
-              </label>
-              <span class="field-help block">检测相邻轮次模型正文是否高度雷同；雷同则累计计数，达到 abort 阈值则终止 Agent。</span>
-              <label class="field">
-                <span class="field-label">stuck_reply_similarity（0～1）</span>
-                <input v-model.number="agentTuning.stuck_reply_similarity" type="number" min="0" max="1" step="0.01" class="inp inp-fill" />
-                <span class="field-help">相似度高于该值视为「卡住」。<strong>调高</strong>更迟钝（少误判）；<strong>调低</strong>更敏感（早中止）。</span>
+                <input v-model="agentTuning.progress_eval.enabled" type="checkbox" />
+                <span>progress_eval.enabled</span>
               </label>
               <label class="field">
-                <span class="field-label">stuck_abort_after</span>
-                <input v-model.number="agentTuning.stuck_abort_after" type="number" min="1" max="12" class="inp inp-fill" />
-                <span class="field-help">连续满足雷同条件的次数达到该值后强制结束 Agent 并走后端兜底路径。</span>
+                <span class="field-label">every_n_iterations</span>
+                <input v-model.number="agentTuning.progress_eval.every_n_iterations" type="number" min="1" max="8" class="inp inp-fill" />
+              </label>
+              <label class="field">
+                <span class="field-label">progress_score_delta_threshold / progress_delta_low_abort_after</span>
+                <span class="inline-pair inp-fill-row">
+                  <input v-model.number="agentTuning.progress_eval.progress_score_delta_threshold" type="number" min="0" max="1" step="0.01" class="inp inp-tiny" title="Δ 阈值" />
+                  <input v-model.number="agentTuning.progress_eval.progress_delta_low_abort_after" type="number" min="1" max="12" class="inp inp-tiny" title="连续轮数" />
+                </span>
+                <span class="field-help">连续多轮进度评分变化低于阈值达到次数后终止 Agent。</span>
               </label>
             </div>
           </article>
@@ -422,7 +419,7 @@
               <div class="step-titles">
                 <div class="step-title">输出与流式</div>
                 <div class="step-sub">stream_slice · stream_tuning</div>
-              </div>
+      </div>
             </header>
             <div class="pipeline-step-body">
               <p class="step-blurb">
@@ -443,9 +440,9 @@
                 <span>emit_content_reset</span>
               </label>
               <span class="field-help block">精化流水线阶段切换时是否发送 content_reset 事件。关闭后 UI 可能连续追加全文，但层次边界需靠步骤组件区分。</span>
-            </div>
+      </div>
           </article>
-        </div>
+      </div>
       </div>
 
       <section class="json-panel">
@@ -594,7 +591,6 @@ export default {
 
       h.agent = h.agent || {};
       if (typeof h.agent.enabled !== "boolean") h.agent.enabled = true;
-      if (h.agent.sync_non_stream_api === undefined) h.agent.sync_non_stream_api = true;
       h.agent.model_by_task_type = h.agent.model_by_task_type || {};
       h.agent.max_iterations_by_complexity = h.agent.max_iterations_by_complexity || {};
       if (h.agent.max_iterations_by_complexity.low == null) h.agent.max_iterations_by_complexity.low = 3;
@@ -602,9 +598,16 @@ export default {
       if (h.agent.max_iterations_by_complexity.high == null) h.agent.max_iterations_by_complexity.high = 8;
 
       h.agent_tuning = h.agent_tuning || {};
-      if (typeof h.agent_tuning.stuck_loop_guard !== "boolean") h.agent_tuning.stuck_loop_guard = true;
-      if (h.agent_tuning.stuck_reply_similarity == null) h.agent_tuning.stuck_reply_similarity = 0.88;
-      if (h.agent_tuning.stuck_abort_after == null) h.agent_tuning.stuck_abort_after = 3;
+      h.agent_tuning.progress_eval = h.agent_tuning.progress_eval || {};
+      const pe = h.agent_tuning.progress_eval;
+      if (typeof pe.enabled !== "boolean") pe.enabled = true;
+      if (pe.every_n_iterations == null) pe.every_n_iterations = 2;
+      if (pe.max_calls_per_request == null) pe.max_calls_per_request = 4;
+      if (pe.low_progress_abort_after == null) pe.low_progress_abort_after = 2;
+      if (pe.min_progress_score == null) pe.min_progress_score = 0.22;
+      if (pe.min_delta_vs_previous == null) pe.min_delta_vs_previous = 0.1;
+      if (pe.progress_score_delta_threshold == null) pe.progress_score_delta_threshold = 0.05;
+      if (pe.progress_delta_low_abort_after == null) pe.progress_delta_low_abort_after = 2;
 
       h.complexity = h.complexity || {};
       if (typeof h.complexity.use_llm_analyzer !== "boolean") h.complexity.use_llm_analyzer = true;

@@ -19,13 +19,42 @@ harness:
     # 预判 JSON 损坏时追加一次「仅修 JSON」的短调用（质量优先）
     analyzer_json_repair: true
 
+  # 动态 Runtime（Stage 1+）：Fast 后置质量门、ExecutionState、Capability Planner 元数据
+  runtime_orchestrator:
+    enabled: true
+    max_escalations: 2
+    # 分阶段回滚开关（false 即关闭该能力；默认可全 true 一次性上线）
+    # auto：默认始终先 fast，由后置 critic 升级（follow_analyzer 则沿用 Analyzer / resolve_initial_track_from_planner 首轨建议）
+    auto_initial_track_policy: fast_first
+    rollout_stages:
+      fast_quality_gate: true
+      unified_critic: true
+      refine_critic_runtime: true
+      agent_progress_evaluator: true
+    fast_quality_gate:
+      enabled: true
+      min_draft_chars: 48
+      score_threshold: 7.5
+      hallucination_risk_threshold: 0.4
+      completeness_threshold: 0.7
+      critic_model_key: "" # 空则使用 routing.default_model / default_models
+      disable_cache_on_high_risk: true
+    # 单次请求外部检索 API 预算（命中请求内缓存 / 会话 Redis 缓存不扣减）。省略或 null 表示不限制。
+    search_budget_per_request: 24
+    refine_pipeline:
+      mode: critic_runtime
+      critic_model_key: "" # 空则回退 routing.default_model / default_models
+    observability:
+      metrics_jsonl_path: "" # 可选：额外 JSONL 副本
+      metrics_sqlite_path: data/runtime_metrics.sqlite # 默认 SQLite 观测库（相对 backend 目录）
+
   # 路由守卫与低置信度随 suggested_track 的阈值（可微调「效果 vs 快轨」）
   routing_tuning:
     confidence_track_guard_threshold: 0.52  # 降低阈值，减少不必要的升级
     confidence_track_guard_min_prompt_chars: 150  # 降低字符数要求
     low_confidence_suggested_track_threshold: 0.50  # 降低阈值
 
-  # Refine 审查层内 <<ACTION: web_search>> 最大轮数
+  # Refine 审查层内 JSON web_search 工具协议的最大核查轮数
   refine_chain_tuning:
     max_review_web_rounds: 3
 
@@ -35,11 +64,20 @@ harness:
     # Refine L1→L2 过渡期的 content_reset 事件（前端可据此折叠草稿）；不想出现“清空再输出”可关
     emit_content_reset: true
 
-  # Agent：连续高度相似输出时注入纠偏，避免空转
+  # Agent：空转中止仅依赖 progress_eval（evaluate_agent_progress），不再使用文本相似度守卫
   agent_tuning:
-    stuck_loop_guard: true
-    stuck_reply_similarity: 0.88  # 降低阈值，更早检测重复
-    stuck_abort_after: 3  # 连续重复触发次数达到阈值后，直接终止 Agent 并进入 Refine 兜底
+    progress_eval:
+      enabled: true
+      every_n_iterations: 2
+      max_calls_per_request: 4
+      low_progress_abort_after: 2
+      min_progress_score: 0.22
+      min_delta_vs_previous: 0.1
+      progress_score_delta_threshold: 0.05
+      progress_delta_low_abort_after: 2
+      goal_resolve_progress_threshold: 0.55
+      goal_resolve_delta_threshold: 0.2
+      model_key: "" # 空则 routing.default_model / default_models
 
   search:
     tavily_api_key: "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"
@@ -62,6 +100,11 @@ harness:
     timeout_s: 15
     timeout_s_max: 28
     include_answer: false
+    # 权威来源加权：.gov/.edu 等域名提高排序；rank_blend 越大越重视权威（相对检索引擎原始顺序）
+    authority:
+      enabled: true
+      rank_blend: 0.42
+      extra_domain_hints: []
     relevance_filter:
       enabled: true
       model: "claude-sonnet-4-6"
@@ -236,8 +279,6 @@ harness:
   # Agent 轨（task_type=reasoning）：思考-行动-观察；工具含联网与 refine_answer 封装
   agent:
     enabled: true
-    # 非流式 /api/chat 是否跑完整 Agent 循环（与 SSE 效果对齐）；false 时仍降级 Refine
-    sync_non_stream_api: true
     model: "claude-sonnet-4-6"
     # 覆写默认 agent.model；未列出的 task_type 仍用 model
     model_by_task_type:
@@ -276,6 +317,9 @@ harness:
         1) 关键点列表
         2) 初步答案（可包含不确定性提示）
         3) 你认为需要进一步核查的点（如果有）
+    # Runtime Repair（critic_runtime 中段修订；未配置时回退 layer2.temperature）
+    repair:
+      temperature: 0.15
     # Layer 2: critical review (find mistakes, add depth)
     layer2:
       name: "review"
@@ -293,7 +337,8 @@ harness:
         <这里是给用户看的完整修正版答案正文>
         <<<END_FINAL_ANSWER>>>
         
-        你仍然可以在审查结论中单行输出动作：<<ACTION: web_search("查询词")>>（不要放进 FINAL_ANSWER 分隔符内）。
+        如需补充检索，仅在审查结论中非 FINAL 区域输出单行 JSON：
+        {"action":"web_search","query":"查询词","reason":"为何检索","priority":"high"}
     # Layer 3: polish (format, coherence)
     layer3:
       name: "polish"

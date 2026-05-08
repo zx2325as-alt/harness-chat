@@ -1,4 +1,4 @@
-"""从用户文案与 options 推导 search_intent / output_intent，并与分析器 suggested_track 对齐。"""
+"""从用户文案与 options 推导 search_intent / response_style，并与分析器 suggested_track 对齐。"""
 from __future__ import annotations
 
 import re
@@ -208,39 +208,46 @@ def derive_user_signals(prompt: str, options: Dict[str, Any]) -> Dict[str, Any]:
         else:
             si = "none"
 
-    oi = str(options.get("output_intent") or "").strip().lower()
-    if oi not in ("neutral", "fast", "deep"):
-        oi = "neutral"
+    rs = str(options.get("response_style") or "").strip().lower()
+    if rs not in ("short", "normal", "deep"):
+        rs = ""
+    oi_legacy = str(options.get("output_intent") or "").strip().lower()
     fast_hit = any(k in text for k in FAST_PHRASES)
     deep_hit = any(k in text for k in DEEP_PHRASES)
     intent_conflict = fast_hit and deep_hit
-    if oi == "neutral":
-        if fast_hit and not deep_hit:
-            oi = "fast"
+    if not rs:
+        if oi_legacy == "fast":
+            rs = "short"
+        elif oi_legacy == "deep":
+            rs = "deep"
+        elif fast_hit and not deep_hit:
+            rs = "short"
         elif deep_hit and not fast_hit:
-            oi = "deep"
+            rs = "deep"
         elif deep_hit:
-            oi = "deep"
+            rs = "deep"
+        else:
+            rs = "normal"
 
     return {
         "search_intent": si,
-        "output_intent": oi,
+        "response_style": rs,
         "intent_conflict": intent_conflict,
     }
 
 
 def apply_suggested_track_on_conflict(signals: Dict[str, Any], analysis: Dict[str, Any]) -> Dict[str, Any]:
-    """当快速/深入表述冲突时，以分析器 suggested_track 覆盖 output_intent。"""
+    """当快速/深入表述冲突时，以分析器 suggested_track 覆盖 response_style（仅输出形态，不是轨道）。"""
     out = dict(signals)
     if not signals.get("intent_conflict"):
         return out
     st = norm_suggested_track(str(analysis.get("suggested_track") or ""))
     if st == "fast":
-        out["output_intent"] = "fast"
-        out["output_intent_source"] = "analyzer_suggested_track"
+        out["response_style"] = "short"
+        out["response_style_source"] = "analyzer_suggested_track"
     elif st in ("refine", "agent"):
-        out["output_intent"] = "deep"
-        out["output_intent_source"] = "analyzer_suggested_track"
+        out["response_style"] = "deep"
+        out["response_style_source"] = "analyzer_suggested_track"
     return out
 
 
@@ -250,7 +257,6 @@ def merge_signals_into_analysis(
     sig2 = apply_suggested_track_on_conflict(signals, analysis)
     out = {**analysis}
     out["search_intent"] = sig2.get("search_intent", "none")
-    out["output_intent"] = sig2.get("output_intent", "neutral")
     out["_routing_signals"] = sig2
     p = (user_prompt or str(analysis.get("search_prompt_base") or "")).strip()
     hr, hits = detect_high_risk_domain(p)
@@ -269,6 +275,24 @@ def merge_signals_into_analysis(
         "",
     ):
         out["search_intent"] = "required"
+
+    # response_style：short | normal | deep —— 唯一「输出形态」字段
+    rs = str(out.get("response_style") or "normal").strip().lower()
+    rs_sig = str(sig2.get("response_style") or "").strip().lower()
+    if rs_sig in ("short", "normal", "deep"):
+        rs = rs_sig
+    oi_an = str(analysis.get("output_intent") or "").strip().lower()
+    if oi_an == "fast":
+        rs = "short"
+    elif oi_an == "deep":
+        rs = "deep"
+    rs_an2 = str(analysis.get("response_style") or "").strip().lower()
+    if rs_an2 in ("short", "normal", "deep"):
+        rs = rs_an2
+    if rs not in ("short", "normal", "deep"):
+        rs = "normal"
+    out["response_style"] = rs
+    out.pop("output_intent", None)
     return out
 
 

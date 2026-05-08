@@ -58,6 +58,8 @@
                 :role="m.role"
                 :content="m.content"
                 :meta="m.meta"
+                :live-run="liveRunForMessage(m)"
+                :step-ui-tick="stepUiTick"
                 @edit="onEditMessage(m)"
                 @regenerate="onRegenerateMessage(m)"
                 @copy="onMessageCopy(m, $event)"
@@ -142,7 +144,8 @@ import {
 } from "./sessionPersistence.js";
 
 /** SSE 在这么长时间内完全无事件则客户端主动断开（有 step/status 等即会刷新） */
-const CHAT_STREAM_IDLE_MS = 180000;
+/* 首 token 前仅有 step/status、无 chunk 时也算「有活动」；仍要给慢模型（如 thinking）留出更长静默窗口 */
+const CHAT_STREAM_IDLE_MS = 600000;
 
 export default {
   name: "App",
@@ -160,7 +163,7 @@ export default {
       configError: "",
       abortController: null,
       stepUiTick: 0,
-      showStepsPanel: true,
+      showStepsPanel: false,
       rightPanelWidth: 320,
       chatBanner: "",
       /** 服务端 Redis 已持久化本轮后，后续请求可省略 messages 体积 */
@@ -226,7 +229,8 @@ export default {
     await this.loadSessionsFromStorage();
     try {
       const v = localStorage.getItem("harness_show_steps");
-      if (v === "0") this.showStepsPanel = false;
+      if (v === "1") this.showStepsPanel = true;
+      else if (v === "0") this.showStepsPanel = false;
       const pw = parseInt(localStorage.getItem("harness_panel_w") || "", 10);
       if (!Number.isNaN(pw) && pw >= 200) this.rightPanelWidth = pw;
     } catch (_) {
@@ -355,12 +359,13 @@ export default {
       }
       void this.saveSessions();
     },
+    /** 流式更新时：仅当用户本来就在底部附近才跟随滚动，避免强行钉在底部导致无法上翻阅读 */
     scheduleScrollBottom() {
       if (this._scrollBottomPending) return;
       this._scrollBottomPending = true;
       requestAnimationFrame(() => {
         this._scrollBottomPending = false;
-        this.scrollToBottom();
+        this.scrollToBottomIfNearEnd();
       });
     },
     createNewSession(options = {}) {
@@ -423,6 +428,12 @@ export default {
     getSessionTitle(session) {
       return deriveSessionTitle(session);
     },
+    /** 助手消息关联本轮 StepDisplay 同源数据，用于气泡内「思考过程」时间轴 */
+    liveRunForMessage(m) {
+      const rid = m?.meta?.runId;
+      if (!rid || !this.currentSession?.stepRuns) return null;
+      return this.currentSession.stepRuns.find((r) => r.id === rid) || null;
+    },
     async loadConfig() {
       this.configLoading = true;
       this.configError = "";
@@ -456,6 +467,15 @@ export default {
         const el = this.$refs.msgRef;
         if (el) el.scrollTop = el.scrollHeight;
       });
+    },
+    scrollToBottomIfNearEnd() {
+      const el = this.$refs.msgRef;
+      if (!el) return;
+      const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+      const threshold = 140;
+      if (gap <= threshold) {
+        el.scrollTop = el.scrollHeight;
+      }
     },
     normalizePayload(payload) {
       return normalizeChatPayload(payload);
@@ -558,6 +578,9 @@ export default {
       } else if (event.event === "status") {
         run.phase = event.phase || "";
         run.phaseMessage = event.message || "";
+        if (event.user_cognitive && event.message) {
+          this.chatBanner = event.message;
+        }
         this.bumpStepUi();
         await this.$nextTick();
       } else if (event.event === "step") {
@@ -596,6 +619,10 @@ export default {
         this.bumpStepUi();
       } else if (event.event === "chunk") {
         const data = event.data || {};
+        const ch = String(data.channel || "").toLowerCase();
+        if (ch === "internal" || ch === "tool") {
+          return;
+        }
         if (data.content) {
           ctx.finalContent += data.content;
           pending.content = ctx.finalContent;

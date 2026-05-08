@@ -2,7 +2,7 @@
   <div class="msg" :class="{ user: role === 'user', assistant: role !== 'user' }">
     <div class="msg-stack">
       <div class="bubble" :class="{ 'user-bubble': role === 'user' }">
-        <div class="meta" v-if="role !== 'user' && meta && !meta.pending">
+        <div class="meta" v-if="role !== 'user' && meta && (!meta.pending || meta.streaming)">
           <span v-if="meta.track" class="pill" :title="metaTitle">{{ meta.track }}</span>
           <span v-if="meta.provider" class="pill">{{ meta.provider }}</span>
           <span v-if="meta.model" class="pill" :title="'末段模型: ' + meta.model">{{ meta.model }}</span>
@@ -14,14 +14,26 @@
           {{ meta.model_chain }}
         </div>
 
+        <ThinkingPane
+          v-if="role === 'assistant' && liveRun && showThinkingPane"
+          :run="liveRun"
+          :tick="stepUiTick"
+          :streaming="Boolean(meta?.streaming)"
+          :latency-ms="meta?.latency_ms != null ? meta.latency_ms : null"
+        />
+
         <div class="content markdown-body">
           <div v-if="Array.isArray(content)" class="multimodal-content">
             <template v-for="(part, idx) in content" :key="idx">
-              <div v-if="part.type === 'text'" v-html="renderMarkdown(part.text)"></div>
+              <div v-if="part.type === 'text'" v-html="safeMarkdown(part.text)"></div>
               <img v-if="part.type === 'image_url'" :src="part.image_url.url" class="chat-img" alt="" />
             </template>
           </div>
-          <pre v-else-if="meta?.streaming" class="stream-plain">{{ textContent }}</pre>
+          <!-- 流式阶段：不用 code-block 的 pre 样式；空内容时不渲染大块深色 pre（避免「黑框」） -->
+          <div v-else-if="meta?.streaming" class="stream-live">
+            <pre v-if="textContent.trim()" class="stream-plain">{{ textContent }}</pre>
+            <p v-else class="stream-placeholder">等待模型输出…</p>
+          </div>
           <div v-else v-html="renderedContent"></div>
         </div>
       </div>
@@ -60,13 +72,18 @@
 
 <script>
 import { renderMarkdownWithMath } from "../markdownMath.js";
+import ThinkingPane from "./ThinkingPane.vue";
 
 export default {
   name: "ChatMessage",
+  components: { ThinkingPane },
   props: {
     role: { type: String, required: true },
     content: { type: [String, Array], required: true },
     meta: { type: Object, default: null },
+    /** 与本轮助手消息绑定的执行过程（用于气泡内「思考过程」） */
+    liveRun: { type: Object, default: null },
+    stepUiTick: { type: Number, default: 0 },
   },
   emits: ["edit", "regenerate", "copy", "retry"],
   computed: {
@@ -82,15 +99,42 @@ export default {
       return "";
     },
     renderedContent() {
-      return this.renderMarkdown(this.textContent || "");
+      return this.safeMarkdown(this.textContent || "");
+    },
+    showThinkingPane() {
+      if (!this.liveRun) return false;
+      // 流式期间助手消息一直保持 meta.pending=true，若据此隐藏则气泡内「思考过程」永远不出现
+      if (this.meta?.pending && !this.meta?.streaming) return false;
+      const steps = this.liveRun.steps || [];
+      return (
+        steps.length > 0 ||
+        this.liveRun.status === "running" ||
+        Boolean(this.meta?.streaming)
+      );
     },
     showUnderActions() {
       return !this.meta?.pending && !this.meta?.streaming && this.role !== "system";
     },
   },
   methods: {
+    escapeHtml(s) {
+      return String(s || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    },
+    safeMarkdown(text) {
+      try {
+        return renderMarkdownWithMath(text || "");
+      } catch (e) {
+        console.warn("ChatMessage: markdown render failed", e);
+        const t = this.escapeHtml(text || "");
+        return `<pre class="md-fallback">${t}</pre>`;
+      }
+    },
     renderMarkdown(text) {
-      return renderMarkdownWithMath(text || "");
+      return this.safeMarkdown(text || "");
     },
     plainTextFromContent() {
       const c = this.content;
@@ -184,12 +228,24 @@ export default {
   font-size: 14px;
   color: #e2e8f0;
 }
+.stream-live {
+  margin-top: 2px;
+}
+.stream-placeholder {
+  margin: 0;
+  padding: 2px 0;
+  font-size: 13px;
+  color: #64748b;
+}
 .stream-plain {
   margin: 0;
   white-space: pre-wrap;
   word-break: break-word;
   font: inherit;
   color: inherit;
+  background: transparent;
+  border: none;
+  padding: 0;
 }
 .msg.user .content {
   color: #f1f5f9;
@@ -266,7 +322,8 @@ export default {
   border-radius: 4px;
   color: #a5b4fc;
 }
-.content.markdown-body :deep(pre) {
+/* 勿作用于流式 plain 文本 pre（.stream-plain），否则空块也会出现代码块样式「黑框」 */
+.content.markdown-body :deep(pre:not(.stream-plain)) {
   background: #161b26;
   padding: 10px 12px;
   border-radius: 8px;
@@ -274,7 +331,7 @@ export default {
   font-size: 13px;
   border: 1px solid #2f3a4d;
 }
-.content.markdown-body :deep(pre code) {
+.content.markdown-body :deep(pre:not(.stream-plain) code) {
   background: transparent;
   padding: 0;
 }
