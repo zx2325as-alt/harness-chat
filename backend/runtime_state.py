@@ -4,8 +4,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-# 仅允许 fast → refine → agent 单调升级（禁止 agent→fast 等降级）。
-TRACK_RANK: Dict[str, int] = {"fast": 0, "refine": 1, "agent": 2}
+# 单调升级秩；dag 为当前默认执行轨（最高）。
+TRACK_RANK: Dict[str, int] = {"fast": 0, "refine": 1, "agent": 2, "dag": 3}
 
 
 def track_rank_value(track: str) -> int:
@@ -31,11 +31,13 @@ class ExecutionState:
     history_tail: List[Dict[str, Any]] = field(default_factory=list)
     """上传文档摘要（文件名/状态等）。"""
     documents_meta: List[Dict[str, Any]] = field(default_factory=list)
-    initial_track: str = "fast"
-    current_track: str = "fast"
+    initial_track: str = "dag"
+    current_track: str = "dag"
     draft_answer: Optional[str] = None
     final_answer: Optional[str] = None
     search_results: List[Dict[str, Any]] = field(default_factory=list)
+    """本轮发出的检索查询历史（query 文本，可观测 / Debug）。"""
+    search_history: List[str] = field(default_factory=list)
     search_count: int = 0
     """本轮请求检索次数上限（与 search_budget_remaining 初始一致；None 表示不限制）。"""
     search_budget: Optional[int] = None
@@ -50,9 +52,53 @@ class ExecutionState:
     max_escalations: int = 2
     escalation_path: List[str] = field(default_factory=list)
     trace: List[Dict[str, Any]] = field(default_factory=list)
+    # DAG / 能力化 Runtime 扩展（默认执行轨为 dag；秩比较仍兼容历史 fast|refine|agent 字符串）
+    active_capabilities: Set[str] = field(default_factory=set)
+    critic_reports: List[Dict[str, Any]] = field(default_factory=list)
+    verification_reports: List[Dict[str, Any]] = field(default_factory=list)
+    contradictions: List[str] = field(default_factory=list)
+    evidence_graph_summary: str = ""
+    runtime_cost_estimate: float = 0.0
+    failed_attempts: List[str] = field(default_factory=list)
+    latency_budget_tier: str = "medium"
+    quality_budget_tier: str = "medium"
+    goals: List[str] = field(default_factory=list)
+    resolved_goals: List[str] = field(default_factory=list)
+    unresolved_goals: List[str] = field(default_factory=list)
+    evidence_nodes: List[Dict[str, Any]] = field(default_factory=list)
+    risk_score: float = 0.0
+    # evidence_graph_snapshot：EvidenceGraph.to_dict()；runtime_memory：失败路径/修复轨迹等
+    evidence_graph_snapshot: Dict[str, Any] = field(default_factory=dict)
+    runtime_memory: List[Dict[str, Any]] = field(default_factory=list)
+    goal_state: Dict[str, Any] = field(default_factory=dict)
+    risk_state: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def latency_budget(self) -> str:
+        return self.latency_budget_tier
+
+    @property
+    def quality_budget(self) -> str:
+        return self.quality_budget_tier
+
+    @property
+    def evidence_graph(self) -> Dict[str, Any]:
+        return self.evidence_graph_snapshot
+
+    @property
+    def runtime_cost(self) -> float:
+        try:
+            return float(self.runtime_cost_estimate or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def to_public_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["latency_budget"] = self.latency_budget_tier
+        d["quality_budget"] = self.quality_budget_tier
+        d["evidence_graph"] = dict(self.evidence_graph_snapshot or {})
+        d["runtime_cost"] = self.runtime_cost
+        return d
 
     def append_trace(self, kind: str, payload: Dict[str, Any]) -> None:
         self.trace.append({"kind": kind, **payload})
@@ -70,6 +116,9 @@ class AgentState:
     last_progress_score: float = 0.0
     progress_delta_low_rounds: int = 0
     iteration_count: int = 0
+    subgoals: List[str] = field(default_factory=list)
+    blocked_reasons: List[str] = field(default_factory=list)
+    tool_results: Dict[str, Any] = field(default_factory=dict)
 
 
 def get_execution_state(options: Dict[str, Any]) -> Optional[ExecutionState]:
@@ -108,13 +157,13 @@ def append_search_evidence_rows(options: Dict[str, Any], rows: List[Dict[str, An
 def runtime_track(options: Dict[str, Any]) -> str:
     st = get_execution_state(options)
     if st:
-        return str(st.current_track or "fast").strip().lower()
-    return str(options.get("_runtime_track") or "fast").strip().lower()
+        return str(st.current_track or "dag").strip().lower()
+    return str(options.get("_runtime_track") or "dag").strip().lower()
 
 
 def set_runtime_track(options: Dict[str, Any], track: str) -> None:
-    """与 escalate 一致：仅允许 fast→refine→agent 单调升级，禁止降级写入。"""
-    t = str(track or "fast").strip().lower()
+    """与 escalate 一致：仅允许单调升级，禁止降级写入。"""
+    t = str(track or "dag").strip().lower()
     st = get_execution_state(options)
     cur = runtime_track(options)
     if st and t != cur and not is_strict_track_upgrade(cur, t):

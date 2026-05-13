@@ -1,9 +1,9 @@
-"""从给定草稿进入文档对齐 Refine Runtime（Critic→Repair→Verify→Finalize）。"""
+"""工具门面：独立 Refine Runtime 流已移除，主路径统一 DAG（此处保留 API 占位）。"""
 from __future__ import annotations
 
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from refine_runtime_pipeline import iter_refine_runtime_stream
+from refine_shared import _pg
 
 
 async def stream_refine_from_draft(
@@ -23,22 +23,20 @@ async def stream_refine_from_draft(
     harness: DualTrackHarness 实例。
     extra_review_context: 注入批评上下文（如 Agent 自检），非用户可见正文。
     """
-    _tag = harness._make_tagger()
-    async for ev in iter_refine_runtime_stream(
-        harness,
-        question,
-        analysis,
-        options,
-        messages,
-        trace_id,
-        hcfg,
-        _tag,
-        entry_block="",
-        skip_draft=False,
-        prefilled_draft=draft_text,
-        critic_hint=extra_review_context or "",
-    ):
-        yield ev
+    del harness, question, draft_text, options, messages, trace_id, hcfg, analysis, meta_extra, extra_review_context
+    yield {
+        "event": "step",
+        "step": {
+            "name": "refine_pipeline_removed",
+            "status": "skipped",
+            "meta": _pg(
+                {"reason": "dag_runtime_only"},
+                "refine",
+                "独立 Refine 流已删除；请使用主路径 run_stream / DAG Runtime。",
+            ),
+        },
+    }
+    yield {"event": "error", "error": "refine_pipeline_removed"}
 
 
 def compile_agent_fallback_draft(conv: List[Dict[str, Any]], user_prompt: str, max_chars: int = 12000) -> str:

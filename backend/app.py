@@ -80,7 +80,7 @@ class ChatRequest(BaseModel):
     messages: List[Message] = Field(default_factory=list, description="Historical conversation messages")
     mode: str = Field(
         default="auto",
-        description="auto | fast | refine | agent（同步 /api/chat 与 SSE /api/chat/stream 共用同一 Runtime，含完整 Agent 循环）",
+        description="auto | dag | fast | refine | agent（后端统一走 DAG Runtime；后三者仅影响预判/意图信号）",
     )
     options: Dict[str, Any] = Field(default_factory=dict)
 
@@ -948,8 +948,8 @@ def create_app() -> FastAPI:
             "runtime_overlay_path": os.path.basename(CONFIG_RUNTIME_PATH),
             "runtime_overlay_active": os.path.isfile(CONFIG_RUNTIME_PATH),
             "routing_notes": {
-                "auto": "mode=auto 由 Capability Planner 与调度解析首执轨；质量闭环可在运行中单调升级 fast→refine→agent。",
-                "sync_api_agent": "非流式 POST /api/chat 与流式 SSE 共用同一 Runtime（execute_runtime→run_stream），不会在同步接口单独把 Agent 降为 Refine。",
+                "auto": "执行轨固定为 DAG Runtime；mode 主要影响预判与意图信号，Capability Planner 产出 capability_plan 供节点编排消费。",
+                "sync_api_agent": "非流式 POST /api/chat 与流式 SSE 共用同一 DAG Runtime（聚合 run_stream 事件）；不存在单独的同步降级 Agent/Refine 旁路。",
             },
         }
 

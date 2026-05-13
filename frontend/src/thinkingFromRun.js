@@ -23,7 +23,7 @@ const STEP_LABELS = {
   fast_answer_cache: "快轨缓存",
   agent_refine_fallback: "Agent 兜底 → Refine",
   agent_stuck_abort: "Agent · 重复终止",
-  agent_progress_abort: "Agent · 低进度终止",
+  agent_progress_abort: "遗留 · 低进度终止",
   agent_postprocess_bundle: "后处理（自检/审查/润色）",
   web_search_policy: "联网策略",
   fast_track: "快速轨",
@@ -39,6 +39,14 @@ const STEP_LABELS = {
   fast_escalation: "快轨 · 升级精化",
   fast_escalation_skip: "快轨 · 升级跳过",
   fast_escalation_complete: "快轨 · 升级完成",
+  dag_runtime_plan: "DAG · 规划",
+  web_search_policy: "联网策略",
+  dag_parallel_search: "DAG · 并行检索",
+  dag_draft: "DAG · 起草",
+  dag_parallel_critic: "DAG · 并行批评",
+  dag_repair: "DAG · 定点修复",
+  dag_verify: "DAG · 验证",
+  dag_finalize: "DAG · 终稿排版",
 };
 
 const PHASE_LABELS = {
@@ -60,6 +68,8 @@ function inferPhaseGroup(step) {
     track_select: "intake",
     web_search: "search",
     refine_entry_web_search: "search",
+    web_search_policy: "search",
+    dag_parallel_search: "search",
   fast_route: "fast",
   fast_quality_critic: "fast",
   fast_answer_eval: "fast",
@@ -90,6 +100,12 @@ function inferPhaseGroup(step) {
     refine_runtime_repair: "refine",
     refine_runtime_verify: "refine",
     refine_runtime_finalize: "refine",
+    dag_runtime_plan: "intake",
+    dag_draft: "refine",
+    dag_parallel_critic: "refine",
+    dag_repair: "polishing",
+    dag_verify: "refine",
+    dag_finalize: "polishing",
   };
   return table[n] || "other";
 }

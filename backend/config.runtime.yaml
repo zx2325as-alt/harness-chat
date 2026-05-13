@@ -8,12 +8,9 @@ harness:
   runtime_orchestrator:
     enabled: true
     max_escalations: 2
-    auto_initial_track_policy: fast_first
+    auto_initial_track_policy: dag_only
     rollout_stages:
-      fast_quality_gate: true
       unified_critic: true
-      refine_critic_runtime: true
-      agent_progress_evaluator: true
     fast_quality_gate:
       enabled: true
       min_draft_chars: 48

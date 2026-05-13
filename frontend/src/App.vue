@@ -201,6 +201,7 @@ export default {
         fast: "快速轨",
         refine: "精化轨",
         agent: "Agent 轨",
+        dag: "DAG Runtime",
       };
       const base = m[this.mode] || this.mode || "自动轨道";
       if (this.globalWebSearchDisabled) {
@@ -451,7 +452,7 @@ export default {
     /** 配置刷新/保存后：聊天区轨道、联网锁定与输入组件对齐服务端 harness */
     applyHarnessUiFromConfig() {
       const dm = this.config?.harness?.default_mode;
-      if (dm && ["auto", "fast", "refine", "agent"].includes(String(dm).toLowerCase())) {
+      if (dm && ["auto", "fast", "refine", "agent", "dag"].includes(String(dm).toLowerCase())) {
         this.mode = String(dm).toLowerCase();
       }
       this.$nextTick(() => {

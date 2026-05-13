@@ -18,7 +18,6 @@ from search_authority import apply_authority_ranking
 from routing_signals import (
     derive_user_signals,
     merge_signals_into_analysis,
-    norm_suggested_track,
     reasoning_keyword_boost,
 )
 from search_query_util import soft_degrade_note, validate_search_query
@@ -31,21 +30,11 @@ from semantic_utils import (
 
 from tools.layer import HarnessTools
 from search_evidence import search_result_to_evidence
-from tools.parsing import next_review_search_action, parse_agent_action, strip_text_after_first_tool_json
-from tools.refine_pipeline import compile_agent_fallback_draft, stream_refine_from_draft
+from tools.parsing import next_review_search_action
 
-from chunk_channels import attach_chunk_channel, chunk_writes_history
-from refine_runtime_pipeline import iter_refine_runtime_stream
-from unified_critic import evaluate_fast_answer, evaluate_unified_critic
-from escalation_engine import (
-    escalate,
-    merge_issues_into_execution_state,
-    recommended_action,
-    should_escalate_refine,
-)
+from chunk_channels import attach_chunk_channel
 from runtime_metrics import emit_product_metric, log_runtime_event
 from runtime_state import (
-    AgentState,
     append_search_evidence_rows,
     execution_evidence_context,
     need_search_allowed,
@@ -60,9 +49,7 @@ from refine_shared import Step, _pg, _int_budget, _clean_review_body
 from orchestrator_state import (
     apply_capability_planner,
     bootstrap_execution_state,
-    can_escalate,
 )
-from fast_quality_gate import fast_gate_enabled, should_skip_fast_cache_store
 from runtime_executor import collect_sync_response_from_stream
 
 
@@ -104,65 +91,12 @@ def _format_messages_snippet(messages: Optional[List[Dict[str, Any]]], n: int = 
 def _analyze_step_summary(analysis: Dict[str, Any]) -> str:
     tt = str(analysis.get("task_type") or "通用")
     cx = str(analysis.get("complexity") or "—")
-    dec = str(analysis.get("decision") or "").strip()
-    tail = f"；调度倾向：{dec}" if dec else ""
-    return f"归类「{tt}」、复杂度「{cx}」{tail}。"
-
-
-def _track_select_summary(chosen: str, intended: str, analysis: Dict[str, Any]) -> str:
-    names = {"fast": "快速答复", "refine": "草稿→审查→润色", "agent": "Agent 多轮推理"}
-    base = names.get(chosen, chosen or "—")
-    sm = str(analysis.get("selected_model") or "").strip()
-    extra = f" 主选模型：{sm}。" if sm else ""
-    ah = analysis.get("analyzer_track_hint")
-    if str(analysis.get("route_rule")) == "runtime_auto_start_fast" and ah:
-        return (
-            f"动态 Runtime：首执「{base}」，后置 critic 可升级；"
-            f"Analyzer 路由参考「{names.get(str(ah), ah)}」。{extra}"
-        ).strip()
-    if intended and str(intended) != str(chosen):
-        return f"原计划「{names.get(intended, intended)}」，实际执行「{base}」。{extra}".strip()
-    return f"执行路径：「{base}」。{extra}".strip()
-
-
-def _bootstrap_agent_state(goals: List[str], *, prompt_fallback: str) -> AgentState:
-    raw = [str(x).strip() for x in (goals or []) if str(x).strip()][:12]
-    if not raw:
-        raw = [(prompt_fallback or "").strip()[:500] or "goal"]
-    ag = AgentState(goals=raw)
-    ag.unresolved_goals = list(raw)
-    return ag
-
-
-def _mark_agent_delegated_refine_complete(options: Dict[str, Any]) -> None:
-    ags = options.get("_agent_state")
-    if not isinstance(ags, AgentState):
-        return
-    for g in ags.goals:
-        if g not in ags.solved_goals:
-            ags.solved_goals.append(g)
-    ags.unresolved_goals = []
-
-
-def _agent_record_search_evidence(
-    options: Dict[str, Any], *, query: str, iteration_idx: int, sr: Dict[str, Any]
-) -> None:
-    ags = options.get("_agent_state")
-    if not isinstance(ags, AgentState):
-        return
-    n_ok = len(sr.get("sources") or [])
-    ctx = bool(str(sr.get("context") or "").strip())
-    key = f"iter{iteration_idx}:{query[:120]}"
-    ags.evidence_map[key] = {"query": query[:400], "sources_count": n_ok, "has_context": ctx}
-
-
-def _agent_resolve_one_goal_from_progress(options: Dict[str, Any]) -> None:
-    ags = options.get("_agent_state")
-    if not isinstance(ags, AgentState) or not ags.unresolved_goals:
-        return
-    g0 = ags.unresolved_goals.pop(0)
-    if g0 not in ags.solved_goals:
-        ags.solved_goals.append(g0)
+    ri = analysis.get("runtime_intent")
+    if isinstance(ri, dict):
+        lb = str(ri.get("latency_budget") or "—")
+        qs = str(ri.get("search_score") or "—")
+        return f"归类「{tt}」、复杂度「{cx}」；RuntimeIntent（latency={lb}，search_score≈{qs}，DAG 执行）。"
+    return f"归类「{tt}」、复杂度「{cx}」（Runtime-centric，无互斥轨路由字段）。"
 
 
 def _build_layer1_prompt(
@@ -204,8 +138,7 @@ def _build_layer2_prompt(
         "<<<FINAL_ANSWER>>>\n"
         "<修正版答案正文>\n"
         "<<<END_FINAL_ANSWER>>>\n"
-        '\n如需核实实时数据，可在审查结论中输出合法 JSON（单独一段）：'
-        '{"action":"web_search","query":"查询词","reason":"说明","priority":"high"}\n'
+        "\n补充证据或实时数据由 Adaptive DAG Runtime 统一调度并行检索；请勿输出 JSON action 或 <<ACTION:…>> 协议。\n"
     )
     ht = _format_messages_snippet(messages, 4, max_chars=max_history_chars)
     if ht:
@@ -271,7 +204,8 @@ class DualTrackHarness:
     def _track_search_overrides(self, track: str, analysis: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         search_cfg = (self.cfg.get("harness") or {}).get("search") or {}
         by_track = search_cfg.get("by_track") or {}
-        base = by_track.get(track) or {}
+        # 统一 DAG Runtime：优先 harness.search.by_track.dag，其次 refine，最后兼容传入 track
+        base = by_track.get("dag") or by_track.get("refine") or by_track.get(track) or {}
         ov = {
             "override_max_results": base.get("max_results"),
             "override_search_depth": base.get("search_depth"),
@@ -280,9 +214,9 @@ class DualTrackHarness:
         si = str((analysis or {}).get("search_intent") or "none").lower()
         if si in ("freshness_required", "required"):
             try:
-                ov["override_max_results"] = max(int(ov.get("override_max_results") or 0), 12 if track == "fast" else 15)
+                ov["override_max_results"] = max(int(ov.get("override_max_results") or 0), 15)
             except Exception:
-                ov["override_max_results"] = 12 if track == "fast" else 15
+                ov["override_max_results"] = 15
             depth = str(ov.get("override_search_depth") or "basic").lower()
             if depth in ("basic", "fast", "ultra-fast"):
                 ov["override_search_depth"] = "advanced"
@@ -499,23 +433,6 @@ class DualTrackHarness:
         out = [m for m in out if self.registry.is_registered(m)]
         return out or [routing_default or "gpt-5.5"]
 
-    def _fast_cache_scope(self, options: Dict[str, Any]) -> str:
-        """缓存隔离键：stable hash（正文指纹 + 历史/文档摘要 + system_prompt / model / search_mode / track）。"""
-        h0 = self.cfg.get("harness") or {}
-        sys_ver = str(h0.get("system_prompt_version") or h0.get("prompt_version") or options.get("_fast_cache_prompt_version") or "1")
-        payload = {
-            "documents_digest": str(options.get("_documents_signature") or self._documents_signature(options.get("documents"))),
-            "history_digest": str(options.get("_history_signature") or ""),
-            "model_version": str(options.get("_fast_cache_model_version") or ""),
-            "prompt_identity": str(options.get("_fast_cache_identity") or options.get("search_prompt_base") or "").strip(),
-            "runtime_track": str(options.get("_runtime_track") or "fast").lower(),
-            "search_mode": str(options.get("search_mode") or options.get("search") or "auto").lower(),
-            "system_prompt_version": sys_ver,
-            "upgrade_track": bool(options.get("upgrade_track")),
-        }
-        blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
-
     def _should_force_relevance_filter_sync(self, analysis: Dict[str, Any], options: Dict[str, Any]) -> bool:
         if bool(options.get("relevance_filter_sync", False)):
             return True
@@ -538,24 +455,6 @@ class DualTrackHarness:
     def _session_search_cache_key(self, session_id: str, query: str) -> str:
         digest = hashlib.sha256(self._normalized_search_key(query).encode("utf-8")).hexdigest()
         return f"harness:searchkb:{session_id}:{digest}"
-
-    def _select_agent_history_messages(self, messages: Optional[List[Dict[str, Any]]], max_chars: int) -> List[Dict[str, Any]]:
-        if not messages:
-            return []
-        picked: List[Dict[str, Any]] = []
-        used = 0
-        budget = max(1200, max_chars)
-        for msg in reversed(messages):
-            role = msg.get("role")
-            if role not in ("user", "assistant"):
-                continue
-            text = _msg_content_to_text(msg.get("content"))
-            estimate = max(1, len(text))
-            if picked and used + estimate > budget:
-                break
-            picked.append({"role": role, "content": text})
-            used += estimate
-        return list(reversed(picked))
 
     def _build_search_queries(self, prompt: str, analysis: Dict[str, Any], options: Optional[Dict[str, Any]] = None) -> List[str]:
         raw_items = analysis.get("search_queries")
@@ -586,7 +485,7 @@ class DualTrackHarness:
 
         default_mode = hcfg.get("default_mode", "auto")
         mode = (mode or default_mode).lower()
-        if mode not in ("auto", "fast", "refine", "agent"):
+        if mode not in ("auto", "fast", "refine", "agent", "dag"):
             mode = "auto"
 
         cx_cfg = hcfg.get("complexity") or {}
@@ -636,25 +535,11 @@ class DualTrackHarness:
             analysis = self._coerce_analysis_when_web_blocked(analysis, options)
 
         apply_capability_planner(analysis)
-        intended_track = self.resolve_initial_track_from_planner(mode, analysis, options)
-        initial_track = self.apply_confidence_track_guard(mode, analysis, sig_base, intended_track)
-        if options.get("upgrade_track"):
-            bump = {"fast": "refine", "refine": "agent"}
-            nt = bump.get(initial_track)
-            if nt:
-                ag_en = bool((hcfg.get("agent") or {}).get("enabled", True))
-                if nt == "agent" and not ag_en:
-                    nt = "refine"
-                    analysis["fallback_reason"] = analysis.get("fallback_reason") or "upgrade_target_agent_disabled"
-                analysis["client_track_upgrade"] = f"{initial_track}->{nt}"
-                initial_track = nt
-
-        orch_rt = hcfg.get("runtime_orchestrator") if isinstance(hcfg.get("runtime_orchestrator"), dict) else {}
-        pol = str(orch_rt.get("auto_initial_track_policy") or "fast_first").strip().lower()
-        if mode == "auto" and pol not in ("follow_analyzer", "legacy", "analyzer"):
-            analysis["analyzer_track_hint"] = intended_track
-            initial_track = "fast"
-            analysis["route_rule"] = "runtime_auto_start_fast"
+        # 执行统一走 DAG：analyzer / planner 仅产出意图与能力信号，不再做 fast|refine|agent 互斥轨决策。
+        analysis["route_rule"] = "dag_runtime_only"
+        analysis["runtime_execution"] = "dag"
+        intended_track = "dag"
+        initial_track = "dag"
 
         entry_search_required, search_reason = self._runtime_need_entry_search(prompt, analysis, options)
         # 路由显式要求：即便检索信号未命中，也允许快轨入口注入一次联网摘要（禁止联网时不生效）
@@ -738,9 +623,6 @@ class DualTrackHarness:
         fallback_models = data.get("fallback_models", [])
         refine_models = data.get("refine_models", {})
         reason = data.get("reason", "")
-        decision = str(data.get("decision", "") or "").strip().lower()
-        if decision not in ("fast", "refine"):
-            decision = "refine" if complexity in ("high", "medium") else "fast"
         task_type = str(data.get("task_type") or "").strip().lower()
         if task_type not in ("conversation", "generation", "reasoning", "code"):
             task_type = ""
@@ -751,9 +633,6 @@ class DualTrackHarness:
         except (TypeError, ValueError):
             confidence = 0.85
         confidence = max(0.0, min(1.0, confidence))
-        suggested_track = str(data.get("suggested_track") or "").strip().lower()
-        if suggested_track not in ("fast", "refine", "agent", ""):
-            suggested_track = ""
         raw_search_queries = data.get("search_queries")
         search_queries: List[str] = []
         if isinstance(raw_search_queries, list):
@@ -762,7 +641,6 @@ class DualTrackHarness:
             search_queries = [str(data.get("search_query") or "").strip()]
         freshness_hint = str(data.get("freshness_hint") or "").strip()
         return {
-            "decision": decision,
             "reasons": [f"llm_reason: {reason}"],
             "complexity": complexity,
             "type": data.get("type", "general"),
@@ -775,9 +653,9 @@ class DualTrackHarness:
             "reason": reason,
             "raw_llm_response": raw_llm_response,
             "confidence": confidence,
-            "suggested_track": suggested_track or None,
             "search_queries": search_queries,
             "freshness_hint": freshness_hint,
+            "analyzer_schema": "runtime_centric_v1",
         }
 
     def _analyzer_heuristic_fallback_result(
@@ -808,24 +686,17 @@ class DualTrackHarness:
         short_chat = length < 96 and entities == 0 and question_density < 0.5 and not deep_kw and not has_code
         if short_chat:
             complexity = "low"
-            decision = "fast"
             task_type = "conversation"
-            suggested_track = "fast"
             conf = 0.68  # 提高置信度
         elif has_code or "def " in low or "class " in low or entities >= 3:
             complexity = "high"
-            decision = "refine"
             task_type = "code" if has_code else "reasoning"
-            suggested_track = "agent"
             conf = 0.62
         else:
             complexity = "medium"
-            decision = "refine"
             task_type = "reasoning" if question_count >= 1 or length > 180 else "generation"
-            suggested_track = "refine"
             conf = 0.58
         out = {
-            "decision": decision,
             "reasons": list(reasons),
             "complexity": complexity,
             "type": "code" if has_code else "general",
@@ -838,8 +709,8 @@ class DualTrackHarness:
             "reason": "；".join(reasons),
             "raw_llm_response": raw_response,
             "confidence": conf,
-            "suggested_track": suggested_track,
             "search_queries": [],
+            "analyzer_schema": "runtime_centric_v1",
         }
         if extra_meta:
             out.update(extra_meta)
@@ -870,10 +741,10 @@ class DualTrackHarness:
             return None
         snippet = (broken or "")[:6500]
         prompt = (
-            "下列文本本应是一段 JSON 路由判定，但可能损坏。"
+            "下列文本本应是一段 JSON 意图判定（Runtime-centric，无 fast/refine/agent 互斥轨），但可能损坏。"
             "请只输出一个合法 JSON 对象，键需包含："
-            "complexity, decision, task_type, type, search_required, search_query, confidence, "
-            "suggested_track, selected_model, fallback_models, refine_models, freshness_hint, reason。"
+            "complexity, task_type, type, search_required, search_query, confidence, "
+            "selected_model, fallback_models, refine_models, freshness_hint, reason, search_queries（可选数组）。"
             "不要 markdown 围栏，不要解释。\n\n"
             f"<<<BROKEN>>>\n{snippet}\n<<<END>>>"
         )
@@ -901,27 +772,25 @@ class DualTrackHarness:
         manual_hits = self._keyword_hit(prompt, manual)
         if manual_hits:
             return {
-                "decision": "refine",
                 "reasons": ["manual:" + ",".join(manual_hits[:3])],
                 "manual_hits": manual_hits,
                 "complexity": "high",
                 "type": "general",
                 "task_type": "generation",
                 "confidence": 1.0,
-                "suggested_track": "refine",
+                "analyzer_schema": "runtime_centric_v1",
             }
 
         use_llm = bool(hcfg.get("use_llm_analyzer", False))
         if not use_llm:
             length = len(prompt or "")
             return {
-                "decision": "refine" if length > 200 else "fast",
                 "reasons": [f"length={length}"],
                 "complexity": "high" if length > 200 else "low",
                 "type": "general",
                 "task_type": "generation" if length > 200 else "conversation",
                 "confidence": 0.55,
-                "suggested_track": "refine" if length > 200 else "fast",
+                "analyzer_schema": "runtime_centric_v1",
             }
 
         analyzer_model = hcfg.get("analyzer_model", "gpt-5.5")
@@ -1007,7 +876,6 @@ class DualTrackHarness:
         choose_refine = length > 200 or question_count >= 2 or deep_kw or has_code
         task_type = "reasoning" if has_code else ("generation" if choose_refine else "conversation")
         return {
-            "decision": "refine" if choose_refine else "fast",
             "reasons": ["analyzer_total_timeout"],
             "complexity": "high" if choose_refine else "low",
             "type": "code" if has_code else "general",
@@ -1015,7 +883,7 @@ class DualTrackHarness:
             "reason": "复杂度预判超时，已按多特征启发规则降级并继续处理",
             "analyzer_timed_out": True,
             "confidence": 0.55 if choose_refine else 0.45,
-            "suggested_track": "agent" if has_code else ("refine" if choose_refine else "fast"),
+            "analyzer_schema": "runtime_centric_v1",
         }
 
     def route_fast_model(self, prompt: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
@@ -1059,9 +927,6 @@ class DualTrackHarness:
             "selected": unique_candidates[0],
         }
 
-    def _routing_tuning(self) -> Dict[str, Any]:
-        return (self.cfg.get("harness") or {}).get("routing_tuning") or {}
-
     def _max_review_web_rounds(self) -> int:
         h = self.cfg.get("harness") or {}
         rt = h.get("refine_chain_tuning") or {}
@@ -1069,29 +934,6 @@ class DualTrackHarness:
             return max(1, min(8, int(rt.get("max_review_web_rounds", 3))))
         except (TypeError, ValueError):
             return 3
-
-    def apply_confidence_track_guard(self, mode: str, analysis: Dict[str, Any], prompt: str, chosen: str) -> str:
-        if (mode or "auto").lower() != "auto":
-            return chosen
-        if str(analysis.get("response_style") or "").lower() == "short":
-            return chosen
-        try:
-            cf = float(analysis.get("confidence", 1.0) or 1.0)
-        except (TypeError, ValueError):
-            cf = 1.0
-        rt = self._routing_tuning()
-        try:
-            thr = float(rt.get("confidence_track_guard_threshold", 0.6))
-        except (TypeError, ValueError):
-            thr = 0.6
-        try:
-            min_chars = int(rt.get("confidence_track_guard_min_prompt_chars", 200))
-        except (TypeError, ValueError):
-            min_chars = 200
-        if cf < thr and len((prompt or "").strip()) > min_chars and chosen == "fast":
-            analysis["track_upgrade_reason"] = "low_analyzer_confidence"
-            return "refine"
-        return chosen
 
     def _registered_model_list(self, keys: Any) -> List[str]:
         out: List[str] = []
@@ -1143,7 +985,6 @@ class DualTrackHarness:
         if hit and str(out.get("complexity") or "low").lower() == "low":
             out["complexity"] = "high"
             out["task_type"] = "reasoning"
-            out["decision"] = "refine"
             out["reasoning_rule_boost"] = reason
         return out
 
@@ -1171,86 +1012,6 @@ class DualTrackHarness:
         }
         blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return self._analysis_cache_prefix + hashlib.sha256(blob.encode("utf-8")).hexdigest()
-
-    def _fast_cache_scope_zset_key(self, pref: str, scope: str) -> str:
-        h = hashlib.sha256((scope or "").encode("utf-8")).hexdigest()
-        return f"{pref}zscope:{h}"
-
-    def _fast_cache_key_source(self, options: Dict[str, Any], augmented_prompt: str) -> str:
-        """缓存键分为正文相似度键 + 作用域键，作用域需隔离文档/历史/搜索模式/轨道。"""
-        opts = options or {}
-        return str(opts.get("_fast_cache_identity") or opts.get("search_prompt_base") or augmented_prompt or "").strip()
-
-    async def _try_fast_cache_hit(self, options: Dict[str, Any], augmented_prompt: str) -> Optional[str]:
-        fcfg = (self.cfg.get("harness") or {}).get("fast_answer_cache") or {}
-        if not fcfg.get("enabled") or not self._redis:
-            return None
-        key_src = self._fast_cache_key_source(options, augmented_prompt)
-        norm = self._norm_cache_prompt(key_src)
-        scope = self._fast_cache_scope(options)
-        pref = str(fcfg.get("key_prefix") or "harness:fast:v1:")
-        thresh = float(fcfg.get("similarity_threshold", 0.92))
-        max_scan = int(fcfg.get("max_scan_keys", 400))
-        cheap_min = float(fcfg.get("cheap_ngram_overlap_min", 0.06))
-        key = pref + hashlib.sha256(f"{scope}\n{norm}".encode("utf-8")).hexdigest()
-        z_scoped = self._fast_cache_scope_zset_key(pref, scope)
-
-        def _sync() -> Optional[str]:
-            v = self._redis.get(key)
-            if v:
-                return str(v)
-            raw = self._redis.zrevrange(z_scoped, 0, max(0, max_scan - 1))
-            best_a: Optional[str] = None
-            best_r = 0.0
-            for row in raw or []:
-                try:
-                    o = json.loads(row)
-                    n2 = str(o.get("n") or "")
-                    s2 = str(o.get("s") or "")
-                    if s2 != scope:
-                        continue
-                    if cheap_min > 0 and ngram_overlap_ratio(norm, n2) < cheap_min:
-                        continue
-                    # 仅用于 fast cache 相似检索：本地稀疏相似足够，避免依赖任何线上 embedding
-                    r = semantic_similarity(norm, n2)
-                    if r > best_r:
-                        best_r = r
-                        best_a = str(o.get("a") or "")
-                except Exception:
-                    continue
-            if best_r >= thresh and best_a:
-                return best_a
-            return None
-
-        try:
-            return await asyncio.to_thread(_sync)
-        except Exception:
-            return None
-
-    async def _store_fast_cache_answer(self, options: Dict[str, Any], augmented_prompt: str, answer: str) -> None:
-        fcfg = (self.cfg.get("harness") or {}).get("fast_answer_cache") or {}
-        if not fcfg.get("enabled") or not self._redis or not (answer or "").strip():
-            return
-        key_src = self._fast_cache_key_source(options, augmented_prompt)
-        norm = self._norm_cache_prompt(key_src)
-        scope = self._fast_cache_scope(options)
-        pref = str(fcfg.get("key_prefix") or "harness:fast:v1:")
-        ttl = int(fcfg.get("ttl_sec", 86400))
-        key = pref + hashlib.sha256(f"{scope}\n{norm}".encode("utf-8")).hexdigest()
-        row = json.dumps({"s": scope, "n": norm, "a": answer}, ensure_ascii=False)
-        z_scoped = self._fast_cache_scope_zset_key(pref, scope)
-
-        def _sync() -> None:
-            self._redis.set(key, answer, ex=ttl)
-            self._redis.zadd(z_scoped, {row: time.time()})
-            size = self._redis.zcard(z_scoped)
-            if size and int(size) > 200:
-                self._redis.zremrangebyrank(z_scoped, 0, int(size) - 201)
-
-        try:
-            await asyncio.to_thread(_sync)
-        except Exception:
-            pass
 
     def _layer_opts(self, hcfg: Dict[str, Any], layer_key: str, base: Dict[str, Any]) -> Dict[str, Any]:
         chain = hcfg.get("refine_chain") or {}
@@ -1920,218 +1681,6 @@ class DualTrackHarness:
                 break
         yield {"kind": "complete", "review_body": rb, "search_loops": search_loops}
 
-    async def _fast_entry_search_step(
-        self,
-        prompt: str,
-        analysis: Dict[str, Any],
-        options: Dict[str, Any],
-        search_reason: str,
-        *,
-        search_mandatory: bool,
-    ) -> Tuple[str, Step, Optional[str]]:
-        """
-        Fast 轨入口联网：校验 query、区分强制/可选失败策略。
-        返回 (更新后的 prompt, step, 若需中止整条流则非空 error 文案)。
-        """
-        if options.get("_web_search_blocked"):
-            st = Step(
-                name="web_search",
-                status="skipped",
-                meta=_pg(
-                    {"reason": options.get("_web_search_block_reason")},
-                    "search",
-                    str(options.get("_web_search_block_reason") or "快轨入口联网已跳过"),
-                ),
-            )
-            return prompt, st, None
-        queries = self._build_search_queries(prompt, analysis, options)
-        raw_q = queries[0] if queries else self.build_search_query(prompt, analysis, options)
-        vq, fc, vreason = validate_search_query(raw_q)
-        if fc:
-            meta = _pg(
-                {
-                    "query": raw_q,
-                    "query_effective": None,
-                    "reason": search_reason,
-                    "failure_code": fc,
-                    "skipped": True,
-                    "validate_only": True,
-                },
-                "search",
-                f"检索词未通过校验（{vreason or fc}），已按策略处理。",
-            )
-            if search_mandatory:
-                err = vreason or fc
-                return (
-                    prompt,
-                    Step(
-                        name="web_search",
-                        status="error",
-                        meta=meta,
-                        error=err,
-                    ),
-                    err,
-                )
-            note = soft_degrade_note(fc, vreason)
-            return (
-                prompt + "\n\n" + note,
-                Step(
-                    name="web_search",
-                    status="ok",
-                    meta=_pg(
-                        {**meta, "degraded": True, "note": "校验未通过，已跳过检索调用"},
-                        "search",
-                        "快轨入口：检索词未过审，已跳过联网并继续生成。",
-                    ),
-                ),
-                None,
-            )
-
-        merged_sources: List[Dict[str, Any]] = []
-        merged_contexts: List[str] = []
-        merged_attempts: List[Dict[str, Any]] = []
-        hard_err = None
-        fallback_from = None
-        total_latency_ms = 0
-        overrides = self._track_search_overrides("fast", analysis)
-        sub_opts = {**options, **{k: v for k, v in overrides.items() if v is not None}}
-        results = await asyncio.gather(*[self.perform_web_search(q, sub_opts) for q in queries[:4]])
-        seen_urls = set()
-        for sr in results:
-            total_latency_ms += int(sr.get("latency_ms") or 0)
-            merged_attempts.extend(list(sr.get("attempts") or []))
-            fallback_from = fallback_from or sr.get("fallback_from")
-            if sr.get("error") and not hard_err:
-                hard_err = sr.get("error")
-            for src in sr.get("sources") or []:
-                url = str(src.get("url") or "")
-                key = url or json.dumps(src, ensure_ascii=False, sort_keys=True)
-                if key in seen_urls:
-                    continue
-                seen_urls.add(key)
-                merged_sources.append(src)
-            ctx = str(sr.get("context") or "").strip()
-            if ctx:
-                merged_contexts.append(ctx)
-        sources = merged_sources
-        packed = {"sources": list(sources), "context": "\n\n".join(merged_contexts)}
-        packed = apply_authority_ranking(packed, (self.cfg.get("harness") or {}).get("search") or {})
-        sources = packed.get("sources") or sources
-        search_context = packed.get("context") or "\n\n".join(merged_contexts)
-        sr = {
-            "context": search_context,
-            "sources": sources,
-            "error": hard_err,
-            "failure_code": results[0].get("failure_code") if results else None,
-            "degraded": any(bool(item.get("degraded")) for item in results),
-            "provider_used": next((item.get("provider_used") for item in results if item.get("provider_used")), "none"),
-            "latency_ms": total_latency_ms,
-            "attempts": merged_attempts,
-            "fallback_from": fallback_from,
-        }
-        nsrc = len(sources)
-        meta = {
-            "query": raw_q,
-            "query_effective": vq,
-            "queries": queries,
-            "reason": search_reason,
-            "sources": sources,
-            "result_count": nsrc,
-            "failure_code": sr.get("failure_code"),
-            "degraded": bool(sr.get("degraded")),
-            "attempts": sr.get("attempts") or [],
-            "fallback_from": sr.get("fallback_from"),
-            "results_preview": search_context[:500] + ("..." if len(search_context) > 500 else ""),
-        }
-        ok_summary = f"快轨入口：已检索「{(vq or raw_q)[:72]}{'…' if len(str(vq or raw_q)) > 72 else ''}」，摘要已并入上下文（约 {nsrc} 条来源）。"
-        if search_mandatory and not hard_err and not sources:
-            fc_empty = str(sr.get("failure_code") or "SEARCH_EMPTY_SOURCES")
-            user_err = f"强制联网未获得有效来源（{fc_empty}）。"
-            return (
-                prompt,
-                Step(
-                    name="web_search",
-                    status="error",
-                    provider=sr.get("provider_used"),
-                    latency_ms=sr.get("latency_ms"),
-                    meta=_pg(
-                        {**meta, "failure_code": fc_empty},
-                        "search",
-                        user_err,
-                    ),
-                    error=user_err,
-                ),
-                user_err,
-            )
-        if hard_err and search_mandatory:
-            return (
-                prompt,
-                Step(
-                    name="web_search",
-                    status="error",
-                    provider=sr.get("provider_used"),
-                    latency_ms=sr.get("latency_ms"),
-                    meta=_pg(meta, "search", f"联网失败（强制检索）：{hard_err}"),
-                    error=hard_err,
-                ),
-                f"当前无法完成实时联网检索：{hard_err}",
-            )
-        if hard_err:
-            note = soft_degrade_note(sr.get("failure_code"), hard_err)
-            return (
-                prompt + "\n\n" + note,
-                Step(
-                    name="web_search",
-                    status="ok",
-                    provider=sr.get("provider_used"),
-                    latency_ms=sr.get("latency_ms"),
-                    meta=_pg(
-                        {**meta, "degraded": True},
-                        "search",
-                        f"联网未完全成功，已降级继续：{hard_err}",
-                    ),
-                ),
-                None,
-            )
-        st = Step(
-            name="web_search",
-            status="ok",
-            provider=sr.get("provider_used"),
-            latency_ms=sr.get("latency_ms"),
-            meta=_pg(meta, "search", ok_summary),
-        )
-        if search_context:
-            prompt = self._merge_search_into_prompt(prompt, search_context, options)
-        return prompt, st, None
-
-    async def _refine_entry_light_search(
-        self,
-        prompt: str,
-        analysis: Dict[str, Any],
-        options: Dict[str, Any],
-    ) -> str:
-        """Refine 轨：显式联网意图下 Layer1 前轻量检索，失败仅注入说明、不中止。"""
-        if options.get("_web_search_blocked"):
-            return f"\n【入口联网】已跳过：{options.get('_web_search_block_reason') or '当前请求禁止联网'}。\n"
-        queries = self._build_search_queries(prompt, analysis, options)
-        raw_q = queries[0] if queries else self.build_search_query(prompt, analysis, options)
-        vq, fc, vreason = validate_search_query(raw_q)
-        if fc:
-            return f"\n【入口联网】检索词未通过校验（{vreason or fc}），请依赖常识与后续审查层按需检索。\n"
-        overrides = self._track_search_overrides("refine", analysis)
-        sub_opts = {**options, **{k: v for k, v in overrides.items() if v is not None}}
-        results = await asyncio.gather(*[self.perform_web_search(q, sub_opts) for q in queries[:4]])
-        err = next((item.get("error") for item in results if item.get("error")), None)
-        if err and not any(item.get("sources") for item in results):
-            return (
-                f"\n【入口联网】检索未成功：{err}。"
-                '后续审查层可输出 JSON：{"action":"web_search","query":"...","reason":"..."} 复核。\n'
-            )
-        ctx = "\n\n".join(str(item.get("context") or "").strip() for item in results if str(item.get("context") or "").strip())
-        if not ctx:
-            return "\n【入口联网】未获得有效摘要，请后续审查层按需检索。\n"
-        return f"\n【入口联网摘要（供初稿参考）】\n{ctx[:6000]}\n"
-
     def _infer_task_type_from_json(self, data: Dict[str, Any]) -> str:
         """当模型未返回 task_type 时，由 complexity/type 推断。"""
         raw_type = str(data.get("type") or "").lower()
@@ -2145,123 +1694,6 @@ class DualTrackHarness:
         if cx == "low":
             return "conversation"
         return "generation"
-
-    def resolve_initial_track_from_planner(
-        self, mode: str, analysis: Dict[str, Any], options: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """首执轨道：综合手动 mode、Capability Planner（capability_plan）与 Analyzer 残留信号。
-        auto + fast_first 下本函数结果写入 analyzer_track_hint，实际首执轨仍可由调度改为 fast。
-        response_style 不参与分流；运行中真相源为 ExecutionState.current_track + critic 单调升级。"""
-        _opts = options or {}
-        mode = (mode or "auto").lower()
-        hcfg = self.cfg.get("harness") or {}
-        ag_enabled = bool((hcfg.get("agent") or {}).get("enabled", True))
-        if mode == "fast":
-            analysis["route_rule"] = "mode_fast"
-            return "fast"
-        if mode == "refine":
-            analysis["route_rule"] = "mode_refine"
-            return "refine"
-        if mode == "agent":
-            if ag_enabled:
-                analysis["route_rule"] = "mode_agent"
-                return "agent"
-            analysis["agent_disabled_fallback"] = True
-            analysis["fallback_reason"] = "agent_disabled_by_config"
-            analysis["route_rule"] = "mode_agent_disabled_fallback_refine"
-            return "refine"
-
-        plan = analysis.get("capability_plan")
-        if not isinstance(plan, dict):
-            plan = apply_capability_planner(analysis)
-        spol = str(plan.get("search_policy") or "optional").lower()
-        cap = str(plan.get("capability_level") or analysis.get("complexity") or "low").lower()
-
-        if mode == "auto" and analysis.get("high_risk_domain"):
-            analysis["search_required"] = True
-            si_h = str(analysis.get("search_intent") or "none").lower()
-            if si_h in ("none", "optional"):
-                analysis["search_intent"] = "required"
-            if ag_enabled:
-                analysis["route_rule"] = "auto_high_risk_agent"
-                return "agent"
-            analysis["fallback_reason"] = analysis.get("fallback_reason") or "high_risk_agent_disabled"
-            analysis["route_rule"] = "auto_high_risk_refine"
-            return "refine"
-
-        tt = str(analysis.get("task_type") or "").strip().lower()
-        if not tt:
-            tt = self._infer_task_type_from_json(analysis)
-        analysis["task_type"] = tt
-        cx = cap
-        rs = str(analysis.get("response_style") or "normal").lower()
-
-        if rs not in ("short", "normal", "deep"):
-            rs = "normal"
-            analysis["response_style"] = rs
-        else:
-            analysis["response_style"] = rs
-
-        if spol == "required":
-            if ag_enabled and tt in ("reasoning", "code"):
-                analysis["route_rule"] = "search_policy_required_agent"
-                return "agent"
-            analysis["route_rule"] = "search_policy_required_refine"
-            return "refine"
-
-        if spol == "explicit" and tt == "conversation" and cx == "low":
-            dec = str(analysis.get("decision") or "fast").lower()
-            if dec == "fast":
-                # 显式联网但低复杂度：优先保留快轨速度，同时在快轨入口注入联网摘要提升正确性
-                analysis["force_entry_search"] = True
-                analysis["route_rule"] = "explicit_search_lowcx_fast_with_entry_search"
-                return "fast"
-
-        if ag_enabled and tt in ("reasoning", "code"):
-            analysis["route_rule"] = "task_type_reasoning_or_code_agent"
-            return "agent"
-        if tt in ("reasoning", "code") and not ag_enabled:
-            analysis["fallback_reason"] = "agent_disabled_by_config"
-            analysis["agent_disabled_fallback"] = True
-            analysis["route_rule"] = "task_type_reasoning_or_code_agent_disabled_fallback_refine"
-            return "refine"
-
-        if cx == "low" and tt == "conversation":
-            analysis["route_rule"] = "lowcx_conversation_fast"
-            return "fast"
-        if tt == "generation":
-            analysis["route_rule"] = "task_type_generation_refine"
-            return "refine"
-        try:
-            cf = float(analysis.get("confidence") or 1.0)
-        except (TypeError, ValueError):
-            cf = 1.0
-        rt_follow = self._routing_tuning()
-        try:
-            cf_follow = float(rt_follow.get("low_confidence_suggested_track_threshold", 0.55))
-        except (TypeError, ValueError):
-            cf_follow = 0.55
-        if mode == "auto" and cf < cf_follow:
-            st = norm_suggested_track(str(analysis.get("suggested_track") or ""))
-            if st == "agent" and ag_enabled:
-                analysis["track_select_low_confidence"] = True
-                analysis["route_rule"] = "low_confidence_follow_agent"
-                return "agent"
-            if st == "refine":
-                analysis["track_select_low_confidence"] = True
-                analysis["route_rule"] = "low_confidence_follow_refine"
-                return "refine"
-            if st == "fast":
-                analysis["track_select_low_confidence"] = True
-                analysis["route_rule"] = "low_confidence_follow_fast"
-                return "fast"
-        dec = str(analysis.get("decision") or "fast").lower()
-        analysis["route_rule"] = f"decision_{dec}"
-        return "refine" if dec == "refine" else "fast"
-
-    def _resolve_track(self, mode: str, analysis: Dict[str, Any], options: Optional[Dict[str, Any]] = None) -> str:
-        """兼容旧名：等同于 resolve_initial_track_from_planner。"""
-        return self.resolve_initial_track_from_planner(mode, analysis, options)
 
     def _should_skip_refine_draft(self, prompt: str, analysis: Dict[str, Any], options: Dict[str, Any]) -> bool:
         if bool(options.get("skip_draft")):
@@ -2298,126 +1730,6 @@ class DualTrackHarness:
             yield attach_chunk_channel({"event": "chunk", "data": {"content": text[start:end]}}, channel, options)
             await asyncio.sleep(0)
 
-    def _agent_plain_text_should_refine(self, analysis: Dict[str, Any]) -> Tuple[bool, str]:
-        """
-        Agent 轨：本轮无 ACTION 的纯文本是否必须改为草稿走 Review→Polish。
-        条件：高复杂度 + 高风险/强时效 / 分析器倾向精化 / 强时效或高风险信号。
-        """
-        cx = str(analysis.get("complexity") or "low").lower()
-        dec = str(analysis.get("decision") or "fast").lower()
-        si = str(analysis.get("search_intent") or "none").lower()
-
-        # 仅当高复杂度 +（强时效/高风险/实体混淆/数值敏感/来源敏感）时才强制 refine，避免过度触发
-        if cx == "high":
-            if si in ("required", "freshness_required"):
-                return True, "complexity_high_with_search_intent"
-            if bool(analysis.get("high_risk_domain")):
-                return True, "complexity_high_with_high_risk"
-            if bool(analysis.get("entity_confusion_risk")):
-                return True, "complexity_high_with_entity_confusion"
-            if bool(analysis.get("numeric_sensitive")):
-                return True, "complexity_high_with_numeric_sensitive"
-            if bool(analysis.get("source_sensitive")):
-                return True, "complexity_high_with_source_sensitive"
-
-        if dec == "refine":
-            return True, "decision_refine"
-        if bool(analysis.get("search_required")):
-            return True, "search_required"
-        if si in ("required", "freshness_required"):
-            return True, f"search_intent_{si}"
-        if analysis.get("manual_hits"):
-            return True, "manual_keyword_trigger"
-        raw_type = str(analysis.get("type") or "").lower()
-        if raw_type == "web_search":
-            return True, "type_web_search"
-        return False, ""
-
-    def _pick_agent_self_check_model(self, hcfg: Dict[str, Any], analysis: Dict[str, Any], agent_model: str) -> str:
-        """非空 agent_self_check_model 为强制覆盖；否则按推理向 selected → reasoning.review[0] → 主模型 → 路由默认。"""
-        scfg = hcfg.get("complexity") or {}
-        override = str(scfg.get("agent_self_check_model") or "").strip()
-        if override:
-            return override
-        raw_rk = scfg.get("self_check_reasoning_models")
-        if isinstance(raw_rk, list) and raw_rk:
-            rk = {str(x).strip() for x in raw_rk if str(x).strip()}
-        else:
-            rk = {
-                "claude-sonnet-4-6-thinking",
-                "grok-4-20-reasoning",
-                "deepseek-v4-pro",
-            }
-        sm = str(analysis.get("selected_model") or "").strip()
-        if sm and sm in rk:
-            return sm
-        tpl = hcfg.get("task_model_templates") or {}
-        rev = ((tpl.get("reasoning") or {}).get("refine_models") or {}).get("review") or []
-        if isinstance(rev, list) and rev:
-            first = str(rev[0]).strip()
-            if first:
-                return first
-        am = str(agent_model or "").strip()
-        if am:
-            return am
-        routing = hcfg.get("routing") or {}
-        default_model = str(routing.get("default_model") or "gpt-5.5").strip()
-        dm = routing.get("default_models") or [default_model]
-        if isinstance(dm, list) and dm:
-            z = str(dm[0]).strip()
-            if z:
-                return z
-        return default_model or "gpt-5.5"
-
-    async def _agent_self_check_block(
-        self,
-        orig_q: str,
-        draft: str,
-        hcfg: Dict[str, Any],
-        analysis: Dict[str, Any],
-        options: Dict[str, Any],
-        agent_model: str,
-    ) -> str:
-        if str(analysis.get("complexity") or "low").lower() != "high":
-            return ""
-        model = self._pick_agent_self_check_model(hcfg, analysis, agent_model)
-        check_prompt = (
-            "你是审稿助手。请用条目列出相对用户问题的关键缺口、不确定处与建议查证点（不超过 900 字），"
-            "不要重复草稿全文。\n【用户问题】\n"
-            f"{(orig_q or '')[:4000]}\n【草稿】\n{(draft or '')[:8000]}"
-        )
-        opts = {**options, "temperature": 0.15, "max_retries": 0}
-        res, _ = await self._ask_with_fallback([model], check_prompt, opts, messages=None)
-        return (res.content or "").strip() if res and res.success else ""
-
-    async def _refine_from_draft_stream(
-        self,
-        question: str,
-        draft_text: str,
-        options: Dict[str, Any],
-        messages: Optional[List[Dict[str, Any]]],
-        trace_id: str,
-        hcfg: Dict[str, Any],
-        analysis: Dict[str, Any],
-        *,
-        meta_extra: Optional[Dict[str, Any]] = None,
-        extra_review_context: str = "",
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Agent 的 refine_answer：委托工具层 stream_refine_from_draft。"""
-        async for ev in stream_refine_from_draft(
-            self,
-            question,
-            draft_text,
-            options,
-            messages,
-            trace_id,
-            hcfg,
-            analysis,
-            meta_extra=meta_extra,
-            extra_review_context=extra_review_context,
-        ):
-            yield ev
-
     def _runtime_max_escalations(self, hcfg: Dict[str, Any]) -> int:
         orch = hcfg.get("runtime_orchestrator") if isinstance(hcfg.get("runtime_orchestrator"), dict) else {}
         try:
@@ -2449,8 +1761,9 @@ class DualTrackHarness:
         hcfg = runtime["hcfg"]
         mode = runtime["mode"]
         analysis = runtime["analysis"]
-        intended_track = runtime["intended_track"]
-        initial_track = runtime["initial_track"]
+        # 执行轨统一为 DAG：analyzer / planner 仅产出意图信号，不再决定互斥 fast|refine|agent。
+        intended_track = "dag"
+        initial_track = "dag"
         entry_search_required = runtime["entry_search_required"]
         search_reason = runtime["search_reason"]
         search_mandatory = runtime["search_mandatory"]
@@ -2486,6 +1799,7 @@ class DualTrackHarness:
             "entry_search_required": entry_search_required,
             "search_reason": search_reason,
             "search_mandatory": search_mandatory,
+            "runtime_contract": "dag_intent_primary",
         }
 
     def _ingest_web_search_into_execution_state(self, options: Dict[str, Any], sr: Dict[str, Any]) -> None:
@@ -2500,396 +1814,6 @@ class DualTrackHarness:
         note_search_consumed(options)
         self._ingest_web_search_into_execution_state(options, sr)
 
-    async def _maybe_escalate_fast_draft_stream(
-        self,
-        draft_text: str,
-        prompt: str,
-        analysis: Dict[str, Any],
-        options: Dict[str, Any],
-        messages: Optional[List[Dict[str, Any]]],
-        trace_id: str,
-        hcfg: Dict[str, Any],
-        _tag,
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Fast 草案结束后：统一 critic → accept / Refine / Agent 恢复 / 保留草案。"""
-        options["_fast_did_escalate_refine"] = False
-        options["_fast_did_escalate_agent"] = False
-        if not fast_gate_enabled(hcfg):
-            return
-        fa = await evaluate_fast_answer(
-            self,
-            prompt,
-            draft_text,
-            analysis,
-            options,
-            hcfg,
-            search_context=execution_evidence_context(options),
-        )
-        qc = fa.get("_unified") or {}
-        merge_issues_into_execution_state(options, qc)
-        ra = str(fa.get("recommended_action") or recommended_action(qc))
-        log_runtime_event(
-            hcfg,
-            {
-                "event": "fast_answer_eval",
-                "trace_id": trace_id,
-                "recommended_action": ra,
-                "needs_escalation": bool(fa.get("needs_escalation")),
-            },
-        )
-        yield {
-            "event": "step",
-            "step": Step(
-                name="fast_answer_eval",
-                status="ok",
-                meta=_pg(
-                    {
-                        **_tag("quality"),
-                        "score": fa.get("score"),
-                        "factual_risk": fa.get("factual_risk"),
-                        "needs_escalation": fa.get("needs_escalation"),
-                        "quality_score": qc.get("quality_score"),
-                        "completeness": qc.get("completeness"),
-                        "factuality": qc.get("factuality"),
-                        "clarity": qc.get("clarity"),
-                        "hallucination_risk": qc.get("hallucination_risk"),
-                        "recommended_action": ra,
-                        "issues": qc.get("issues") or [],
-                        "missing_constraints": qc.get("missing_constraints") or [],
-                        "parse_ok": fa.get("parse_ok"),
-                        "critic_model": fa.get("critic_model"),
-                    },
-                    "fast",
-                    f"快轨质量评估：recommended_action={ra} score={fa.get('score')} needs_escalation={fa.get('needs_escalation')}",
-                ),
-            ).to_dict(),
-        }
-        if not fa.get("needs_escalation"):
-            return
-        if ra == "reject":
-            emit_product_metric(hcfg, "critic_reject_rate", trace_id=trace_id, phase="fast")
-            yield {
-                "event": "step",
-                "step": Step(
-                    name="fast_critic_reject",
-                    status="skipped",
-                    meta=_pg({"reason": "reject_keeps_draft"}, "fast", "评估为 reject：保留快轨输出，不自动升级。"),
-                ).to_dict(),
-            }
-            return
-        if not can_escalate(options):
-            yield {
-                "event": "step",
-                "step": Step(
-                    name="fast_escalation_skip",
-                    status="skipped",
-                    meta=_pg({"reason": "max_escalations"}, "fast", "已达升级次数上限，保留快轨草案。"),
-                ).to_dict(),
-            }
-            return
-
-        h_agent = hcfg.get("agent") or {}
-        ag_enabled = bool(h_agent.get("enabled", True))
-        from_track = runtime_track(options)
-
-        if ra == "search_more" and not options.get("_web_search_blocked"):
-            yield {
-                "event": "status",
-                "phase": "search",
-                "message": "正在搜索最新信息以改进答案…",
-                "user_cognitive": True,
-            }
-            sq = self.build_search_query(prompt, analysis, options)
-            if sq and need_search_allowed(options):
-                sr = await self.perform_web_search(sq, options)
-                self._capture_search_evidence_for_runtime(options, sr)
-            emit_product_metric(hcfg, "fast_search_more", trace_id=trace_id)
-
-        if ra == "agent_recover" and ag_enabled:
-            if not escalate(options, hcfg, from_track, "agent", trace_id=trace_id, reason="agent_recover"):
-                yield {
-                    "event": "step",
-                    "step": Step(
-                        name="fast_escalation_denied",
-                        status="skipped",
-                        meta=_pg({"reason": "not_strict_upgrade"}, "fast", "轨道升级被拒绝（仅允许 fast→refine→agent）。"),
-                    ).to_dict(),
-                }
-                return
-            emit_product_metric(hcfg, "fast_escalation_rate", trace_id=trace_id, to_track="agent", reason="agent_recover")
-            options["_fast_did_escalate_agent"] = True
-            options["_agent_seed_draft"] = draft_text
-            yield {"event": "status", "phase": "agent", "message": "快轨质量不足：转入 Agent 复核与工具推理…"}
-            yield {
-                "event": "stream_start",
-                "track": "agent",
-                "trace_id": trace_id,
-                "meta": {"stream_phase": "fast_escalation_agent"},
-            }
-            async for ev in self._run_agent_stream(prompt, analysis, options, messages, trace_id, hcfg, _tag):
-                yield ev
-            return
-
-        if ra not in ("refine", "search_more") and not should_escalate_refine(qc):
-            return
-
-        refine_ctx = self._resolve_refine_context(analysis, hcfg)
-        chain = refine_ctx.get("chain") or {}
-        if not chain.get("enabled", True):
-            yield {
-                "event": "step",
-                "step": Step(
-                    name="fast_escalation_skip",
-                    status="skipped",
-                    meta=_pg({"reason": "refine_chain_disabled"}, "fast", "精化链已关闭，无法从快轨升级。"),
-                ).to_dict(),
-            }
-            return
-
-        if not escalate(options, hcfg, from_track, "refine", trace_id=trace_id, reason="unified_critic_refine"):
-            yield {
-                "event": "step",
-                "step": Step(
-                    name="fast_escalation_denied",
-                    status="skipped",
-                    meta=_pg({"reason": "not_strict_upgrade"}, "fast", "轨道升级被拒绝（仅允许 fast→refine→agent）。"),
-                ).to_dict(),
-            }
-            return
-        emit_product_metric(hcfg, "fast_escalation_rate", trace_id=trace_id, to_track="refine", reason="unified_critic_refine")
-        options["_fast_did_escalate_refine"] = True
-        yield {"event": "status", "phase": "refine", "message": "快轨质量未达标：转入审查与修复流水线…"}
-        yield {
-            "event": "stream_start",
-            "track": "refine",
-            "trace_id": trace_id,
-            "meta": {"stream_phase": "fast_escalation_refine"},
-        }
-        refine_ok = True
-        async for ev in self._refine_from_draft_stream(
-            prompt,
-            draft_text,
-            options,
-            messages,
-            trace_id,
-            hcfg,
-            analysis,
-            meta_extra={"fast_unified_escalation": True},
-            extra_review_context="",
-        ):
-            yield ev
-            if ev.get("event") == "error":
-                refine_ok = False
-        yield {
-            "event": "step",
-            "step": Step(
-                name="fast_escalation_complete",
-                status="ok" if refine_ok else "error",
-                meta=_pg({}, "fast", "快轨升级精化已完成。" if refine_ok else "快轨升级精化失败。"),
-                error=None if refine_ok else "fast_escalation_refine_failed",
-            ).to_dict(),
-        }
-
-    async def _consume_refine_runtime_full_sync(
-        self,
-        prompt: str,
-        analysis: Dict[str, Any],
-        options: Dict[str, Any],
-        messages: Optional[List[Dict[str, Any]]],
-        trace_id: str,
-        hcfg: Dict[str, Any],
-        _tag,
-        *,
-        entry_block: str,
-        skip_draft: bool,
-    ) -> Tuple[AskResult, List[Step]]:
-        parts: List[str] = []
-        extra_steps: List[Step] = []
-        err: Optional[str] = None
-        last_model = ""
-        last_provider = ""
-        last_lat = 0
-        async for ev in iter_refine_runtime_stream(
-            self,
-            prompt,
-            analysis,
-            options,
-            messages,
-            trace_id,
-            hcfg,
-            _tag,
-            entry_block=entry_block,
-            skip_draft=skip_draft,
-        ):
-            et = ev.get("event")
-            if et == "chunk":
-                data = ev.get("data") or {}
-                if chunk_writes_history(data):
-                    parts.append(str(data.get("content") or ""))
-            elif et == "error":
-                err = str(ev.get("error") or "REFINE_RUNTIME_ERROR")
-            elif et == "step":
-                payload = ev.get("step")
-                if isinstance(payload, dict):
-                    extra_steps.append(
-                        Step(
-                            name=str(payload.get("name") or "step"),
-                            status=str(payload.get("status") or "ok"),
-                            provider=payload.get("provider"),
-                            model=payload.get("model"),
-                            latency_ms=payload.get("latency_ms"),
-                            meta=dict(payload.get("meta") or {}),
-                            error=payload.get("error"),
-                        )
-                    )
-                    if payload.get("model"):
-                        last_model = str(payload.get("model"))
-                    if payload.get("provider"):
-                        last_provider = str(payload.get("provider"))
-                    if payload.get("latency_ms") is not None:
-                        try:
-                            last_lat = int(payload.get("latency_ms") or 0)
-                        except (TypeError, ValueError):
-                            pass
-        body = "".join(parts)
-        if err:
-            return AskResult(False, body, last_provider or "refine", last_model or "refine", last_lat, error=err), extra_steps
-        return AskResult(True, body, last_provider or "refine", last_model or "refine", last_lat), extra_steps
-
-    async def _consume_refine_from_draft_sync(
-        self,
-        question: str,
-        draft_text: str,
-        options: Dict[str, Any],
-        messages: Optional[List[Dict[str, Any]]],
-        trace_id: str,
-        hcfg: Dict[str, Any],
-        analysis: Dict[str, Any],
-        *,
-        meta_extra: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[AskResult, List[Step]]:
-        parts: List[str] = []
-        extra_steps: List[Step] = []
-        err: Optional[str] = None
-        last_model = ""
-        last_provider = ""
-        last_lat = 0
-        async for ev in self._refine_from_draft_stream(
-            question,
-            draft_text,
-            options,
-            messages,
-            trace_id,
-            hcfg,
-            analysis,
-            meta_extra=meta_extra,
-            extra_review_context="",
-        ):
-            et = ev.get("event")
-            if et == "chunk":
-                data = ev.get("data") or {}
-                if chunk_writes_history(data):
-                    parts.append(str(data.get("content") or ""))
-            elif et == "error":
-                err = str(ev.get("error") or "REFINE_ERROR")
-            elif et == "step":
-                payload = ev.get("step")
-                if isinstance(payload, dict):
-                    extra_steps.append(
-                        Step(
-                            name=str(payload.get("name") or "step"),
-                            status=str(payload.get("status") or "ok"),
-                            provider=payload.get("provider"),
-                            model=payload.get("model"),
-                            latency_ms=payload.get("latency_ms"),
-                            meta=dict(payload.get("meta") or {}),
-                            error=payload.get("error"),
-                        )
-                    )
-                    if payload.get("model"):
-                        last_model = str(payload.get("model"))
-                    if payload.get("provider"):
-                        last_provider = str(payload.get("provider"))
-                    if payload.get("latency_ms") is not None:
-                        try:
-                            last_lat = int(payload.get("latency_ms") or 0)
-                        except (TypeError, ValueError):
-                            pass
-        body = "".join(parts)
-        if err:
-            return AskResult(False, body, last_provider or "refine", last_model or "refine", last_lat, error=err), extra_steps
-        return AskResult(True, body, last_provider or "refine", last_model or "refine", last_lat), extra_steps
-
-    async def _consume_agent_stream_for_sync(
-        self,
-        prompt: str,
-        analysis: Dict[str, Any],
-        options: Dict[str, Any],
-        messages: Optional[List[Dict[str, Any]]],
-        trace_id: str,
-        hcfg: Dict[str, Any],
-        _tag,
-    ) -> Tuple[AskResult, List[Step]]:
-        """非流式 API：复用流式 Agent 循环，将 chunk 拼成最终正文供 /api/chat 返回。"""
-        parts: List[str] = []
-        extra_steps: List[Step] = []
-        last_model = "agent"
-        last_provider = "agent"
-        last_latency = 0
-        stream_error: Optional[str] = None
-
-        async for ev in self._run_agent_stream(prompt, analysis, options, messages, trace_id, hcfg, _tag):
-            et = ev.get("event")
-            if et == "chunk":
-                data = ev.get("data") or {}
-                if chunk_writes_history(data):
-                    parts.append(str(data.get("content") or ""))
-                continue
-            if et == "step":
-                payload = ev.get("step")
-                if isinstance(payload, dict):
-                    extra_steps.append(
-                        Step(
-                            name=str(payload.get("name") or "step"),
-                            status=str(payload.get("status") or "ok"),
-                            provider=payload.get("provider"),
-                            model=payload.get("model"),
-                            latency_ms=payload.get("latency_ms"),
-                            input_preview=payload.get("input_preview"),
-                            output=payload.get("output") if isinstance(payload.get("output"), str) else None,
-                            error=payload.get("error"),
-                            meta=dict(payload.get("meta") or {}),
-                        )
-                    )
-                    if payload.get("model"):
-                        last_model = str(payload.get("model"))
-                    if payload.get("provider"):
-                        last_provider = str(payload.get("provider"))
-                    if payload.get("latency_ms") is not None:
-                        try:
-                            last_latency = int(payload.get("latency_ms") or 0)
-                        except (TypeError, ValueError):
-                            pass
-                continue
-            if et == "error":
-                stream_error = str(ev.get("error") or "STREAM_ERROR")
-
-        body = "".join(parts)
-        if stream_error:
-            return (
-                AskResult(
-                    False,
-                    body,
-                    last_provider,
-                    last_model,
-                    last_latency,
-                    error=stream_error,
-                    failure_kind="stream",
-                ),
-                extra_steps,
-            )
-        return AskResult(True, body, last_provider, last_model, last_latency), extra_steps
-
     async def _run_agent_stream(
         self,
         prompt: str,
@@ -2900,652 +1824,20 @@ class DualTrackHarness:
         hcfg: Dict[str, Any],
         _tag,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        acfg = hcfg.get("agent") or {}
-        routing = hcfg.get("routing") or {}
-        default_model = routing.get("default_model", "gpt-5.5")
-        agent_candidates = self._agent_model_candidates(hcfg, analysis, default_model)
-        agent_model = agent_candidates[0]
-        max_map = acfg.get("max_iterations_by_complexity") or {}
-        cx = str(analysis.get("complexity") or "low").lower()
-        max_iter = int(max_map.get(cx) or acfg.get("max_iterations", 5))
-        max_iter = max(3, min(8, max_iter))
-        agent_intro = (acfg.get("system_prompt") or "").strip()
-        base_rules = (
-            "你是具备工具调用能力的智能体，按「思考 → 行动 → 观察」循环推理。\n"
-            "工具调用必须使用合法 JSON 对象（可单独一段，也可出现在解释文字之后），例如：\n"
-            '{"action":"web_search","query":"查询词","reason":"为何检索","priority":"high"}\n'
-            '{"action":"refine_answer","question":"用户原问题","draft":"你的结论草稿"}\n'
-            "禁止使用任何非 JSON 的工具标记语法。\n"
-            "若能直接给出最终答案，可直接输出正文。\n"
-            "若任务为高复杂度、倾向精化或涉及时效/高风险主题，服务器可能将你本轮无工具 JSON 的正文视为草稿并强制进入审查与润色流程。\n"
-        )
-        sys_content = (agent_intro + "\n\n" + base_rules).strip()
-        thread_msgs: List[Dict[str, Any]] = []
-        if messages:
-            history_budget = _int_budget(options, "agent_history_context_chars", 12000, minimum=2000, maximum=40000)
-            for m in self._select_agent_history_messages(messages, history_budget):
-                role = m.get("role")
-                if role not in ("user", "assistant"):
-                    continue
-                thread_msgs.append({"role": role, "content": _msg_content_to_text(m.get("content"))})
-        agent_prompt = self._attach_documents_to_prompt(prompt, options)
-        seed = str(options.pop("_agent_seed_draft", "") or "").strip()
-        if seed:
-            agent_prompt = (
-                f"{agent_prompt}\n\n【上游快轨草案（质量未达标，请用工具核实或 refine_answer）】\n{seed[:12000]}"
-            )
-        sub_goals = [s.strip() for s in re.split(r"[？?\n]", prompt or "") if s.strip()][:12]
-        if not options.get("_agent_state"):
-            options["_agent_state"] = _bootstrap_agent_state(sub_goals, prompt_fallback=prompt or "")
-        else:
-            ag0 = options.get("_agent_state")
-            if (
-                isinstance(ag0, AgentState)
-                and ag0.goals
-                and not ag0.unresolved_goals
-                and not ag0.solved_goals
-            ):
-                ag0.unresolved_goals = list(ag0.goals)
-        conv: List[Dict[str, Any]] = [{"role": "system", "content": sys_content}] + thread_msgs + [{"role": "user", "content": agent_prompt}]
-        options.setdefault("_agent_loop_ctx", {"last_query": "", "last_ok": False, "all_queries": []})
-
+        """旧 ReAct / ACTION 循环已移除；遗留调用仅返回错误事件（主路径为 DAG Runtime）。"""
         yield {
             "event": "step",
             "step": {
-                "name": "agent_start",
-                "status": "ok",
+                "name": "agent_runtime_removed",
+                "status": "skipped",
                 "meta": _pg(
-                    {
-                        "model": agent_model,
-                        "model_candidates": agent_candidates,
-                        "max_iterations": max_iter,
-                        "thread_turns": len(thread_msgs),
-                        "phase": "初始化推理线程（system + 近期对话 + 当前问题）",
-                    },
+                    {"reason": "dag_runtime_only"},
                     "reasoning",
-                    f"Agent 已启动：主模型「{agent_model}」，最多 {max_iter} 轮「思考→行动→观察」。",
+                    "互斥 Agent 轨已删除；工具与推理由 DAG 能力与并行节点编排。",
                 ),
             },
         }
-        yield {"event": "status", "phase": "agent", "message": "正在分析问题并规划工具调用…"}
-
-        prev_parse_snapshot = ""
-        for it in range(max_iter):
-            yield {
-                "event": "step",
-                "step": {
-                    "name": "agent_iteration",
-                    "status": "running",
-                    "meta": _pg(
-                        {
-                            "i": it + 1,
-                            "max": max_iter,
-                            "phase": "调用主模型生成本轮策略与正文",
-                            "model": agent_model,
-                        },
-                        "reasoning",
-                        f"第 {it + 1}/{max_iter} 轮：正在调用主模型推理…",
-                    ),
-                },
-            }
-            res, _att = await self._ask_with_fallback(agent_candidates, "", options, messages=conv)
-            if not res.success:
-                yield {"event": "error", "error": res.error or "Agent 调用失败"}
-                return
-            text = (res.content or "").strip()
-            conv.append({"role": "assistant", "content": text})
-
-            trimmed = strip_text_after_first_tool_json(text)
-            parse_text = trimmed
-            if trimmed != text:
-                conv[-1]["content"] = trimmed
-
-            action = parse_agent_action(parse_text)
-            action_name = action.get("action") or ""
-            if action_name == "refine_answer":
-                next_move = "refine_answer"
-            elif action_name == "web_search":
-                next_move = "web_search"
-            else:
-                next_move = "direct_reply"
-
-            ag_st = options.get("_agent_state")
-            if isinstance(ag_st, AgentState):
-                ag_st.iteration_count = it + 1
-                if action_name == "web_search":
-                    wq = str(action.get("query") or "").strip()[:400]
-                    tag = f"web_search:{wq}" if wq else "web_search"
-                    ag_st.attempted_actions.add(tag)
-                    if wq and wq not in ag_st.search_history:
-                        ag_st.search_history.append(wq)
-                elif action_name == "refine_answer":
-                    ag_st.attempted_actions.add("refine_answer")
-
-            ag_tune = (hcfg.get("agent_tuning") or {})
-            orch_rt = hcfg.get("runtime_orchestrator") if isinstance(hcfg.get("runtime_orchestrator"), dict) else {}
-            stages_rt = orch_rt.get("rollout_stages") if isinstance(orch_rt.get("rollout_stages"), dict) else {}
-            pe = ag_tune.get("progress_eval") if isinstance(ag_tune.get("progress_eval"), dict) else {}
-            pe_on = bool(pe.get("enabled")) and stages_rt.get("agent_progress_evaluator") is not False
-
-            if next_move != "direct_reply":
-                ctxpx = options.get("_agent_progress_ctx")
-                if isinstance(ctxpx, dict):
-                    ctxpx["low_hits"] = 0
-                ags0 = options.get("_agent_state")
-                if isinstance(ags0, AgentState):
-                    ags0.progress_delta_low_rounds = 0
-            elif pe_on and it > 0 and prev_parse_snapshot.strip():
-                every_n = max(1, int(pe.get("every_n_iterations", 2) or 2))
-                if it % every_n == 0:
-                    ctx_pe = options.setdefault("_agent_progress_ctx", {"calls": 0, "low_hits": 0})
-                    max_calls = max(1, int(pe.get("max_calls_per_request", 4) or 4))
-                    if ctx_pe["calls"] < max_calls:
-                        from agent_progress import evaluate_agent_progress
-
-                        pr = await evaluate_agent_progress(
-                            self, prompt, prev_parse_snapshot, parse_text, options, hcfg
-                        )
-                        ctx_pe["calls"] = int(ctx_pe.get("calls") or 0) + 1
-                        try:
-                            ps = float(pr.get("progress_score") or 0)
-                            dv = float(pr.get("delta_vs_previous") or 0)
-                        except (TypeError, ValueError):
-                            ps, dv = 0.5, 0.35
-                        min_ps = float(pe.get("min_progress_score", 0.22) or 0.22)
-                        min_dv = float(pe.get("min_delta_vs_previous", 0.1) or 0.1)
-                        if ps < min_ps and dv < min_dv:
-                            ctx_pe["low_hits"] = int(ctx_pe.get("low_hits") or 0) + 1
-                        else:
-                            ctx_pe["low_hits"] = 0
-                            thr_gr_ps = float(pe.get("goal_resolve_progress_threshold", 0.55) or 0.55)
-                            thr_gr_dv = float(pe.get("goal_resolve_delta_threshold", 0.2) or 0.2)
-                            if ps >= thr_gr_ps or dv >= thr_gr_dv:
-                                _agent_resolve_one_goal_from_progress(options)
-                        abort_n = max(1, int(pe.get("low_progress_abort_after", 2) or 2))
-                        if ctx_pe["low_hits"] >= abort_n:
-                            emit_product_metric(hcfg, "agent_stuck_rate", trace_id=trace_id, reason="low_progress_abort")
-                            draft_fb = compile_agent_fallback_draft(conv, prompt)
-                            yield {
-                                "event": "step",
-                                "step": {
-                                    "name": "agent_progress_abort",
-                                    "status": "ok",
-                                    "meta": _pg(
-                                        {
-                                            "low_hits": ctx_pe["low_hits"],
-                                            "eval_calls": ctx_pe["calls"],
-                                        },
-                                        "reasoning",
-                                        "多轮进度评分偏低，已终止 Agent 并进入 Refine 兜底。",
-                                    ),
-                                },
-                            }
-                            async for ev in stream_refine_from_draft(
-                                self,
-                                prompt,
-                                draft_fb,
-                                options,
-                                messages,
-                                trace_id,
-                                hcfg,
-                                analysis,
-                                meta_extra={"agent_fallback": True, "reason": "low_progress_abort"},
-                            ):
-                                yield ev
-                            return
-                        ags = options.get("_agent_state")
-                        thr_delta = float(pe.get("progress_score_delta_threshold", 0.05) or 0.05)
-                        rounds_need = max(1, int(pe.get("progress_delta_low_abort_after", 2) or 2))
-                        if isinstance(ags, AgentState):
-                            old_ps = float(ags.progress_score or 0.0)
-                            delta_ps = abs(ps - old_ps)
-                            ags.last_progress_score = old_ps
-                            ags.progress_score = ps
-                            if delta_ps < thr_delta:
-                                ags.progress_delta_low_rounds = int(ags.progress_delta_low_rounds or 0) + 1
-                            else:
-                                ags.progress_delta_low_rounds = 0
-                            if ags.progress_delta_low_rounds >= rounds_need:
-                                emit_product_metric(
-                                    hcfg,
-                                    "agent_stuck_rate",
-                                    trace_id=trace_id,
-                                    reason="progress_score_delta_flat",
-                                )
-                                draft_fb = compile_agent_fallback_draft(conv, prompt)
-                                yield {
-                                    "event": "step",
-                                    "step": {
-                                        "name": "agent_progress_delta_abort",
-                                        "status": "ok",
-                                        "meta": _pg(
-                                            {
-                                                "progress_delta_low_rounds": ags.progress_delta_low_rounds,
-                                                "threshold": thr_delta,
-                                            },
-                                            "reasoning",
-                                            "连续多轮进度评分变化过小，已终止 Agent 并进入 Refine 兜底。",
-                                        ),
-                                    },
-                                }
-                                async for ev in stream_refine_from_draft(
-                                    self,
-                                    prompt,
-                                    draft_fb,
-                                    options,
-                                    messages,
-                                    trace_id,
-                                    hcfg,
-                                    analysis,
-                                    meta_extra={"agent_fallback": True, "reason": "progress_score_delta_flat"},
-                                ):
-                                    yield ev
-                                return
-
-            prev_parse_snapshot = parse_text[:3500]
-
-            preview = text[:400] + ("…" if len(text) > 400 else "")
-            branch_cn = {
-                "refine_answer": "进入审查与润色全链",
-                "web_search": "触发联网检索后继续推理",
-                "direct_reply": "本轮将直接流式输出答复",
-            }.get(next_move, next_move)
-            iter_summary = (
-                f"第 {it + 1}/{max_iter} 轮思考完成：下一步 — {branch_cn}。"
-                f"（模型输出约 {len(text)} 字）"
-            )
-            force_refine, coerce_reason = self._agent_plain_text_should_refine(analysis)
-            will_exit_after_plain_coerce = (
-                next_move == "direct_reply"
-                and bool(parse_text.strip())
-                and force_refine
-            )
-            iter_meta_core = {
-                "i": it + 1,
-                "max": max_iter,
-                "next_move": next_move,
-                "branch_next": {
-                    "refine_answer": "进入 Refine 全链（审查+按需检索+润色）",
-                    "web_search": "触发联网检索后继续推理",
-                    "direct_reply": "本轮输出短文答复（流式）",
-                }.get(next_move, next_move),
-                "reply_preview": preview,
-                "reply_chars": len(text),
-                "phase": "本轮模型调用已完成，下一步按分支继续",
-            }
-            if will_exit_after_plain_coerce:
-                iter_meta_core["agent_loop_early_exit"] = True
-                iter_meta_core["agent_loop_exit_hint"] = (
-                    f"判定：{coerce_reason}。本轮无工具 ACTION 的纯文本将被当作草稿，"
-                    f"随后进入审查/润色链；Agent 多轮循环在此结束。"
-                    f"「{max_iter}」为可用轮次上限，不是每次请求都会跑满。"
-                )
-            yield {
-                "event": "step",
-                "step": {
-                    "name": "agent_iteration",
-                    "status": "ok",
-                    "provider": res.provider,
-                    "model": res.model,
-                    "latency_ms": res.latency_ms,
-                    "meta": _pg(
-                        iter_meta_core,
-                        "reasoning",
-                        iter_summary,
-                    ),
-                },
-            }
-
-            if action_name == "refine_answer":
-                orig_q = (action.get("question") or "").strip() or prompt
-                draft = (action.get("draft") or "").strip()
-                if len(draft) < 16:
-                    conv.append(
-                        {
-                            "role": "user",
-                            "content": "【系统】refine_answer 草稿过短或为空；请先 web_search 补充事实或输出完整草稿后再调用 refine_answer。",
-                        }
-                    )
-                    yield {
-                        "event": "step",
-                        "step": {
-                            "name": "agent_refine_answer",
-                            "status": "skipped",
-                            "meta": _pg(
-                                {"reason": "empty_or_tiny_draft", "draft_len": len(draft)},
-                                "polishing",
-                                "refine_answer 草稿过短，已跳过并回到推理循环。",
-                            ),
-                        },
-                    }
-                    continue
-                extra_sc = await self._agent_self_check_block(orig_q, draft, hcfg, analysis, options, agent_model)
-                if extra_sc:
-                    yield {
-                        "event": "step",
-                        "step": {
-                            "name": "agent_self_check",
-                            "status": "ok",
-                            "meta": _pg(
-                                {**_tag("review"), "chars": len(extra_sc)},
-                                "polishing",
-                                f"高复杂度自检完成（约 {len(extra_sc)} 字），供审查层参考。",
-                            ),
-                        },
-                    }
-                yield {
-                    "event": "step",
-                    "step": {
-                        "name": "agent_refine_answer",
-                        "status": "running",
-                        "meta": _pg({}, "polishing", "按 Agent 工具调用：进入审查 → 按需联网 → 润色…"),
-                    },
-                }
-                yield {
-                    "event": "stream_start",
-                    "track": "agent",
-                    "trace_id": trace_id,
-                    "meta": {"stream_phase": "tool_refine"},
-                }
-                refine_ok = True
-                async for ev in self._refine_from_draft_stream(
-                    orig_q,
-                    draft,
-                    options,
-                    messages,
-                    trace_id,
-                    hcfg,
-                    analysis,
-                    meta_extra={"agent_tool": "refine_answer"},
-                    extra_review_context=extra_sc,
-                ):
-                    yield ev
-                    if ev.get("event") == "error":
-                        refine_ok = False
-                yield {
-                    "event": "step",
-                    "step": {
-                        "name": "agent_refine_answer",
-                        "status": "ok" if refine_ok else "error",
-                        "meta": _pg(
-                            {},
-                            "polishing",
-                            "Agent 触发的审查与润色流水线已完成。"
-                            if refine_ok
-                            else "Agent 触发的审查与润色流水线失败。",
-                        ),
-                        "error": None if refine_ok else "Agent refine_answer failed",
-                    },
-                }
-                if refine_ok:
-                    _mark_agent_delegated_refine_complete(options)
-                return
-
-            if action_name == "web_search":
-                if options.get("_web_search_blocked"):
-                    yield {
-                        "event": "step",
-                        "step": {
-                            "name": "agent_web_search",
-                            "status": "skipped",
-                            "meta": _pg(
-                                {"reason": "web_search_blocked", "detail": options.get("_web_search_block_reason")},
-                                "reasoning",
-                                str(options.get("_web_search_block_reason") or "当前请求禁止联网，已跳过 web_search。"),
-                            ),
-                        },
-                    }
-                    conv.append(
-                        {
-                            "role": "user",
-                            "content": f"【系统】{options.get('_web_search_block_reason') or '当前禁止联网'}；请在不检索的前提下继续推理或直接给出结论。",
-                        }
-                    )
-                    continue
-                query = (action.get("query") or "").strip()
-                lo = options.get("_agent_loop_ctx") or {}
-                history_queries = list(lo.get("all_queries") or [])
-                repeated = False
-                for old_query in history_queries:
-                    if ngram_overlap_ratio(old_query, query) >= 0.7:
-                        repeated = True
-                        break
-                if repeated:
-                    conv.append(
-                        {
-                            "role": "user",
-                            "content": "【系统】该检索词与之前轮次高度重复，请换角度、泛化关键词或拆分子问题后再搜索。",
-                        }
-                    )
-                    yield {
-                        "event": "step",
-                        "step": {
-                            "name": "agent_web_search",
-                            "status": "skipped",
-                            "meta": _pg({"query": query, "reason": "repeat_query_detected"}, "reasoning", "检测到重复搜索，已要求 Agent 改写查询词。"),
-                        },
-                    }
-                    continue
-                vq, vfc, vreason = validate_search_query(query)
-                if vfc:
-                    conv.append(
-                        {
-                            "role": "user",
-                            "content": f"【系统】检索词未通过校验：{vreason or vfc}。请改写查询词后输出 web_search JSON：{{\"action\":\"web_search\",\"query\":\"...\",\"reason\":\"...\"}}。",
-                        }
-                    )
-                    yield {
-                        "event": "step",
-                        "step": {
-                            "name": "agent_web_search",
-                            "status": "skipped",
-                            "meta": _pg(
-                                {"query": query, "failure_code": vfc},
-                                "reasoning",
-                                f"联网动作已跳过：检索词未过审（{vreason or vfc}）。",
-                            ),
-                        },
-                    }
-                    continue
-                yield {
-                    "event": "step",
-                    "step": {
-                        "name": "agent_web_search",
-                        "status": "running",
-                        "meta": _pg(
-                            {"query": vq},
-                            "reasoning",
-                            f"行动：联网搜索「{str(vq)[:72]}{'…' if len(str(vq)) > 72 else ''}」…",
-                        ),
-                    },
-                }
-                track_overrides = self._track_search_overrides("agent", analysis)
-                sr = await self.tools.web_search(vq, {**options, **{k: v for k, v in track_overrides.items() if v is not None}})
-                ctx = (sr.get("context") or "")[:12000]
-                n_ok = len(sr.get("sources") or [])
-                st = Step(
-                    name="agent_web_search",
-                    status="error" if sr.get("error") else "ok",
-                    meta=_pg(
-                        {"query": vq, "query_raw": query, "sources": sr.get("sources") or [], "from": "agent"},
-                        "reasoning",
-                        (
-                            f"观察：检索返回约 {n_ok} 条来源，摘要已注入对话。"
-                            if not sr.get("error")
-                            else f"观察：检索失败 — {sr.get('error') or 'error'}"
-                        ),
-                    ),
-                    error=sr.get("error"),
-                )
-                yield {"event": "step", "step": st.to_dict()}
-                if sr.get("error") or not (sr.get("sources") or []):
-                    hint = ""
-                    if lo.get("last_query"):
-                        hint = (
-                            f"【系统】上一轮检索词为「{lo.get('last_query')}」。"
-                            "请换用不同角度、更泛化或拆分子问题的检索词，避免重复同一查询。"
-                        )
-                    conv.append(
-                        {
-                            "role": "user",
-                            "content": f"【观察】搜索失败或无有效结果：{sr.get('error') or 'empty'}。{hint}请换查询词或继续推理。",
-                        }
-                    )
-                else:
-                    lo["last_query"] = vq
-                    lo["last_ok"] = True
-                    lo.setdefault("all_queries", []).append(vq)
-                    _agent_record_search_evidence(options, query=str(vq), iteration_idx=it, sr=sr)
-                    conv.append({"role": "user", "content": f"【观察】联网摘要：\n{ctx}\n请继续推理或给出最终答案。"})
-                continue
-
-            draft_plain = parse_text.strip()
-            if force_refine and draft_plain:
-                yield {
-                    "event": "step",
-                    "step": {
-                        "name": "agent_plain_coerce_refine",
-                        "status": "ok",
-                        "meta": _pg(
-                            {
-                                "reason": coerce_reason,
-                                "draft_chars": len(draft_plain),
-                                "phase": "无 ACTION 纯文本 → 强制 Review / Polish",
-                            },
-                            "polishing",
-                            f"策略：本轮无工具调用，因「{coerce_reason}」将正文视为草稿，强制进入审查与润色。",
-                        ),
-                    },
-                }
-                yield {
-                    "event": "status",
-                    "phase": "agent",
-                    "message": "高复杂度或精化/强时效倾向：将本轮正文作为草稿进入审查与润色…",
-                }
-                yield {
-                    "event": "step",
-                    "step": {
-                        "name": "agent_refine_answer",
-                        "status": "running",
-                        "meta": _pg(
-                            {"coerced_from_plain_text": True, "coerce_reason": coerce_reason},
-                            "polishing",
-                            "后处理：对纯文本草稿执行审查与润色流水线…",
-                        ),
-                    },
-                }
-                extra_sc2 = await self._agent_self_check_block(prompt, draft_plain, hcfg, analysis, options, agent_model)
-                if extra_sc2:
-                    yield {
-                        "event": "step",
-                        "step": {
-                            "name": "agent_self_check",
-                            "status": "ok",
-                            "meta": _pg(
-                                {**_tag("review"), "chars": len(extra_sc2), "coerced_plain_text": True},
-                                "polishing",
-                                f"强制精化前自检完成（约 {len(extra_sc2)} 字），供审查层参考。",
-                            ),
-                        },
-                    }
-                yield {
-                    "event": "stream_start",
-                    "track": "agent",
-                    "trace_id": trace_id,
-                    "meta": {"stream_phase": "plain_coerce_refine"},
-                }
-                refine_ok = True
-                async for ev in self._refine_from_draft_stream(
-                    prompt,
-                    draft_plain,
-                    options,
-                    messages,
-                    trace_id,
-                    hcfg,
-                    analysis,
-                    meta_extra={
-                        "agent_tool": "refine_answer",
-                        "coerced_plain_text": True,
-                        "coerce_reason": coerce_reason,
-                    },
-                    extra_review_context=extra_sc2,
-                ):
-                    yield ev
-                    if ev.get("event") == "error":
-                        refine_ok = False
-                yield {
-                    "event": "step",
-                    "step": {
-                        "name": "agent_refine_answer",
-                        "status": "ok" if refine_ok else "error",
-                        "meta": _pg(
-                            {"coerced_plain_text": True},
-                            "polishing",
-                            "强制精化流水线已完成。" if refine_ok else "强制精化流水线失败。",
-                        ),
-                        "error": None if refine_ok else "Agent coerced refine failed",
-                    },
-                }
-                if refine_ok:
-                    _mark_agent_delegated_refine_complete(options)
-                return
-
-            yield {
-                "event": "stream_start",
-                "track": "agent",
-                "trace_id": trace_id,
-                "meta": {"stream_phase": "direct_answer"},
-            }
-            async for ev in self._emit_text_chunks(text, options):
-                yield ev
-            return
-
-        # 迭代用尽：与 refine_answer 相同的全链路 Review + Polish（非 Fast 摘要）
-        draft_fb = compile_agent_fallback_draft(conv, prompt)
-        yield {
-            "event": "step",
-            "step": {
-                "name": "agent_refine_fallback",
-                "status": "running",
-                "meta": _pg(
-                    {"reason": "max_iterations_exhausted", "same_pipeline_as": "refine_answer"},
-                    "polishing",
-                    "迭代次数用尽：正将多轮对话摘录拼成草稿，走审查与润色兜底。",
-                ),
-            },
-        }
-        yield {
-            "event": "stream_start",
-            "track": "agent",
-            "trace_id": trace_id,
-            "meta": {"stream_phase": "fallback_refine"},
-        }
-        fb_ok = True
-        async for ev in self._refine_from_draft_stream(
-            prompt,
-            draft_fb,
-            options,
-            messages,
-            trace_id,
-            hcfg,
-            analysis,
-            meta_extra={"agent_fallback": True, "reason": "max_iterations_exhausted"},
-        ):
-            yield ev
-            if ev.get("event") == "error":
-                fb_ok = False
-        yield {
-            "event": "step",
-            "step": {
-                "name": "agent_refine_fallback",
-                "status": "ok" if fb_ok else "error",
-                "meta": _pg(
-                    {},
-                    "polishing",
-                    "Agent 兜底 Refine 已完成。" if fb_ok else "Agent 兜底 Refine 失败。",
-                ),
-            },
-        }
+        yield {"event": "error", "error": "agent_track_removed"}
 
     async def run_stream(self, prompt: str, mode: str = "auto", options: Optional[Dict[str, Any]] = None, messages: Optional[List[Dict[str, Any]]] = None) -> AsyncGenerator[Dict[str, Any], None]:
         """流式 SSE 主路径；同步 ``run`` 经 ``runtime_executor.collect_sync_response_from_stream`` 消费同一序列。"""
@@ -3555,7 +1847,6 @@ class DualTrackHarness:
         if "_fast_cache_identity" not in options:
             options["_fast_cache_identity"] = str(options.get("search_prompt_base") or prompt or "").strip()
         trace_id = options.get("trace_id") or new_trace_id()
-        steps: List[Step] = []
         _tag = self._make_tagger()
 
         yield {"event": "trace", "trace_id": trace_id, "meta": dict(SSE_PROTOCOL_META)}
@@ -3574,248 +1865,14 @@ class DualTrackHarness:
         hcfg = prep["hcfg"]
         mode = prep["mode"]
         analysis = prep["analysis"]
-        intended_track = prep["intended_track"]
-        initial_track = prep["initial_track"]
-        entry_search_required = prep["entry_search_required"]
-        search_reason = prep["search_reason"]
-        search_mandatory = prep["search_mandatory"]
 
-        step_analyze = Step(
-            name="complexity_analyze",
-            status="ok",
-            meta=_pg({**analysis, **_tag("intake")}, "intake", _analyze_step_summary(analysis)),
-            input_preview=(prompt[:240] + ("…" if len(prompt) > 240 else "")),
-        )
-        steps.append(step_analyze)
-        yield {"event": "step", "step": step_analyze.to_dict()}
+        from runtime.dag_stream import run_dag_runtime_stream
 
-        yield {"event": "status", "phase": "route", "message": "正在选择处理轨道…"}
-        step_track = Step(
-            name="track_select",
-            status="ok",
-            meta=_pg(
-                {
-                    **_tag("routing"),
-                    "mode": mode,
-                    "track": initial_track,
-                    "initial_track": initial_track,
-                    "current_track": runtime_track(options),
-                    "task_type": analysis.get("task_type"),
-                    "complexity": analysis.get("complexity"),
-                    "decision": analysis.get("decision"),
-                    "confidence": analysis.get("confidence"),
-                    "search_required": analysis.get("search_required"),
-                    "intended_track": intended_track,
-                    "search_intent": analysis.get("search_intent"),
-                    "fallback_reason": analysis.get("fallback_reason"),
-                    "high_risk_domain": analysis.get("high_risk_domain"),
-                    "agent_disabled_fallback": bool(analysis.get("agent_disabled_fallback")),
-                    "capability_plan": analysis.get("capability_plan"),
-                    "analyzer_track_hint": analysis.get("analyzer_track_hint"),
-                    "runtime_route_rule": analysis.get("route_rule"),
-                    "limitations": analysis.get("limitations"),
-                    "response_style": analysis.get("response_style"),
-                },
-                "intake",
-                _track_select_summary(initial_track, intended_track, analysis),
-            ),
-        )
-        steps.append(step_track)
-        yield {"event": "step", "step": step_track.to_dict()}
-        if options.get("_web_search_blocked"):
-            yield {
-                "event": "step",
-                "step": {
-                    "name": "web_search_policy",
-                    "status": "skipped",
-                    "meta": _pg(
-                        {"blocked": True, "reason": options.get("_web_search_block_reason")},
-                        "intake",
-                        str(options.get("_web_search_block_reason") or "已禁止联网检索"),
-                    ),
-                },
-            }
-        yield {
-            "event": "trace",
-            "trace_id": trace_id,
-            "track": initial_track,
-            "initial_track": initial_track,
-            "current_track": runtime_track(options),
-            "meta": dict(SSE_PROTOCOL_META),
-        }
-        if initial_track == "fast" and entry_search_required:
-            yield {"event": "status", "phase": "search", "message": "正在联网检索（快轨）…"}
-            yield {
-                "event": "step",
-                "step": {
-                    "name": "web_search",
-                    "status": "running",
-                    "meta": _pg({}, "search", "快轨入口：正在联网补充实时信息…"),
-                },
-            }
-            prompt, step_ws, abort_err = await self._fast_entry_search_step(
-                prompt, analysis, options, search_reason, search_mandatory=search_mandatory
-            )
-            steps.append(step_ws)
-            yield {"event": "step", "step": step_ws.to_dict()}
-            if abort_err:
-                yield {"event": "error", "error": abort_err}
-                return
-
-        if initial_track == "agent":
-            yield {"event": "status", "phase": "agent", "message": "正在 Agent 推理与按需工具…"}
-            async for ev in self._run_agent_stream(prompt, analysis, options, messages, trace_id, hcfg, _tag):
-                yield ev
-            return
-
-        if initial_track == "fast":
-            prompt_for_answer = self._attach_documents_to_prompt(prompt, options)
-            cached = None
-            if not should_skip_fast_cache_store(analysis, hcfg, options):
-                cached = await self._try_fast_cache_hit(options, prompt_for_answer)
-            if cached:
-                yield {
-                    "event": "step",
-                    "step": {
-                        "name": "fast_answer_cache",
-                        "status": "ok",
-                        "meta": _pg(
-                            {**_tag("cache"), "chars": len(cached)},
-                            "fast",
-                            "命中本地/Redis 答案缓存，跳过模型调用。",
-                        ),
-                    },
-                }
-                yield {
-                    "event": "stream_start",
-                    "track": "fast",
-                    "trace_id": trace_id,
-                    "meta": {"stream_phase": "answer"},
-                }
-                async for s_event in self._emit_text_chunks(cached, options):
-                    yield s_event
-                options.pop("_fast_did_escalate_refine", None)
-                options.pop("_fast_did_escalate_agent", None)
-                async for ev in self._maybe_escalate_fast_draft_stream(
-                    cached, prompt, analysis, options, messages, trace_id, hcfg, _tag
-                ):
-                    yield ev
-                return
-            yield {"event": "status", "phase": "draft", "message": "正在生成回答…"}
-            route = self.route_fast_model(prompt, analysis)
-            step_route = Step(
-                name="fast_route",
-                status="ok",
-                meta=_pg(
-                    {**route, **_tag("draft")},
-                    "fast",
-                    f"快轨已选定首选模型「{route.get('selected') or '—'}」，将单段流式生成。",
-                ),
-            )
-            steps.append(step_route)
-            yield {"event": "step", "step": step_route.to_dict()}
-
-            candidates = route.get("candidates") or [route.get("selected")]
-            yield {
-                "event": "stream_start",
-                "track": "fast",
-                "trace_id": trace_id,
-                "meta": {"stream_phase": "answer"},
-            }
-            buf: List[str] = []
-            async for s_event in self._stream_with_fallback(candidates, prompt_for_answer, options, messages=messages):
-                yield s_event
-                if s_event.get("event") == "chunk":
-                    buf.append(str((s_event.get("data") or {}).get("content") or ""))
-            draft_fast = "".join(buf)
-            options.pop("_fast_did_escalate_refine", None)
-            options.pop("_fast_did_escalate_agent", None)
-            async for ev in self._maybe_escalate_fast_draft_stream(
-                draft_fast, prompt, analysis, options, messages, trace_id, hcfg, _tag
-            ):
-                yield ev
-            if (
-                not options.get("_fast_did_escalate_refine")
-                and not options.get("_fast_did_escalate_agent")
-                and not should_skip_fast_cache_store(analysis, hcfg, options)
-            ):
-                await self._store_fast_cache_answer(options, prompt_for_answer, draft_fast)
-            return
-
-        # refine track
-        refine_ctx = self._resolve_refine_context(analysis, hcfg)
-        chain = refine_ctx["chain"]
-        if not chain.get("enabled", True):
-            route = self.route_fast_model(prompt, analysis)
-            steps.append(
-                Step(
-                    name="refine_disabled_fallback_fast",
-                    status="ok",
-                    meta=_pg(
-                        dict(route) if isinstance(route, dict) else {"route": route},
-                        "fast",
-                        "精化链已关闭，已改为快轨单段生成。",
-                    ),
-                )
-            )
-            candidates = route.get("candidates") or [route.get("selected")]
-
-            yield {
-                "event": "stream_start",
-                "track": "fast",
-                "trace_id": trace_id,
-                "meta": {"stream_phase": "answer"},
-            }
-            async for s_event in self._stream_with_fallback(candidates, prompt, options, messages=messages):
-                yield s_event
-            return
-
-        entry_block = ""
-        si0 = str(analysis.get("search_intent") or "none").lower()
-        if si0 in ("explicit", "required", "freshness_required"):
-            yield {"event": "status", "phase": "search", "message": "正在为精化流程做入口轻量检索…"}
-            step_re0 = Step(
-                name="refine_entry_web_search",
-                status="running",
-                meta=_pg(
-                    {"phase": "Refine 入口 · 轻量联网（Layer1 前）"},
-                    "search",
-                    "精化轨：入口轻量联网，为初稿补充实时摘要…",
-                ),
-            )
-            yield {"event": "step", "step": step_re0.to_dict()}
-            entry_block = await self._refine_entry_light_search(prompt, analysis, options)
-            step_re1 = Step(
-                name="refine_entry_web_search",
-                status="ok",
-                meta=_pg(
-                    {
-                        "phase": "Refine 入口 · 轻量联网（Layer1 前）",
-                        "injected_chars": len(entry_block),
-                    },
-                    "search",
-                    f"入口联网完成，已向初稿上下文注入约 {len(entry_block)} 字摘要。",
-                ),
-            )
-            steps.append(step_re1)
-            yield {"event": "step", "step": step_re1.to_dict()}
-
-        skip_draft = self._should_skip_refine_draft(prompt, analysis, options)
-        async for ev in iter_refine_runtime_stream(
-            self,
-            prompt,
-            analysis,
-            options,
-            messages,
-            trace_id,
-            hcfg,
-            _tag,
-            entry_block=entry_block,
-            skip_draft=skip_draft,
+        async for ev in run_dag_runtime_stream(
+            self, prompt, mode, options, messages, trace_id, hcfg, prep, _tag
         ):
             yield ev
         return
-
 
     async def run(self, prompt: str, mode: str = "auto", options: Optional[Dict[str, Any]] = None, messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """与 SSE 共用 ``run_stream`` 运行时；同步响应仅对流事件聚合成最终 JSON。"""

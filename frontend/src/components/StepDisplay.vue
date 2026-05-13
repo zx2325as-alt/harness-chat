@@ -200,6 +200,7 @@ const STEP_LABELS = {
   complexity_analyze: "复杂度分析",
   track_select: "轨道选择",
   web_search: "联网搜索",
+  web_search_policy: "联网策略",
   fast_route: "快速轨路由",
   refine_layer1_draft: "初稿层",
   refine_draft: "初稿层",
@@ -219,6 +220,13 @@ const STEP_LABELS = {
   fast_answer_cache: "快轨 · 缓存命中",
   agent_refine_fallback: "Agent 迭代用尽 · 全链 Refine 兜底",
   agent_postprocess_bundle: "Agent 后处理（自检+润色）",
+  dag_runtime_plan: "DAG 规划",
+  dag_parallel_search: "DAG · 并行检索",
+  dag_draft: "DAG · 起草",
+  dag_parallel_critic: "DAG · 并行批评",
+  dag_repair: "DAG · 定点修复",
+  dag_verify: "DAG · 验证",
+  dag_finalize: "DAG · 终稿排版",
 };
 
 export default {
@@ -340,6 +348,7 @@ export default {
         track_select: "intake",
         web_search: "search",
         refine_entry_web_search: "search",
+        web_search_policy: "search",
         fast_route: "fast",
         fast_answer_cache: "fast",
         refine_disabled_fallback_fast: "fast",
@@ -363,6 +372,13 @@ export default {
         refine_runtime_verify: "refine",
         refine_runtime_finalize: "refine",
         review_web_search: "refine",
+        dag_runtime_plan: "intake",
+        dag_parallel_search: "search",
+        dag_draft: "refine",
+        dag_parallel_critic: "refine",
+        dag_repair: "polishing",
+        dag_verify: "refine",
+        dag_finalize: "polishing",
       };
       return table[n] || "other";
     },
@@ -482,7 +498,7 @@ export default {
     },
     trackLabel(t) {
       const z = String(t || "").toLowerCase();
-      const map = { fast: "快速轨", refine: "精化轨", agent: "Agent 轨", auto: "自动" };
+      const map = { fast: "快速轨", refine: "精化轨", agent: "Agent 轨", dag: "DAG Runtime", auto: "自动" };
       return map[z] || t || "—";
     },
     truncateOut(text) {

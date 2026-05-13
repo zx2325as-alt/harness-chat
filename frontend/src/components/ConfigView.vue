@@ -137,7 +137,7 @@
             </header>
             <div class="pipeline-step-body">
               <p class="step-blurb">
-                预判之后，系统按<strong>模板与默认模型池</strong>选出实际调用的模型；失败则沿列表降级。<strong>routing_tuning</strong> 仅在 <strong>auto</strong> 下生效：当预判置信度偏低且用户输入较长时，可把<strong>快轨升为精化轨</strong>，减少「过于草率」的回答。
+                预判之后，系统按<strong>模板与默认模型池</strong>选出实际调用的模型；失败则沿列表降级。当前<strong>执行主路径为 DAG Runtime</strong>，不再按置信度在 fast/refine/agent 之间<strong>互斥换轨</strong>；下方 <strong>routing_tuning</strong> 字段仅为<strong>兼容保留</strong>（后端暂不读取）。
               </p>
               <label class="field">
                 <span class="field-label">routing.default_model</span>
@@ -153,16 +153,16 @@
                 <span class="field-help">自上而下依次尝试，某一模型报错或不可用则换下一个，用于提高可用性与兜底。</span>
               </label>
               <div class="divider" />
-              <div class="cardTitle tight">routing_tuning（auto · 低置信度 guard）</div>
+              <div class="cardTitle tight">routing_tuning（兼容保留 · 当前 DAG 不生效）</div>
               <label class="field">
                 <span class="field-label">guard_threshold（0～1）</span>
                 <input v-model.number="routingTuning.confidence_track_guard_threshold" type="number" min="0" max="1" step="0.01" class="inp inp-fill" />
-                <span class="field-help">预判 <code>confidence</code> 低于该值时才考虑升轨。<strong>调高</strong>更容易从 fast 升到 refine（更稳、更慢）；<strong>调低</strong>则更倾向保留快轨。</span>
+                <span class="field-help">历史字段：曾为低置信度时从快轨升到精化轨。DAG 主路径<strong>不使用</strong>该阈值。</span>
               </label>
               <label class="field">
                 <span class="field-label">guard_min_prompt_chars</span>
                 <input v-model.number="routingTuning.confidence_track_guard_min_prompt_chars" type="number" min="0" max="2000" class="inp inp-fill" />
-                <span class="field-help">用户输入短于该字符数时不触发升轨，避免一句话闲聊被误判成「需要深奥推理」。</span>
+                <span class="field-help">历史字段：短输入不触发升轨。DAG 主路径<strong>不使用</strong>。</span>
               </label>
             </div>
           </article>
@@ -390,7 +390,7 @@
                 <span class="field-help">与预判给出的 complexity 联动；高档任务允许更多轮工具调用，但也更容易耗时。</span>
               </label>
               <div class="divider" />
-              <span class="field-help block">Agent 空转中止由「进度评估」主导（后端 evaluate_agent_progress），不再使用相邻轮次文本相似度守卫。</span>
+              <span class="field-help block">独立 Agent 循环已移除；下列 progress_eval 为<strong>兼容保留</strong>（DAG 主路径不调用进度评估模块）。</span>
               <label class="row-check">
                 <input v-model="agentTuning.progress_eval.enabled" type="checkbox" />
                 <span>progress_eval.enabled</span>
@@ -637,7 +637,7 @@ export default {
       const rf = h.search.relevance_filter;
       if (typeof rf.enabled !== "boolean") rf.enabled = true;
       if (!rf.sync_default_mode) rf.sync_default_mode = "quality_tracks";
-      if (!Array.isArray(rf.sync_tracks)) rf.sync_tracks = ["refine", "agent"];
+      if (!Array.isArray(rf.sync_tracks)) rf.sync_tracks = ["dag", "refine", "agent"];
 
       h.documents = h.documents || {};
       if (h.documents.bm25_weight == null) h.documents.bm25_weight = 0.55;

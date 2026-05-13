@@ -94,9 +94,8 @@ def _compact_documents_meta(documents: Any) -> List[Dict[str, Any]]:
 
 def apply_capability_planner(analysis: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Capability Planner：产出 capability_plan（能力与检索策略），作为首执轨道的主要输入。
-    首执轨道由 DualTrackHarness.resolve_initial_track_from_planner（读 capability_plan + mode）解析；
-    运行中真相源为 ExecutionState.current_track，可由质量闭环单调升级。
+    Capability Planner：产出 capability_plan（能力与检索策略），供 DAG Runtime 节点消费。
+    执行轨固定为 DAG；运行中真相源为 ExecutionState.current_track（与 options["_runtime_track"] 同步）。
     """
     cx = str(analysis.get("complexity") or "low").lower()
     if cx not in ("low", "medium", "high"):
@@ -147,7 +146,7 @@ def bootstrap_execution_state(
 
 
 def record_track_escalation(options: Dict[str, Any], from_track: str, to_track: str) -> bool:
-    """仅在严格升级（fast→refine→agent）时更新状态并计入 escalation_count。"""
+    """仅在严格升级（runtime_state.TRACK_RANK 秩上升）时更新状态并计入 escalation_count。"""
     ft = str(from_track).strip().lower()
     tt = str(to_track).strip().lower()
     if not is_strict_track_upgrade(ft, tt):

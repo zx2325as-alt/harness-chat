@@ -8,7 +8,7 @@ server:
     - "http://127.0.0.1:6008"
 
 harness:
-  # default: auto | fast | refine
+  # default: auto | dag | fast | refine | agent（执行统一 DAG；后者主要影响预判与意图信号）
   default_mode: "auto"
   # 非流式兜底与 Agent 直接输出时的字符切片；中文界面可略小于默认 96 以更顺滑
   stream_slice_chars: 72
@@ -19,18 +19,27 @@ harness:
     # 预判 JSON 损坏时追加一次「仅修 JSON」的短调用（质量优先）
     analyzer_json_repair: true
 
-  # 动态 Runtime（Stage 1+）：Fast 后置质量门、ExecutionState、Capability Planner 元数据
+  # DAG Runtime（默认主路径）：并行检索 + 并行批评 + 修复/验证/终稿
+  dag_runtime:
+    parallel_search_queries: 2
+    parallel_critics: true
+    layered_critics: true
+    parallel_drafts: true
+    hedge_draft_delay_ms: 0
+    max_repair_rounds: 2
+    agent_subgraph_enabled: false
+    # intent.tool_requirement 为真时插入 tool_capability_gate DAG 节点
+    tool_capability_gate_enabled: true
+
+  # 动态 Runtime：ExecutionState、Capability Planner、统一 Critic 阈值（DAG 内嵌调用）
   runtime_orchestrator:
     enabled: true
     max_escalations: 2
-    # 分阶段回滚开关（false 即关闭该能力；默认可全 true 一次性上线）
-    # auto：默认始终先 fast，由后置 critic 升级（follow_analyzer 则沿用 Analyzer / resolve_initial_track_from_planner 首轨建议）
-    auto_initial_track_policy: fast_first
+    # 保留字段：主路径已固定 DAG，此项无调度效果。
+    auto_initial_track_policy: dag_only
+    # 仅 unified_critic 被后端读取；其余旧 stage 键已移除。
     rollout_stages:
-      fast_quality_gate: true
       unified_critic: true
-      refine_critic_runtime: true
-      agent_progress_evaluator: true
     fast_quality_gate:
       enabled: true
       min_draft_chars: 48
@@ -48,7 +57,7 @@ harness:
       metrics_jsonl_path: "" # 可选：额外 JSONL 副本
       metrics_sqlite_path: data/runtime_metrics.sqlite # 默认 SQLite 观测库（相对 backend 目录）
 
-  # 路由守卫与低置信度随 suggested_track 的阈值（可微调「效果 vs 快轨」）
+  # 路由阈值（当前 DAG 主路径不读取；保留字段以免配置页 / 合并补丁报错）
   routing_tuning:
     confidence_track_guard_threshold: 0.52  # 降低阈值，减少不必要的升级
     confidence_track_guard_min_prompt_chars: 150  # 降低字符数要求
@@ -64,7 +73,7 @@ harness:
     # Refine L1→L2 过渡期的 content_reset 事件（前端可据此折叠草稿）；不想出现“清空再输出”可关
     emit_content_reset: true
 
-  # Agent：空转中止仅依赖 progress_eval（evaluate_agent_progress），不再使用文本相似度守卫
+  # Agent / progress_eval：配置块保留；DAG 主路径未再接独立 Agent 循环（亦无 evaluate_agent_progress 模块）。
   agent_tuning:
     progress_eval:
       enabled: true

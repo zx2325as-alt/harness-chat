@@ -149,9 +149,10 @@ import { isSendableComposerState } from "../chatShared.js";
 
 const MODE_OPTIONS = [
   { value: "auto", label: "自动" },
-  { value: "agent", label: "Agent轨" },
-  { value: "refine", label: "精化轨" },
-  { value: "fast", label: "快速轨" },
+  { value: "dag", label: "DAG Runtime" },
+  { value: "agent", label: "Agent轨(遗留)" },
+  { value: "refine", label: "精化轨(提示)" },
+  { value: "fast", label: "快速轨(提示)" },
 ];
 
 const SEARCH_OPTIONS = [
