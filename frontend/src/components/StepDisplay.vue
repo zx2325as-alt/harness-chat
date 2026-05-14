@@ -3,9 +3,9 @@
     <div v-if="runs.length" class="summary-bar">
       <span>{{ runs.length }} 轮对话</span>
       <span class="sep">·</span>
-      <span class="track-pill">{{ trackLabel(latestRun?.track) }}</span>
+      <span class="runtime-pill">{{ runtimeLabel(latestRun?.runtime) }}</span>
       <span class="sep">·</span>
-        <span>共 {{ latestRun ? displayStepsForRun(latestRun).length : 0 }} 步</span>
+      <span>共 {{ latestRun ? flatSteps(latestRun).length : 0 }} 步</span>
       <template v-if="latestRun?.phaseMessage">
         <span class="sep">·</span>
         <span class="phase-hint">{{ latestRun.phaseMessage }}</span>
@@ -31,8 +31,9 @@
             <div class="run-sub">{{ formatTime(run.createdAt) }} · {{ shortTrace(run.traceId) }}</div>
           </div>
           <div class="run-badges">
+            <span class="badge soft runtime">{{ runtimeLabel(run.runtime) }}</span>
             <span class="badge soft" :class="run.status">{{ statusText(run.status) }}</span>
-            <span class="badge outline">{{ displayStepsForRun(run).length || 0 }} 步</span>
+            <span class="badge outline">{{ flatSteps(run).length || 0 }} 步</span>
             <span class="chev">{{ isOpen(run, idx) ? "收起" : "展开" }}</span>
           </div>
         </button>
@@ -40,152 +41,70 @@
         <div v-if="isOpen(run, idx)" class="run-body">
           <div v-if="run.documents && run.documents.length" class="doc-line">
             文档：
-            <span v-for="d in run.documents" :key="d.name" class="doc-pill">{{ d.name }}</span>
+            <span v-for="doc in run.documents" :key="doc.name" class="doc-pill">{{ doc.name }}</span>
           </div>
 
           <div class="phases-col">
-            <section
-              v-for="ph in groupedPhases(run)"
-              :key="ph.key"
-              class="phase-card"
-            >
+            <section v-for="phase in groupedPhases(run)" :key="phase.key" class="phase-card">
               <div class="phase-head">
-                <span class="phase-title">{{ ph.title }}</span>
-                <span class="phase-count">{{ ph.steps.length }} 步</span>
-              </div>
-
-              <div v-if="ph.key === 'refine'" class="refine-pipeline" aria-hidden="true">
-                <span class="pipe-node" :class="refinePipeClass(ph.steps, 'draft')">初稿</span>
-                <span class="pipe-arrow">→</span>
-                <span class="pipe-node" :class="refinePipeClass(ph.steps, 'review')">审查</span>
-                <span class="pipe-arrow">→</span>
-                <span class="pipe-node" :class="refinePipeClass(ph.steps, 'polish')">润色</span>
-              </div>
-
-              <div v-if="ph.key === 'polishing'" class="polish-pipeline-hint" aria-hidden="true">
-                <span class="pipe-node" :class="polishPipeClass(ph.steps, 'self')">自检</span>
-                <span class="pipe-arrow">→</span>
-                <span class="pipe-node" :class="polishPipeClass(ph.steps, 'review')">审查</span>
-                <span class="pipe-arrow">→</span>
-                <span class="pipe-node" :class="polishPipeClass(ph.steps, 'polish')">润色</span>
+                <span class="phase-title">{{ phase.title }}</span>
+                <span class="phase-count">{{ phase.steps.length }} 步</span>
               </div>
 
               <div class="steps-col">
-                <template v-for="item in ph.steps" :key="`${ph.key}-${item.globalIdx}-${item.step.name}-${item.step.status}-${renderTick}-${(item.step.output || '').length}`">
-                  <div
-                    v-if="ph.key === 'reasoning' && narrativeReasoningLine(item.step)"
-                    class="narrative-row"
-                    :class="{
-                      think: item.step.name === 'agent_iteration',
-                      act: item.step.name === 'agent_web_search',
-                      start: item.step.name === 'agent_start',
-                    }"
-                  >
-                    <span class="nar-icon">{{ narrativeReasoningLine(item.step).icon }}</span>
-                    <div class="nar-body">
-                      <div class="nar-title">{{ narrativeReasoningLine(item.step).title }}</div>
-                      <div v-if="(item.step.meta || {}).event_summary" class="nar-sum">{{ (item.step.meta || {}).event_summary }}</div>
+                <details
+                  v-for="item in phase.steps"
+                  :key="`${run.id}-${item.globalIdx}-${item.step.name}-${item.step.status}-${renderTick}`"
+                  class="step-one"
+                  :open="stepFoldOpen(run, item.step, item.globalIdx)"
+                >
+                  <summary class="step-sum">
+                    <span class="sum-chev" aria-hidden="true">◇</span>
+                    <span class="sum-name">{{ stepName(item.step) }}</span>
+                    <span class="sum-st" :class="item.step.status">{{ statusShort(item.step.status) }}</span>
+                    <span v-if="item.step.provider" class="sum-meta">{{ item.step.provider }}</span>
+                    <span v-if="item.step.latency_ms != null" class="sum-meta">{{ item.step.latency_ms }}ms</span>
+                  </summary>
+
+                  <div class="step-inner">
+                    <p v-if="item.step.meta?.event_summary" class="event-summary">
+                      {{ item.step.meta.event_summary }}
+                    </p>
+
+                    <div v-if="workflowLines(item.step).length" class="flow-block">
+                      <div class="flow-h">技术细节</div>
+                      <ul class="flow-ul">
+                        <li v-for="(row, ri) in workflowLines(item.step)" :key="ri">
+                          <span class="flow-k">{{ row.label }}</span>
+                          <span class="flow-v">{{ row.text }}</span>
+                        </li>
+                      </ul>
                     </div>
+
+                    <div v-if="sourceList(item.step).length" class="src-block">
+                      <div class="src-h">引用链接</div>
+                      <ul class="src-ul">
+                        <li v-for="(src, si) in sourceList(item.step)" :key="si">
+                          <a :href="src.url" target="_blank" rel="noopener noreferrer" class="src-a">
+                            {{ src.title || src.url }}
+                          </a>
+                        </li>
+                      </ul>
+                    </div>
+
+                    <template v-if="item.step.input_preview">
+                      <div class="sec-h">输入摘要</div>
+                      <div class="sec-text sm">{{ item.step.input_preview }}</div>
+                    </template>
+
+                    <template v-if="item.step.output">
+                      <div class="sec-h">阶段产出</div>
+                      <div class="sec-text out">{{ truncateOut(item.step.output) }}</div>
+                    </template>
+
+                    <div v-if="item.step.error" class="err-line">{{ item.step.error }}</div>
                   </div>
-
-                  <details
-                    class="step-one"
-                    :class="{ 'nar-attached': ph.key === 'reasoning' && narrativeReasoningLine(item.step) }"
-                    :open="stepFoldOpen(run, item.step, item.globalIdx)"
-                  >
-                    <summary class="step-sum">
-                      <span class="sum-chev" aria-hidden="true">◇</span>
-                      <span class="sum-name">{{ humanStepName(item.step.name, item.step.meta) }}</span>
-                      <span class="sum-st" :class="item.step.status">{{ statusShort(item.step.status) }}</span>
-                      <span v-if="item.step.provider" class="sum-meta">{{ item.step.provider }}</span>
-                      <span v-if="item.step.latency_ms != null" class="sum-meta">{{ item.step.latency_ms }}ms</span>
-                      <span
-                        v-if="item.step.name === 'agent_postprocess_bundle' && (item.step.meta || {})._bundle_latency_sum_ms"
-                        class="sum-meta"
-                      >
-                        Σ {{ (item.step.meta || {})._bundle_latency_sum_ms }}ms
-                      </span>
-                    </summary>
-
-                    <div class="step-inner">
-                      <details
-                        v-if="item.step.name === 'agent_postprocess_bundle' && ((item.step.meta || {})._bundle_steps || []).length"
-                        class="bundle-substeps"
-                      >
-                        <summary>展开子步骤（耗时与状态）</summary>
-                        <ul class="bundle-ul">
-                          <li v-for="(bs, bi) in (item.step.meta || {})._bundle_steps || []" :key="bi" class="bundle-li">
-                            <span class="bundle-name">{{ humanStepName(bs.name, bs.meta) }}</span>
-                            <span class="bundle-st" :class="bs.status">{{ statusShort(bs.status) }}</span>
-                            <span v-if="bs.latency_ms != null" class="bundle-meta">{{ bs.latency_ms }}ms</span>
-                            <span v-if="bs.error" class="bundle-err">{{ bs.error }}</span>
-                          </li>
-                        </ul>
-                      </details>
-                      <p
-                        v-if="
-                          (item.step.meta || {}).event_summary &&
-                          !(ph.key === 'reasoning' && narrativeReasoningLine(item.step))
-                        "
-                        class="event-summary"
-                      >
-                        {{ (item.step.meta || {}).event_summary }}
-                      </p>
-
-                      <details
-                        v-if="item.step.name === 'agent_iteration' && (item.step.meta || {}).reply_preview"
-                        class="think-preview"
-                      >
-                        <summary>本轮模型输出摘录</summary>
-                        <div class="sec-text sm">{{ (item.step.meta || {}).reply_preview }}</div>
-                      </details>
-
-                      <button
-                        v-if="wantsTechToggle(item.step)"
-                        type="button"
-                        class="meta-toggle meta-toggle-first"
-                        @click.stop="toggleFullMeta(run.id, item.globalIdx)"
-                      >
-                        {{ fullMetaOpen(run.id, item.globalIdx) ? "收起技术细节" : "查看技术细节" }}
-                      </button>
-
-                      <div
-                        v-if="showWorkflowBlock(run, item.globalIdx, item.step)"
-                        class="flow-block"
-                      >
-                        <div class="flow-h">技术细节</div>
-                        <ul class="flow-ul">
-                          <li v-for="(row, wi) in workflowLines(item.step, run, item.globalIdx)" :key="wi">
-                            <span class="flow-k">{{ row.label }}</span>
-                            <span class="flow-v">{{ row.text }}</span>
-                          </li>
-                        </ul>
-                      </div>
-
-                      <div v-if="sourceList(item.step).length" class="src-block">
-                        <div class="src-h">引用链接</div>
-                        <ul class="src-ul">
-                          <li v-for="(src, si) in sourceList(item.step)" :key="si">
-                            <span class="src-n">[{{ src.index }}]</span>
-                            <a :href="src.url" target="_blank" rel="noopener noreferrer" class="src-a">{{ src.title || "打开" }}</a>
-                          </li>
-                        </ul>
-                      </div>
-
-                      <template v-if="item.step.input_preview">
-                        <div class="sec-h">输入摘要</div>
-                        <div class="sec-text sm">{{ item.step.input_preview }}</div>
-                      </template>
-
-                      <template v-if="item.step.output">
-                        <div class="sec-h">阶段产出（节选）</div>
-                        <div class="sec-text out">{{ truncateOut(item.step.output) }}</div>
-                      </template>
-
-                      <div v-if="item.step.error" class="err-line">{{ item.step.error }}</div>
-                    </div>
-                  </details>
-                </template>
+                </details>
               </div>
             </section>
           </div>
@@ -196,37 +115,19 @@
 </template>
 
 <script>
-const STEP_LABELS = {
-  complexity_analyze: "复杂度分析",
-  track_select: "轨道选择",
-  web_search: "联网搜索",
-  web_search_policy: "联网策略",
-  fast_route: "快速轨路由",
-  refine_layer1_draft: "初稿层",
-  refine_draft: "初稿层",
-  refine_layer2_review: "审查层",
-  refine_quality_review: "结构化审查",
-  refine_layer3_polish: "润色层",
-  refine_finalize: "终稿排版",
-  refine_disabled_fallback_fast: "精化关闭 · 降级快速轨",
-  review_web_search: "审查 · 联网核查",
-  refine_entry_web_search: "精化轨 · 入口轻量联网",
-  agent_start: "Agent 轨",
-  agent_iteration: "Agent 迭代",
-  agent_web_search: "Agent · 联网",
-  agent_plain_coerce_refine: "Agent · 纯文本强制精化",
-  agent_self_check: "Agent · 高复杂度自检",
-  agent_refine_answer: "Agent · Refine 润色",
-  fast_answer_cache: "快轨 · 缓存命中",
-  agent_refine_fallback: "Agent 迭代用尽 · 全链 Refine 兜底",
-  agent_postprocess_bundle: "Agent 后处理（自检+润色）",
-  dag_runtime_plan: "DAG 规划",
-  dag_parallel_search: "DAG · 并行检索",
-  dag_draft: "DAG · 起草",
-  dag_parallel_critic: "DAG · 并行批评",
-  dag_repair: "DAG · 定点修复",
-  dag_verify: "DAG · 验证",
-  dag_finalize: "DAG · 终稿排版",
+import { displayStepsForRun, humanStepName as humanRuntimeStepName, inferPhaseGroup } from "../thinkingFromRun.js";
+
+const PHASE_ORDER = ["intake", "search", "reasoning", "draft", "evaluate", "repair", "verify", "finalize", "other"];
+const PHASE_TITLES = {
+  intake: "分析与规划",
+  search: "检索与证据",
+  reasoning: "能力与工具",
+  draft: "起草",
+  evaluate: "评估",
+  repair: "修复",
+  verify: "验证",
+  finalize: "终稿",
+  other: "其他步骤",
 };
 
 export default {
@@ -237,37 +138,33 @@ export default {
   },
   data() {
     return {
-      /** 用户点击历史轮次时，只展开该 id；为空则按「最后一轮默认展开」规则 */
       manualOpenId: "",
-      /** 用户手动收起的轮次 id（解决：点「收起」清空 manualOpenId 后最后一轮又被强制展开） */
       collapsedRunIds: [],
       wallClock: 0,
       _clockId: null,
       stepsStickBottom: true,
-      showFullMetaSteps: {},
     };
   },
   computed: {
     latestRun() {
       void this.renderTick;
-      return this.runs && this.runs.length ? this.runs[this.runs.length - 1] : null;
+      return this.runs.length ? this.runs[this.runs.length - 1] : null;
     },
     runningElapsedSec() {
       void this.wallClock;
-      void this.renderTick;
-      const r = this.latestRun;
-      if (!r || r.status !== "running") return 0;
-      const t0 = new Date(r.createdAt || 0).getTime();
-      if (!t0) return 0;
-      return Math.max(0, Math.floor((Date.now() - t0) / 1000));
+      const run = this.latestRun;
+      if (!run || run.status !== "running") return 0;
+      const started = new Date(run.createdAt || 0).getTime();
+      if (!started) return 0;
+      return Math.max(0, Math.floor((Date.now() - started) / 1000));
     },
   },
   watch: {
-    runs(newRuns, oldRuns) {
-      if ((newRuns?.length || 0) !== (oldRuns?.length || 0)) {
+    runs(nextRuns, oldRuns) {
+      if ((nextRuns?.length || 0) !== (oldRuns?.length || 0)) {
         this.manualOpenId = "";
-        const ids = new Set((newRuns || []).map((r) => r.id));
-        this.collapsedRunIds = (this.collapsedRunIds || []).filter((id) => ids.has(id));
+        const ids = new Set((nextRuns || []).map((run) => run.id));
+        this.collapsedRunIds = this.collapsedRunIds.filter((id) => ids.has(id));
       }
       this.$nextTick(() => this.maybeScrollStepsToBottom());
     },
@@ -277,250 +174,63 @@ export default {
   },
   mounted() {
     this._clockId = setInterval(() => {
-      if (this.runs && this.runs.some((r) => r.status === "running")) this.wallClock++;
+      if (this.runs.some((run) => run.status === "running")) {
+        this.wallClock += 1;
+      }
     }, 1000);
-    const el = this.$refs.stepsList;
-    if (el) el.addEventListener("scroll", this.onStepsScroll, { passive: true });
+    const list = this.$refs.stepsList;
+    if (list) list.addEventListener("scroll", this.onStepsScroll, { passive: true });
   },
   beforeUnmount() {
     if (this._clockId) clearInterval(this._clockId);
-    const el = this.$refs.stepsList;
-    if (el) el.removeEventListener("scroll", this.onStepsScroll);
+    const list = this.$refs.stepsList;
+    if (list) list.removeEventListener("scroll", this.onStepsScroll);
   },
   methods: {
-    fullMetaKey(runId, stepIdx) {
-      return `${runId || "x"}:${stepIdx}`;
+    runtimeLabel(runtime) {
+      const value = String(runtime || "").trim().toLowerCase();
+      if (!value || value === "adaptive_dag_v3") return "Adaptive DAG Runtime";
+      return runtime;
     },
-    fullMetaOpen(runId, stepIdx) {
-      return !!this.showFullMetaSteps[this.fullMetaKey(runId, stepIdx)];
-    },
-    toggleFullMeta(runId, stepIdx) {
-      const k = this.fullMetaKey(runId, stepIdx);
-      this.showFullMetaSteps = { ...this.showFullMetaSteps, [k]: !this.showFullMetaSteps[k] };
-    },
-    displayStepsForRun(run) {
-      const steps = run?.steps || [];
-      if (!steps.length) return [];
-      const bundle = new Set(["agent_plain_coerce_refine", "agent_self_check", "agent_refine_answer"]);
-      const out = [];
-      let i = 0;
-      while (i < steps.length) {
-        const s = steps[i];
-        if (bundle.has(s.name)) {
-          let j = i;
-          while (j < steps.length && bundle.has(steps[j].name)) j++;
-          const chunk = steps.slice(i, j);
-          const running = chunk.some((x) => x.status === "running");
-          const err = chunk.some((x) => x.status === "error");
-          const st = running ? "running" : err ? "error" : "ok";
-          const last = chunk[chunk.length - 1];
-          const latSum = chunk.reduce((acc, x) => acc + (x.latency_ms || 0), 0);
-          out.push({
-            name: "agent_postprocess_bundle",
-            status: st,
-            meta: {
-              phase_group: "polishing",
-              event_summary: "后处理：自检 → 审查 → 润色（合并为一步展示）",
-              _bundle_members: chunk.map((c) => c.name).join(" → "),
-              _bundle_steps: chunk.map((c) => ({ ...c })),
-              _bundle_latency_sum_ms: latSum || null,
-            },
-            model: last?.model,
-            provider: last?.provider,
-            latency_ms: last?.latency_ms,
-            output: null,
-            error: err ? (chunk.find((x) => x.status === "error") || {}).error : null,
-          });
-          i = j;
-          continue;
-        }
-        out.push(s);
-        i++;
-      }
-      return out;
-    },
-    inferPhaseGroup(step) {
-      const m = (step && step.meta) || {};
-      if (m.phase_group) return String(m.phase_group);
-      const n = (step && step.name) || "";
-      const table = {
-        complexity_analyze: "intake",
-        track_select: "intake",
-        web_search: "search",
-        refine_entry_web_search: "search",
-        web_search_policy: "search",
-        fast_route: "fast",
-        fast_answer_cache: "fast",
-        refine_disabled_fallback_fast: "fast",
-        agent_start: "reasoning",
-        agent_iteration: "reasoning",
-        agent_web_search: "reasoning",
-        agent_refine_fallback: "polishing",
-        agent_plain_coerce_refine: "polishing",
-        agent_self_check: "polishing",
-        agent_refine_answer: "polishing",
-        agent_postprocess_bundle: "polishing",
-        refine_layer1_draft: "refine",
-        refine_draft: "refine",
-        refine_layer2_review: "refine",
-        refine_quality_review: "refine",
-        refine_layer3_polish: "refine",
-        refine_finalize: "refine",
-        refine_runtime_generate: "refine",
-        refine_runtime_critic: "refine",
-        refine_runtime_repair: "refine",
-        refine_runtime_verify: "refine",
-        refine_runtime_finalize: "refine",
-        review_web_search: "refine",
-        dag_runtime_plan: "intake",
-        dag_parallel_search: "search",
-        dag_draft: "refine",
-        dag_parallel_critic: "refine",
-        dag_repair: "polishing",
-        dag_verify: "refine",
-        dag_finalize: "polishing",
-      };
-      return table[n] || "other";
+    flatSteps(run) {
+      return displayStepsForRun(run);
     },
     groupedPhases(run) {
-      const order = ["intake", "search", "fast", "reasoning", "refine", "polishing", "other"];
-      const titles = {
-        intake: "分析与调度",
-        search: "联网检索",
-        fast: "快速生成",
-        reasoning: "Agent 推理循环",
-        refine: "精化流水线",
-        polishing: "精化与输出",
-        other: "其他步骤",
-      };
-      const flat = this.displayStepsForRun(run);
-      const buckets = {};
-      order.forEach((k) => {
-        buckets[k] = [];
+      const buckets = Object.fromEntries(PHASE_ORDER.map((key) => [key, []]));
+      this.flatSteps(run).forEach((step, globalIdx) => {
+        const phase = inferPhaseGroup(step);
+        const key = buckets[phase] ? phase : "other";
+        buckets[key].push({ step, globalIdx });
       });
-      flat.forEach((step, globalIdx) => {
-        const g = this.inferPhaseGroup(step);
-        const k = buckets[g] !== undefined ? g : "other";
-        buckets[k].push({ step, globalIdx });
-      });
-      return order.filter((k) => buckets[k].length).map((k) => ({ key: k, title: titles[k], steps: buckets[k] }));
+      return PHASE_ORDER.filter((key) => buckets[key].length).map((key) => ({
+        key,
+        title: PHASE_TITLES[key] || key,
+        steps: buckets[key],
+      }));
     },
-    _flattenStepsForPipe(stepsWrap) {
-      const flat = [];
-      (stepsWrap || []).forEach((w) => {
-        const s = w.step;
-        if (!s) return;
-        flat.push(s);
-        const inner = (s.meta && s.meta._bundle_steps) || [];
-        inner.forEach((sub) => flat.push(sub));
-      });
-      return flat;
-    },
-    polishPipeClass(stepsWrap, role) {
-      const steps = this._flattenStepsForPipe(stepsWrap);
-      const pick = (name) => steps.find((s) => s.name === name);
-      if (role === "self") {
-        const sc = pick("agent_self_check");
-        if (sc) {
-          if (sc.status === "running") return "run";
-          if (sc.status === "error") return "err";
-          return "ok";
-        }
-        const b = pick("agent_postprocess_bundle");
-        const bm = (b && b.meta && b.meta._bundle_members) || "";
-        if (bm.includes("agent_self_check")) return "ok";
-        return "idle";
-      }
-      if (role === "review") {
-        const s = pick("refine_runtime_critic") || pick("refine_quality_review") || pick("refine_layer2_review");
-        if (!s) return "idle";
-        if (s.status === "running") return "run";
-        if (s.status === "error") return "err";
-        return "ok";
-      }
-      const s = pick("refine_runtime_finalize") || pick("refine_finalize") || pick("refine_layer3_polish");
-      if (!s) return "idle";
-      if (s.status === "running") return "run";
-      if (s.status === "error") return "err";
-      return "ok";
-    },
-    refinePipeClass(stepsWrap, layer) {
-      const steps = this._flattenStepsForPipe(stepsWrap);
-      const pick = (name) => steps.find((s) => s.name === name);
-      if (layer === "draft") {
-        const s = pick("refine_runtime_generate") || pick("refine_draft") || pick("refine_layer1_draft");
-        if (!s) return "idle";
-        if (s.status === "running") return "run";
-        if (s.status === "error") return "err";
-        return "ok";
-      }
-      if (layer === "review") {
-        const s = pick("refine_runtime_critic") || pick("refine_quality_review") || pick("refine_layer2_review");
-        if (!s) return "idle";
-        if (s.status === "running") return "run";
-        if (s.status === "error") return "err";
-        return "ok";
-      }
-      const s = pick("refine_runtime_finalize") || pick("refine_finalize") || pick("refine_layer3_polish");
-      if (!s) return "idle";
-      if (s.status === "running") return "run";
-      if (s.status === "error") return "err";
-      return "ok";
-    },
-    narrativeReasoningLine(step) {
-      if (!step) return null;
-      if (step.name === "agent_start") return { icon: "▶", title: "Agent 启动" };
-      if (step.name === "agent_iteration") return { icon: "🤔", title: "思考" };
-      if (step.name === "agent_web_search") return { icon: "🔍", title: "行动 · 联网检索" };
-      return null;
-    },
-    wantsTechToggle(step) {
-      return !!(step && step.meta && step.meta.event_summary);
-    },
-    showWorkflowBlock(run, globalIdx, step) {
-      const rows = this.workflowLines(step, run, globalIdx);
-      if (!rows.length) return false;
-      if (this.wantsTechToggle(step) && !this.fullMetaOpen(run.id, globalIdx)) return false;
-      return true;
+    stepName(step) {
+      return humanRuntimeStepName(step?.name, step?.meta || {});
     },
     onStepsScroll() {
-      const el = this.$refs.stepsList;
-      if (!el) return;
-      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
-      this.stepsStickBottom = nearBottom;
+      const list = this.$refs.stepsList;
+      if (!list) return;
+      this.stepsStickBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 48;
     },
     maybeScrollStepsToBottom() {
       if (!this.stepsStickBottom) return;
       this.$nextTick(() => {
-        const el = this.$refs.stepsList;
-        if (el) el.scrollTop = el.scrollHeight;
+        const list = this.$refs.stepsList;
+        if (list) list.scrollTop = list.scrollHeight;
       });
-    },
-    trackLabel(t) {
-      const z = String(t || "").toLowerCase();
-      const map = { fast: "快速轨", refine: "精化轨", agent: "Agent 轨", dag: "DAG Runtime", auto: "自动" };
-      return map[z] || t || "—";
     },
     truncateOut(text) {
       if (!text || typeof text !== "string") return "";
-      const max = 4000;
-      const t = text.trim();
-      return t.length <= max ? t : `${t.slice(0, max)}\n…（以下省略）`;
+      const trimmed = text.trim();
+      return trimmed.length <= 4000 ? trimmed : `${trimmed.slice(0, 4000)}\n…（以下省略）`;
     },
-    humanStepName(name, meta) {
-      const m = meta || {};
-      const base = STEP_LABELS[name] || name || "步骤";
-      if (name === "review_web_search" && m.review_round != null) {
-        return `${base} · 第${m.review_round}轮`;
-      }
-      if (name === "agent_iteration" && m.i != null && m.max != null) {
-        return `${base} · ${m.i}/${m.max}`;
-      }
-      return base;
-    },
-    shortTrace(t) {
-      if (!t) return "trace …";
-      return t.length > 18 ? `${t.slice(0, 14)}…` : t;
+    shortTrace(traceId) {
+      if (!traceId) return "trace …";
+      return traceId.length > 18 ? `${traceId.slice(0, 14)}…` : traceId;
     },
     isOpen(run, idx) {
       if (this.manualOpenId) return this.manualOpenId === run.id;
@@ -542,12 +252,10 @@ export default {
         return;
       }
       if (lastId && run.id === lastId) {
-        const i = this.collapsedRunIds.indexOf(run.id);
-        if (i >= 0) {
-          this.collapsedRunIds = this.collapsedRunIds.filter((id) => id !== run.id);
-        } else {
-          this.collapsedRunIds = [...this.collapsedRunIds, run.id];
-        }
+        const exists = this.collapsedRunIds.includes(run.id);
+        this.collapsedRunIds = exists
+          ? this.collapsedRunIds.filter((id) => id !== run.id)
+          : [...this.collapsedRunIds, run.id];
         return;
       }
       this.manualOpenId = run.id;
@@ -559,11 +267,11 @@ export default {
       if (status === "skipped") return "已跳过";
       return "进行中";
     },
-    statusShort(st) {
-      if (st === "ok") return "完成";
-      if (st === "error") return "失败";
-      if (st === "running") return "进行中";
-      if (st === "skipped") return "跳过";
+    statusShort(status) {
+      if (status === "ok") return "完成";
+      if (status === "error") return "失败";
+      if (status === "running") return "进行中";
+      if (status === "skipped") return "跳过";
       return "⋯";
     },
     formatTime(value) {
@@ -575,238 +283,132 @@ export default {
       }
     },
     sourceList(step) {
-      const m = step?.meta;
-      if (!m || !Array.isArray(m.sources)) return [];
-      return m.sources.filter((x) => x && (x.url || x.title));
+      const sources = step?.meta?.sources;
+      return Array.isArray(sources) ? sources.filter((src) => src && (src.url || src.title)) : [];
     },
-    _fmtDecision(d) {
-      if (d === undefined || d === null || d === "") return "";
-      const x = String(d).toLowerCase();
-      if (x === "fast") return "倾向快速单段答复";
-      if (x === "refine") return "倾向精化（草稿→审查→润色）";
-      return String(d);
-    },
-    _fmtMode(mode) {
-      const z = String(mode || "").toLowerCase();
-      const map = { auto: "自动", fast: "快速轨", refine: "精化轨", agent: "Agent 轨" };
-      return map[z] || mode || "";
-    },
-    _fmtTaskType(tt) {
-      const z = String(tt || "").toLowerCase();
-      const map = {
-        reasoning: "推理类（可走 Agent 轨）",
-        generation: "生成类（倾向精化轨）",
-        conversation: "对话类（倾向快速轨）",
-      };
-      return map[z] || tt || "";
-    },
-    _line(rows, label, text) {
-      if (text === undefined || text === null) return;
-      let s = text;
-      if (typeof text === "boolean") s = text ? "是" : "否";
-      else if (typeof text === "number") s = String(text);
-      else if (typeof text === "string") {
-        s = text.trim();
-        if (!s) return;
-      } else return;
-      rows.push({ label, text: s });
-    },
-    _briefModels(obj) {
-      if (!obj || typeof obj !== "object") return "";
-      try {
-        return Object.entries(obj)
-          .map(([k, v]) => {
-            const arr = Array.isArray(v) ? v : [v];
-            return `${k}：${arr.filter(Boolean).slice(0, 3).join("、")}`;
-          })
-          .join("；");
-      } catch {
-        return "";
-      }
-    },
-    workflowLines(step, run = null, stepIdx = -1) {
+    workflowLines(step) {
+      const meta = step?.meta && typeof step.meta === "object" ? step.meta : {};
       const rows = [];
-      const m = step.meta && typeof step.meta === "object" ? step.meta : {};
-      const name = step.name || "";
-      const fk = run && stepIdx >= 0 ? this.fullMetaKey(run.id, stepIdx) : "";
-      const showAllComplexity = fk && this.showFullMetaSteps[fk];
+      const add = (label, value) => {
+        if (value === undefined || value === null || value === "") return;
+        rows.push({ label, text: this.formatMetaValue(value) });
+      };
 
-      switch (name) {
-        case "complexity_analyze": {
-          this._line(rows, "调度结论", this._fmtDecision(m.decision));
-          const tt = [this._fmtTaskType(m.task_type) || m.task_type, m.type].filter(Boolean).join(" · ");
-          if (tt) this._line(rows, "任务 / 归类", tt);
-          this._line(rows, "复杂度", m.complexity);
-          const rs =
-            m.reason ||
-            (Array.isArray(m.reasons) && m.reasons.length ? m.reasons.join("；") : "") ||
-            (m.analyzer_timed_out ? "预判超时，已按规则降级" : "");
-          if (rs) this._line(rows, "判定摘要", rs);
-          if (m.search_required === true) this._line(rows, "检索策略", "倾向补充实时信息");
-          else if (m.search_required === false) this._line(rows, "检索策略", "未强制检索");
-          if (showAllComplexity) {
-            if (m.search_query) this._line(rows, "检索要点建议", m.search_query);
-            if (m.selected_model || (Array.isArray(m.fallback_models) && m.fallback_models.length)) {
-              const pool = [m.selected_model, ...(Array.isArray(m.fallback_models) ? m.fallback_models : [])]
-                .filter(Boolean)
-                .join(" → ");
-              if (pool) this._line(rows, "模型池", pool);
-            }
-            if (Array.isArray(m.manual_hits) && m.manual_hits.length) {
-              this._line(rows, "快捷触发", m.manual_hits.join("、"));
-            }
-            if (m.refine_models && typeof m.refine_models === "object") {
-              const b = this._briefModels(m.refine_models);
-              if (b) this._line(rows, "精化各层模型", b);
-            }
-          }
-          break;
-        }
-        case "agent_self_check": {
-          if (m.chars != null) this._line(rows, "自检输出", `约 ${m.chars} 字`);
-          if (m.phase) this._line(rows, "环节", m.phase);
-          break;
-        }
-        case "fast_answer_cache": {
-          if (m.chars != null) this._line(rows, "缓存答案", `约 ${m.chars} 字`);
-          if (m.note) this._line(rows, "说明", m.note);
-          break;
-        }
-        case "agent_postprocess_bundle": {
-          if (m._bundle_members) this._line(rows, "合并子步骤", m._bundle_members);
-          if (m._bundle_latency_sum_ms != null) this._line(rows, "子步骤耗时合计", `${m._bundle_latency_sum_ms}ms`);
-          break;
-        }
-        case "track_select":
-          this._line(rows, "请求模式", this._fmtMode(m.mode));
-          this._line(rows, "选用轨道", this.trackLabel(m.track));
-          this._line(rows, "任务类型", this._fmtTaskType(m.task_type) || m.task_type || "—");
-          if (m.complexity) this._line(rows, "复杂度标签", m.complexity);
-          if (m.decision) this._line(rows, "预判调度", this._fmtDecision(m.decision));
-          if (m.search_required === true) this._line(rows, "实时信息", "预判：需要检索补充");
-          else if (m.search_required === false) this._line(rows, "实时信息", "预判：未强制检索");
-          if (m.intended_track && m.intended_track !== m.track) {
-            this._line(rows, "原计划轨道", this.trackLabel(m.intended_track));
-          }
-          if (m.agent_disabled_fallback) this._line(rows, "说明", "Agent 未启用，已改用精化轨");
-          break;
-        case "agent_start":
-          if (m.phase) this._line(rows, "初始化", m.phase);
-          if (m.model) this._line(rows, "主模型", m.model);
-          if (m.max_iterations != null) this._line(rows, "迭代上限", `${m.max_iterations} 轮`);
-          if (m.thread_turns != null) this._line(rows, "上下文带入轮次", String(m.thread_turns));
-          break;
-        case "agent_iteration":
-          if (m.phase) this._line(rows, "阶段", m.phase);
-          if (m.i != null && m.max != null) this._line(rows, "进度", `第 ${m.i} / ${m.max} 轮`);
-          if (m.model) this._line(rows, "模型", m.model);
-          if (m.branch_next) this._line(rows, "下一步", m.branch_next);
-          if (m.reply_preview) this._line(rows, "本轮模型输出摘录", m.reply_preview);
-          if (m.reply_chars != null) this._line(rows, "输出长度", `${m.reply_chars} 字符`);
-          break;
-        case "agent_web_search":
-          this._line(rows, "查询词", m.query);
-          if (m.from === "agent") this._line(rows, "触发方式", "Agent JSON：{\"action\":\"web_search\",...}");
-          if (Array.isArray(m.sources)) this._line(rows, "返回条目", String(m.sources.length));
-          break;
-        case "fast_route":
-          this._line(rows, "路由策略", m.rule || "按分析结果选择模型");
-          if (Array.isArray(m.candidates) && m.candidates.length) {
-            this._line(rows, "候选顺序", m.candidates.join(" → "));
-          }
-          this._line(rows, "首选模型", m.selected);
-          break;
-        case "web_search":
-          this._line(rows, "检索查询", m.query_effective || m.query);
-          this._line(rows, "触发原因", m.reason);
-          if (m.result_count != null) this._line(rows, "命中条数", m.result_count);
-          if (m.degraded) this._line(rows, "检索状态", "部分降级");
-          if (m.failure_code) this._line(rows, "失败码", m.failure_code);
-          break;
-        case "review_web_search":
-          if (m.phase) this._line(rows, "环节", m.phase);
-          if (m.review_round != null) this._line(rows, "轮次", `第 ${m.review_round} 轮`);
-          this._line(rows, "查询", m.query);
-          if (m.result_count != null) this._line(rows, "命中条数", m.result_count);
-          if (m.agent_tool === "refine_answer") this._line(rows, "来源", "Agent 工具 refine_answer");
-          if (m.agent_fallback) this._line(rows, "来源", "Agent 迭代兜底");
-          break;
-        case "refine_layer1_draft":
-        case "refine_draft":
-        case "refine_layer2_review":
-        case "refine_quality_review":
-        case "refine_layer3_polish":
-        case "refine_finalize":
-          if (m.phase) this._line(rows, "环节", m.phase);
-          if (Array.isArray(m.candidates)) this._line(rows, "候选模型", m.candidates.join("、"));
-          if (Array.isArray(m.attempts)) this._line(rows, "尝试次数", m.attempts.length);
-          if (m.from_agent) this._line(rows, "链路", "Agent Refine 流水线");
-          if (m.review_search_loops != null) this._line(rows, "审查联网轮次", m.review_search_loops);
-          if (m.reason) this._line(rows, "说明", m.reason);
-          break;
-        default:
-          if (name.startsWith("agent_")) {
-            if (m.query) this._line(rows, "查询词", m.query);
-            if (m.reason === "max_iterations_exhausted") this._line(rows, "触发原因", "已达最大迭代次数");
-            if (m.same_pipeline_as) this._line(rows, "对齐流水线", String(m.same_pipeline_as));
-          }
-          this._appendGenericMetaLines(m, rows);
-          break;
+      if (step?.name === "complexity_analyze") {
+        add("复杂度", meta.complexity);
+        add("任务类型", meta.task_type);
+        add("意图归类", meta.type);
+        if (meta.search_required === true) add("需要联网", "是");
+        if (meta.search_required === false) add("需要联网", "否");
+        add("检索查询", meta.search_query);
+        add("时效提示", meta.freshness_hint);
+        add("置信度", meta.confidence);
+        add("首选模型", meta.selected_model);
+        add("回退模型", Array.isArray(meta.fallback_models) ? meta.fallback_models.join(" → ") : "");
+        return rows;
       }
 
-      if (!rows.some((r) => r.label === "模型") && step.model) this._line(rows, "模型", step.model);
-      if (!rows.some((r) => r.label === "接入") && step.provider) this._line(rows, "接入", step.provider);
+      if (step?.name === "dag_runtime_plan") {
+        add("架构", meta.architecture);
+        add("调度器", meta.scheduler);
+        const plan = meta.plan && typeof meta.plan === "object" ? meta.plan : {};
+        add("并行检索", plan.parallel_search_queries);
+        add("并行评估", plan.parallel_critics);
+        add("分层评估", plan.layered_critics);
+        add("并行起草", plan.parallel_drafts);
+        add("最大修复轮次", plan.max_repair_rounds);
+        add("工具能力门", plan.tool_capability_gate);
+        add("目标子图", plan.goal_subgraph);
+        if (Array.isArray(plan.planned_nodes) && plan.planned_nodes.length) {
+          add("计划节点", `${plan.planned_nodes.length} 个`);
+        }
+        return rows;
+      }
 
+      if (step?.name === "web_search" || step?.name === "dag_parallel_search") {
+        add("检索查询", meta.query_effective || meta.query);
+        add("提供方", meta.provider_used || meta.provider || step.provider);
+        add("命中条数", meta.result_count != null ? meta.result_count : this.sourceList(step).length);
+        add("降级执行", meta.degraded);
+        add("失败码", meta.failure_code);
+      } else if (step?.name === "dag_tool_capability_gate") {
+        add("能力", meta.capability);
+      } else if (step?.name === "goal_capability_gate") {
+        add("目标已解决", meta.goals_resolved);
+        add("证据充分", meta.evidence_sufficient);
+        add("阻塞", meta.blocked);
+      } else if (step?.name === "dag_parallel_critic") {
+        add("轮次", meta.round);
+        add("评估模式", meta.gather_mode);
+      } else if (step?.name === "dag_repair") {
+        add("轮次", meta.round);
+        add("跳过修复", meta.skipped);
+        add("已回滚保护", meta.guard_reverted);
+      } else if (step?.name === "dag_verify") {
+        add("推荐动作", meta.unified_critic?.recommended_action);
+      }
+
+      const genericRows = this.genericMetaRows(meta);
+      genericRows.forEach((row) => {
+        if (!rows.some((item) => item.label === row.label && item.text === row.text)) rows.push(row);
+      });
       return rows;
     },
-    _appendGenericMetaLines(m, rows) {
+    genericMetaRows(meta) {
+      const rows = [];
       const skip = new Set([
         "sources",
-        "raw_llm_response",
-        "hits",
-        "results_preview",
-        "attempts",
-        "refine_models",
-        "fallback_models",
-        "next_move",
+        "event_summary",
+        "runtime_intent",
+        "dynamic_plan",
+        "plan",
+        "unified_critic",
+        "query_effective",
       ]);
-      const labels = {
+      Object.entries(meta || {}).forEach(([key, value]) => {
+        if (skip.has(key)) return;
+        if (value === undefined || value === null || value === "") return;
+        if (typeof value === "object" && !Array.isArray(value)) return;
+        rows.push({ label: this.metaLabel(key), text: this.formatMetaValue(value) });
+      });
+      return rows;
+    },
+    metaLabel(key) {
+      const map = {
+        phase_group: "阶段",
         query: "查询",
-        query_effective: "生效查询",
-        reason: "原因",
-        track: "轨道",
-        mode: "模式",
-        task_type: "任务类型",
-        meta: "附加",
-        model: "模型",
-        max_iterations: "最大迭代轮次",
+        provider: "提供方",
+        provider_used: "提供方",
         result_count: "命中条数",
-        branch_next: "下一步",
-        reply_preview: "输出摘录",
-        next_move: "分支",
-        phase: "阶段",
-        thread_turns: "对话轮次",
+        round: "轮次",
+        architecture: "架构",
+        scheduler: "调度器",
+        capability: "能力",
+        blocked: "阻塞",
+        goals_resolved: "目标已解决",
+        evidence_sufficient: "证据充分",
       };
-      const have = new Set(rows.map((r) => r.label));
-      for (const [k, v] of Object.entries(m)) {
-        if (skip.has(k)) continue;
-        if (v === null || v === undefined || v === "") continue;
-        const lab = labels[k] || k;
-        if (have.has(lab)) continue;
-        if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
-          this._line(rows, lab, v);
-          have.add(lab);
-        }
+      return map[key] || key;
+    },
+    formatMetaValue(value) {
+      if (value === true) return "是";
+      if (value === false) return "否";
+      if (Array.isArray(value)) {
+        return value.map((item) => this.formatMetaValue(item)).join("、");
       }
+      if (typeof value === "object") {
+        return JSON.stringify(value);
+      }
+      return String(value);
     },
     stepFoldOpen(run, step, globalIdx) {
       void this.renderTick;
       if (step.status === "running" || step.status === "error") return true;
-      const runIdx = this.runs.findIndex((r) => r.id === run.id);
-      const isLatestCard = runIdx >= 0 && runIdx === this.runs.length - 1;
-      if (!isLatestCard) return false;
-      const disp = this.displayStepsForRun(run);
-      return globalIdx === (disp.length || 0) - 1;
+      const runIdx = this.runs.findIndex((item) => item.id === run.id);
+      const isLatest = runIdx >= 0 && runIdx === this.runs.length - 1;
+      if (!isLatest) return false;
+      const steps = this.flatSteps(run);
+      return globalIdx === steps.length - 1;
     },
   },
 };
@@ -836,17 +438,16 @@ export default {
 .sep {
   opacity: 0.45;
 }
-.track-pill {
+.runtime-pill {
   padding: 2px 8px;
   border-radius: 6px;
   background: rgba(99, 102, 241, 0.2);
-  color: #a5b4fc;
+  color: #c7d2fe;
   font-weight: 600;
 }
 .phase-hint {
   color: #e2e8f0;
   font-weight: 500;
-  max-width: 100%;
 }
 .list {
   padding: 10px 12px 16px;
@@ -894,7 +495,6 @@ export default {
   font-weight: 600;
   color: #f1f5f9;
   overflow-wrap: anywhere;
-  word-break: break-word;
 }
 .run-sub {
   margin-top: 4px;
@@ -906,6 +506,8 @@ export default {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .badge {
   font-size: 11px;
@@ -915,6 +517,9 @@ export default {
 .badge.soft {
   background: #2f3a4d;
   color: #cbd5e1;
+}
+.badge.soft.runtime {
+  color: #c7d2fe;
 }
 .badge.soft.running {
   background: rgba(99, 102, 241, 0.22);
@@ -936,7 +541,6 @@ export default {
 }
 .run-body {
   padding: 0 10px 14px;
-  overflow: visible;
 }
 .doc-line {
   font-size: 12px;
@@ -975,162 +579,10 @@ export default {
   font-size: 12px;
   font-weight: 700;
   color: #e2e8f0;
-  letter-spacing: 0.02em;
 }
 .phase-count {
   font-size: 11px;
   color: #64748b;
-}
-.refine-pipeline,
-.polish-pipeline-hint {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px 4px;
-  margin: 0 0 10px 4px;
-  font-size: 11px;
-}
-.pipe-arrow {
-  color: #475569;
-}
-.pipe-node {
-  padding: 3px 10px;
-  border-radius: 999px;
-  border: 1px solid #3d4d64;
-  color: #94a3b8;
-  background: #1a1f2b;
-}
-.pipe-node.soft {
-  border-style: dashed;
-  opacity: 0.92;
-}
-.pipe-node.ok {
-  border-color: rgba(52, 211, 153, 0.45);
-  color: #6ee7b7;
-}
-.pipe-node.run {
-  border-color: rgba(129, 140, 248, 0.55);
-  color: #c7d2fe;
-}
-.pipe-node.err {
-  border-color: rgba(248, 113, 113, 0.45);
-  color: #fca5a5;
-}
-.pipe-node.idle {
-  opacity: 0.55;
-}
-.narrative-row {
-  display: flex;
-  gap: 10px;
-  align-items: flex-start;
-  padding: 8px 10px;
-  margin-bottom: 4px;
-  border-radius: 8px;
-  background: rgba(99, 102, 241, 0.06);
-  border: 1px solid rgba(99, 102, 241, 0.12);
-}
-.narrative-row.start {
-  background: rgba(14, 165, 233, 0.06);
-  border-color: rgba(14, 165, 233, 0.15);
-}
-.narrative-row.act {
-  background: rgba(245, 158, 11, 0.06);
-  border-color: rgba(245, 158, 11, 0.14);
-}
-.nar-icon {
-  font-size: 16px;
-  line-height: 1.2;
-  flex-shrink: 0;
-}
-.nar-body {
-  min-width: 0;
-  flex: 1;
-}
-.nar-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: #cbd5e1;
-}
-.nar-sum {
-  margin-top: 4px;
-  font-size: 12px;
-  color: #94a3b8;
-  line-height: 1.45;
-  overflow-wrap: anywhere;
-}
-.step-one.nar-attached {
-  margin-top: -2px;
-}
-.event-summary {
-  margin: 0 0 10px;
-  font-size: 12px;
-  line-height: 1.5;
-  color: #e2e8f0;
-  overflow-wrap: anywhere;
-}
-.think-preview {
-  margin-bottom: 10px;
-  border-radius: 8px;
-  border: 1px solid #2f3a4d;
-  background: #1a1f2b;
-  padding: 6px 10px;
-  font-size: 12px;
-  color: #94a3b8;
-}
-.think-preview > summary {
-  cursor: pointer;
-  font-weight: 600;
-  color: #a5b4fc;
-}
-.bundle-substeps {
-  margin-bottom: 10px;
-  border-radius: 8px;
-  border: 1px solid #2f3a4d;
-  background: #1a1f2b;
-  padding: 6px 10px;
-  font-size: 12px;
-  color: #94a3b8;
-}
-.bundle-substeps > summary {
-  cursor: pointer;
-  font-weight: 600;
-  color: #a5b4fc;
-}
-.bundle-ul {
-  margin: 8px 0 0;
-  padding-left: 1.1em;
-  list-style: disc;
-}
-.bundle-li {
-  margin: 4px 0;
-  line-height: 1.45;
-}
-.bundle-name {
-  margin-right: 6px;
-}
-.bundle-st {
-  font-size: 11px;
-  margin-right: 6px;
-  opacity: 0.9;
-}
-.bundle-st.ok {
-  color: #6ee7b7;
-}
-.bundle-st.running {
-  color: #a5b4fc;
-}
-.bundle-st.error {
-  color: #fca5a5;
-}
-.bundle-meta {
-  font-size: 11px;
-  color: #64748b;
-}
-.bundle-err {
-  display: block;
-  font-size: 11px;
-  color: #fca5a5;
-  margin-top: 2px;
 }
 .steps-col {
   display: flex;
@@ -1176,10 +628,7 @@ export default {
   color: #f1f5f9;
   flex: 1;
   min-width: 6.5rem;
-  writing-mode: horizontal-tb;
-  overflow-wrap: break-word;
-  word-break: normal;
-  line-break: auto;
+  overflow-wrap: anywhere;
   line-height: 1.35;
 }
 .sum-st {
@@ -1207,28 +656,16 @@ export default {
   max-height: min(52vh, 520px);
   overflow-x: hidden;
   overflow-y: auto;
-  overscroll-behavior: contain;
+}
+.event-summary {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #e2e8f0;
+  overflow-wrap: anywhere;
 }
 .flow-block {
   margin-top: 10px;
-}
-.meta-toggle {
-  margin-top: 10px;
-  padding: 6px 10px;
-  font-size: 12px;
-  border-radius: 8px;
-  border: 1px solid #3d4d64;
-  background: #1e2433;
-  color: #a5b4fc;
-  cursor: pointer;
-}
-.meta-toggle:hover {
-  border-color: rgba(129, 140, 248, 0.45);
-  color: #e0e7ff;
-}
-.meta-toggle-first {
-  margin-top: 4px;
-  margin-bottom: 2px;
 }
 .flow-h {
   font-size: 11px;
@@ -1256,13 +693,11 @@ export default {
 }
 .flow-k {
   color: #64748b;
-  flex-shrink: 0;
 }
 .flow-v {
   color: #e2e8f0;
   min-width: 0;
   overflow-wrap: anywhere;
-  word-break: break-word;
   line-height: 1.5;
   white-space: pre-wrap;
 }
@@ -1281,10 +716,6 @@ export default {
   padding-left: 1.15em;
   font-size: 12px;
   color: #cbd5e1;
-}
-.src-n {
-  color: #64748b;
-  margin-right: 4px;
 }
 .src-a {
   color: #a5b4fc;
@@ -1313,10 +744,8 @@ export default {
   color: #cbd5e1;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  word-break: break-word;
   max-height: min(36vh, 320px);
   overflow-y: auto;
-  overscroll-behavior: contain;
 }
 .sec-text.sm {
   max-height: 120px;

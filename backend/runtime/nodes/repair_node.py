@@ -31,7 +31,7 @@ async def execute_round(
             "step": {
                 "name": "dag_repair",
                 "status": "running",
-                "meta": _pg({"round": round_idx}, "polishing", "DAG：Repair Node"),
+                "meta": _pg({"round": round_idx}, "repair", "DAG：Repair Node"),
             },
         }
     )
@@ -57,7 +57,7 @@ async def execute_round(
                 "provider": getattr(r_rep, "provider", None) if r_rep else None,
                 "model": getattr(r_rep, "model", None) if r_rep else None,
                 "latency_ms": int(getattr(r_rep, "latency_ms", 0) or 0) if r_rep else 0,
-                "meta": _pg({"guard_reverted": guard_reverted, "skipped": skipped}, "polishing", "修复阶段结束。"),
+                "meta": _pg({"guard_reverted": guard_reverted, "skipped": skipped}, "repair", "修复阶段结束。"),
                 "error": getattr(r_rep, "error", None) if r_rep and not getattr(r_rep, "success", True) else None,
             },
         }

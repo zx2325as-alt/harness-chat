@@ -18,14 +18,14 @@ from runtime.orchestrator.runtime_orchestrator import RuntimeOrchestrator
 from runtime.models.planner_model import describe_dynamic_plan
 from runtime.streaming.progressive_stream import ProgressiveStreamRouter
 from runtime.state.goal_risk import GoalState, RiskState
-from runtime_state import AgentState, get_execution_state
+from runtime_state import GoalExecutionState, get_execution_state
 
 from harness import SSE_PROTOCOL_META, _analyze_step_summary
 
 
 def _analysis_payload_for_dag_sse(analysis: Dict[str, Any]) -> Dict[str, Any]:
-    """DAG 主路径：SSE 元数据不暴露互斥轨字段（decision/suggested_track）；内部 prep 仍保留完整 analysis。"""
-    return {k: v for k, v in analysis.items() if k not in ("decision", "suggested_track")}
+    """DAG 主路径：SSE 元数据仅暴露运行时研判与 runtime intent。"""
+    return dict(analysis) if isinstance(analysis, dict) else {}
 
 
 async def run_dag_runtime_stream(
@@ -88,7 +88,7 @@ async def run_dag_runtime_stream(
                         "parallel_drafts": plan.parallel_drafts,
                         "hedge_draft_delay_ms": plan.hedge_draft_delay_ms,
                         "max_repair_rounds": plan.repair_rounds_max,
-                        "agent_subgraph": plan.use_agent_subgraph,
+                        "goal_subgraph": plan.use_goal_subgraph,
                         "tool_capability_gate": plan.use_tool_gate,
                         "planned_nodes": planned_dag_node_ids(plan),
                         "dynamic_dag": True,
@@ -121,10 +121,9 @@ async def run_dag_runtime_stream(
     yield {
         "event": "trace",
         "trace_id": trace_id,
-        "track": "dag",
-        "initial_track": "dag",
-        "current_track": "dag",
-        "meta": {**dict(SSE_PROTOCOL_META), "dag_runtime": True, "runtime": "adaptive_dag_v3"},
+        "runtime": "adaptive_dag_v3",
+        "phase": "intake",
+        "meta": {**dict(SSE_PROTOCOL_META), "dag_runtime": True, "runtime": "adaptive_dag_v3", "phase": "intake"},
     }
 
     ctx = DAGRuntimeContext(harness, prompt, mode, options, messages, trace_id, hcfg, prep, _tag)
@@ -155,20 +154,21 @@ async def run_dag_runtime_stream(
         ctx.st.runtime_memory.append({"phase": "bootstrap", "intent": intent_dict})
         ctx.st.latency_budget_tier = str(intent.latency_budget or ctx.st.latency_budget_tier or "medium")
         ctx.st.quality_budget_tier = str(intent.quality_requirement or ctx.st.quality_budget_tier or "medium")
+        ctx.st.set_phase("planning", node="dag_runtime_plan")
 
-    ag = options.get("_agent_state")
-    if not isinstance(ag, AgentState):
-        ag = AgentState()
-        options["_agent_state"] = ag
+    goal_exec = options.get("_goal_execution_state")
+    if not isinstance(goal_exec, GoalExecutionState):
+        goal_exec = GoalExecutionState()
+        options["_goal_execution_state"] = goal_exec
     if ctx.st and ctx.st.goals:
-        ag.goals = list(ctx.st.goals)
-        ag.unresolved_goals = list(ctx.st.unresolved_goals)
-        ag.subgoals = ag.goals[: min(6, len(ag.goals))]
-        ag.progress_score = 0.0 if ag.unresolved_goals else 1.0
+        goal_exec.goals = list(ctx.st.goals)
+        goal_exec.unresolved_goals = list(ctx.st.unresolved_goals)
+        goal_exec.subgoals = goal_exec.goals[: min(6, len(goal_exec.goals))]
+        goal_exec.progress_score = 0.0 if goal_exec.unresolved_goals else 1.0
 
     ctx.caches = RuntimeTieredCaches()
     ctx.blocked = bool(options.get("_web_search_blocked"))
-    ctx.overrides = {k: v for k, v in harness._track_search_overrides("dag", analysis).items() if v is not None}
+    ctx.overrides = {k: v for k, v in harness._search_policy_overrides("dag", analysis).items() if v is not None}
 
     prog = ProgressiveStreamRouter(options)
     await prog.emit_preliminary_note(intent_dict)

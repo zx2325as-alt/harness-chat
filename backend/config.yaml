@@ -1,6 +1,5 @@
 server:
-  # SSE：队列侧最长空闲等待（秒），超时发 heartbeat，防止代理断开
-  sse_queue_timeout_s: 8  # 缩短 heartbeat 间隔，提升用户体验
+  sse_queue_timeout_s: 8
   cors_allow_origins:
     - "http://localhost:5173"
     - "http://127.0.0.1:5173"
@@ -8,18 +7,13 @@ server:
     - "http://127.0.0.1:6008"
 
 harness:
-  # default: auto | dag | fast | refine | agent（执行统一 DAG；后者主要影响预判与意图信号）
-  default_mode: "auto"
-  # 非流式兜底与 Agent 直接输出时的字符切片；中文界面可略小于默认 96 以更顺滑
+  runtime: "adaptive_dag_v3"
   stream_slice_chars: 72
-  # 全局禁止联网（可由配置页写入 config.runtime.yaml）。对话里选「关闭联网」对本条消息同样禁止检索且会清除预判中的联网意图。
   web_search:
     globally_disabled: false
   features:
-    # 预判 JSON 损坏时追加一次「仅修 JSON」的短调用（质量优先）
     analyzer_json_repair: true
 
-  # DAG Runtime（默认主路径）：并行检索 + 并行批评 + 修复/验证/终稿
   dag_runtime:
     parallel_search_queries: 2
     parallel_critics: true
@@ -27,89 +21,45 @@ harness:
     parallel_drafts: true
     hedge_draft_delay_ms: 0
     max_repair_rounds: 2
-    agent_subgraph_enabled: false
-    # intent.tool_requirement 为真时插入 tool_capability_gate DAG 节点
+    goal_subgraph_enabled: false
     tool_capability_gate_enabled: true
+    semantic_cache_short_circuit: false
 
-  # 动态 Runtime：ExecutionState、Capability Planner、统一 Critic 阈值（DAG 内嵌调用）
   runtime_orchestrator:
     enabled: true
-    max_escalations: 2
-    # 保留字段：主路径已固定 DAG，此项无调度效果。
-    auto_initial_track_policy: dag_only
-    # 仅 unified_critic 被后端读取；其余旧 stage 键已移除。
-    rollout_stages:
-      unified_critic: true
-    fast_quality_gate:
-      enabled: true
-      min_draft_chars: 48
-      score_threshold: 7.5
-      hallucination_risk_threshold: 0.4
-      completeness_threshold: 0.7
-      critic_model_key: "" # 空则使用 routing.default_model / default_models
-      disable_cache_on_high_risk: true
-    # 单次请求外部检索 API 预算（命中请求内缓存 / 会话 Redis 缓存不扣减）。省略或 null 表示不限制。
     search_budget_per_request: 24
-    refine_pipeline:
-      mode: critic_runtime
-      critic_model_key: "" # 空则回退 routing.default_model / default_models
+    unified_critic:
+      enabled: true
+      model_key: ""
+    search_sufficiency:
+      enabled: true
+      model_key: ""
     observability:
-      metrics_jsonl_path: "" # 可选：额外 JSONL 副本
-      metrics_sqlite_path: data/runtime_metrics.sqlite # 默认 SQLite 观测库（相对 backend 目录）
+      metrics_jsonl_path: ""
+      metrics_sqlite_path: data/runtime_metrics.sqlite
 
-  # 路由阈值（当前 DAG 主路径不读取；保留字段以免配置页 / 合并补丁报错）
-  routing_tuning:
-    confidence_track_guard_threshold: 0.52  # 降低阈值，减少不必要的升级
-    confidence_track_guard_min_prompt_chars: 150  # 降低字符数要求
-    low_confidence_suggested_track_threshold: 0.50  # 降低阈值
-
-  # Refine 审查层内 JSON web_search 工具协议的最大核查轮数
-  refine_chain_tuning:
-    max_review_web_rounds: 3
-
-  # 流式输出：按标点优先断句（中文体验）
   stream_tuning:
     smart_chunk_boundary: true
-    # Refine L1→L2 过渡期的 content_reset 事件（前端可据此折叠草稿）；不想出现“清空再输出”可关
     emit_content_reset: true
-
-  # Agent / progress_eval：配置块保留；DAG 主路径未再接独立 Agent 循环（亦无 evaluate_agent_progress 模块）。
-  agent_tuning:
-    progress_eval:
-      enabled: true
-      every_n_iterations: 2
-      max_calls_per_request: 4
-      low_progress_abort_after: 2
-      min_progress_score: 0.22
-      min_delta_vs_previous: 0.1
-      progress_score_delta_threshold: 0.05
-      progress_delta_low_abort_after: 2
-      goal_resolve_progress_threshold: 0.55
-      goal_resolve_delta_threshold: 0.2
-      model_key: "" # 空则 routing.default_model / default_models
 
   search:
     tavily_api_key: "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"
     provider: tavily
     fallback: duckduckgo
-    query_enrich: false  # 关闭自动增强，让 LLM analyzer 生成更精准的 search_query
+    query_enrich: false
     search_depth: basic
     max_results: 8
-    by_track:
-      fast:
-        max_results: 5
+    by_intent:
+      search:
+        max_results: 8
         search_depth: basic
-      refine:
+      dag:
         max_results: 12
-        search_depth: advanced
-      agent:
-        max_results: 10
         search_depth: advanced
     topic: general
     timeout_s: 15
     timeout_s_max: 28
     include_answer: false
-    # 权威来源加权：.gov/.edu 等域名提高排序；rank_blend 越大越重视权威（相对检索引擎原始顺序）
     authority:
       enabled: true
       rank_blend: 0.42
@@ -117,17 +67,11 @@ harness:
     relevance_filter:
       enabled: true
       model: "claude-sonnet-4-6"
-      # 仅质量轨道同步过滤，fast 轨异步过滤以提升响应速度
-      sync_default_mode: quality_tracks
-      sync_tracks:
-        - refine
-        - agent
+      sync_default_mode: runtime_phases
     session_cache_ttl_s: 1800
-    session_cache_ttl_freshness_s: 180  # 强时效缩短到 3 分钟
-    # 会话内检索结果 Redis TTL：强时效 < 显式联网 < 默认（秒）
+    session_cache_ttl_freshness_s: 180
     session_cache_ttl_required_s: 900
     session_cache_ttl_explicit_s: 1800
-    # 命中任一子串时启动投机预取联网（与 build_search_query 配合）
     speculative_markers:
       - "联网"
       - "搜索"
@@ -145,19 +89,15 @@ harness:
   documents:
     bm25_weight: 0.55
     embedding_weight: 0.45
-    # 纯线上 Embeddings（OpenAI 兼容 /v1/embeddings）
     embedding:
       enabled: true
       model_key: "n1n-embedding-3-large"
-      # 只对 BM25 召回的前 N 个做向量化（成本/效果折中）
       max_items: 40
-      # 每段参与 embedding 的最大字符数（太长会稀释语义 & 增加 token 成本）
       text_chars: 2000
       timeout_s: 30
-      # RRF 融合参数：score = 1/(k+rank_bm25)+1/(k+rank_emb)
       rrf_k: 60
     compact:
-      max_items: 8  # Refine L2/L3 使用“文档指针版”上下文的条数
+      max_items: 8
     max_text_chars: 220000
     chunk_size: 7000
     chunk_overlap: 900
@@ -165,39 +105,29 @@ harness:
     max_sheet_rows: 2500
     rerank:
       enabled: true
-      # 优先使用专用重排序模型（走 /v1/rerank），失败再回退到 chat 模型
       model: "bge-reranker-v2-m3"
       max_items: 12
       top_k: 8
-
-  fast_answer_cache:
-    enabled: false
-    key_prefix: "harness:fast:v1:"
-    ttl_sec: 86400
-    similarity_threshold: 0.92
-    max_scan_keys: 400
-    # 先 ngram 过滤再语义相似，减少无效 embedding 调用
-    cheap_ngram_overlap_min: 0.06
 
   task_model_templates:
     reasoning:
       selected_model: "claude-sonnet-4-6-thinking"
       fallback_models: ["grok-4-20-reasoning", "gpt-5.5", "deepseek-v4-flash"]
-      refine_models:
+      quality_models:
         draft: ["claude-sonnet-4-6-thinking", "grok-4-20-reasoning"]
         review: ["gpt-5.5", "claude-sonnet-4-6"]
         polish: ["claude-opus-4-7", "gpt-5.5"]
     generation:
       selected_model: "claude-opus-4-7"
       fallback_models: ["deepseek-v4-pro", "gpt-5.5"]
-      refine_models:
+      quality_models:
         draft: ["deepseek-v4-pro", "gpt-5.5"]
         review: ["gpt-5.5", "claude-sonnet-4-6"]
         polish: ["claude-opus-4-7", "gpt-5.5"]
     code:
       selected_model: "claude-sonnet-4-6"
       fallback_models: ["deepseek-v4-flash", "gpt-5.5"]
-      refine_models:
+      quality_models:
         draft: ["deepseek-v4-flash", "claude-sonnet-4-6"]
         review: ["gpt-5.5", "claude-sonnet-4-6-thinking"]
         polish: ["claude-opus-4-7", "gpt-5.5"]
@@ -206,118 +136,60 @@ harness:
       fallback_models: ["deepseek-v4-flash", "grok-4.2"]
 
   complexity:
-    # 预判 LLM 单次请求超时（秒）、重试次数、整体硬超时（超过则降级为规则预判，避免 SSE 长时间无响应）
     analyzer_request_timeout_s: 18
-    analyzer_max_retries: 2  # 2 次重试（共 3 次尝试）
-    # 须 ≥ analyzer_request_timeout_s × (analyzer_max_retries + 1)
-    analyzer_total_timeout_s: 60  # 18 * 3 = 54，留余量
+    analyzer_max_retries: 2
+    analyzer_total_timeout_s: 60
     analysis_cache_ttl_s: 300
-    # 非空则强制用于高复杂度自检；留空则自动：推理向 selected_model → reasoning.review[0] → Agent 主模型 → routing 默认
-    agent_self_check_model: ""
-    self_check_reasoning_models:
-      - "claude-sonnet-4-6-thinking"
-      - "grok-4-20-reasoning"
-      - "deepseek-v4-pro"
-    # 启用大模型进行预判
     use_llm_analyzer: true
-    analyzer_model: "claude-sonnet-4-6" # 预判使用的模型，需在 models 下注册，要求速度快且能输出 JSON
+    analyzer_model: "claude-sonnet-4-6"
     analyzer_prompt: |
-      你是一个高级的大模型路由调度中枢。请分析以下用户输入的复杂度和意图，并从可用模型池中为用户自主选择最合适的大模型。
-      
+      你是一个 Runtime Intent Analyzer。请分析用户输入，并只输出一个合法 JSON 对象。
+
+      【目标】
+      - 识别任务复杂度、任务类型与是否需要实时/外部信息。
+      - 为统一 Adaptive Self-Correcting Async DAG Runtime 选择合适模型池。
+      - 不要输出任何 fast/refine/agent、track、decision、suggested_track 之类旧路由字段。
+
       【可用模型池及其特长】
       - claude-sonnet-4-6: 极其擅长代码编写、架构设计、逻辑分析。
       - claude-sonnet-4-6-thinking: 擅长深度数学证明、复杂逻辑推导。
-      - claude-opus-4-7: 擅长长文写作、极致的语言润色、高难度综合任务。
-      - gpt-5.5 / gpt-5.4-high: 速度极快，综合能力极强，适合日常通用问答、联网搜索总结。
+      - claude-opus-4-7: 擅长长文写作、极致语言润色、高难度综合任务。
+      - gpt-5.5 / gpt-5.4-high: 速度快，适合通用问答、联网搜索总结。
       - grok-4-20-reasoning / grok-4.2: 擅长数理逻辑、硬核推理。
-      - deepseek-v4-pro / deepseek-v4-flash: flash速度快适合通用与代码，pro适合深度专业问题。
+      - deepseek-v4-pro / deepseek-v4-flash: flash 适合通用与代码，pro 适合深度专业问题。
       - gemini-3.1-pro-preview: 适合长上下文、多模态或泛用型搜索。
-      # - ollama-llama3: 本地模型，必须用于处理包含隐私、密码、内部数据的极度敏感请求。
-      
-      请返回一段合法的 JSON，格式如下：
+
+      请输出如下 JSON：
       {
         "complexity": "low | medium | high",
-        "decision": "fast 或 refine",
         "task_type": "conversation | generation | reasoning | code",
         "type": "general | web_search | document_qa | code | math_logic | writing",
-        "freshness_hint": "如问题隐含强时效（今天/本周/2026-05/最新版本号等），给出简短提示；否则为空字符串",
-        "search_required": true 或 false,
-        "search_query": "若需要联网搜索，给出最适合搜索引擎的短查询词；否则为空字符串",
+        "search_required": true,
+        "search_query": "适合搜索引擎的短查询；不需要时为空字符串",
+        "search_queries": ["可选的并行检索查询"],
+        "freshness_hint": "若问题隐含强时效，给出简短提示；否则为空字符串",
         "confidence": 0.85,
-        "suggested_track": "fast",
-        "selected_model": "低复杂度时主力模型名称",
+        "selected_model": "首选模型名称",
         "fallback_models": ["备选1", "备选2"],
-        "refine_models": {
-          "draft": ["初稿层模型池"],
-          "review": ["审查层模型池"],
-          "polish": ["润色层模型池"]
+        "quality_models": {
+          "draft": ["初稿模型池"],
+          "review": ["审查模型池"],
+          "polish": ["润色模型池"]
         },
         "reason": "简短判定理由"
       }
-      
-      confidence 必须为 0.0～1.0 的数字（对小数点一位即可），表示你对上述分类的综合把握。
-      suggested_track 必须为 fast、refine、agent 三者之一；当用户同时要求「简短」与「深入分析」等冲突时，根据整句语义选一个轨道。
-      
-      task_type 含义（用于三轨路由）：
-      - conversation：闲聊、简单问答、翻译 → 通常配合 low → Fast 轨
-      - generation：长文、方案、写作、润色类 → 通常配合 medium/high → Refine 轨
-      - reasoning：多步推理、工具链、数学证明、复杂逻辑 → Agent 轨（思考-行动-观察）
-      - code：代码编写、调试、架构设计、配置审查、性能优化 → 通常 Agent 轨并选用代码向模型池
-      
-      complexity 档位：
-      - low：简单问答、翻译、信息检索
-      - medium：中等分析、少量查证、短链路推理
-      - high：复杂推理、长文写作、多源查证、代码审查
-      
-      判断标准：
-      - complexity: 根据上述 low/medium/high 定义选择；不确定时宁可填 medium。
-      - decision: high/medium 倾向 refine，low 倾向 fast（可被用户模式覆盖）。
-      - search_required: 涉及实时信息、新闻、股价、天气、版本更新等填 true。
-      - type: 需要实时外部信息填 web_search。
-      - task_type 为 reasoning 时：数学推导、多约束决策、需多次查资料或验证的任务优先。
-      - task_type 为 code 时：明确编程/脚本/配置/调试需求优先。
-      
+
+      规则：
+      - complexity 不确定时优先给 medium。
+      - search_required 仅在需要实时、最新、外部事实核验时给 true。
+      - type 为 web_search 时，search_query 应尽量短且具体。
+      - task_type 为 code 时优先代码向模型池；为 reasoning 时优先推理向模型池。
+      - confidence 必须为 0.0 到 1.0 的数字。
+
       用户输入如下：
-      
-    # 强制进入 refine 轨的指令（仍然保留作为快捷入口）
-    manual_triggers:
-      - "/refine"
-      - "强制精化"
-      - "精化轨"
 
-  # Agent 轨（task_type=reasoning）：思考-行动-观察；工具含联网与 refine_answer 封装
-  agent:
+  quality_pipeline:
     enabled: true
-    model: "claude-sonnet-4-6"
-    # 覆写默认 agent.model；未列出的 task_type 仍用 model
-    model_by_task_type:
-      code: "claude-sonnet-4-6"
-      reasoning: "claude-sonnet-4-6-thinking"
-    max_iterations: 5
-    max_iterations_by_complexity:
-      low: 3
-      medium: 5
-      high: 8
-    system_prompt: |
-      你是严谨的推理智能体。每一步先简短说明推理意图，再决定是否需要工具。
-      工具调用必须使用指定单行格式，勿编造工具结果。
-      若本轮曾成功执行 web_search，最终答案文末必须用「## 引用来源」列出实际用到的来源标题与 URL，与摘要序号对应；不得虚构未出现的链接。
-      若用户问题涉及医疗、法律或个性化投资建议，须在答案开头用一两句给出「非专业意见、不可替代执业者」类免责声明。
-
-  routing:
-    # 无规则命中时按顺序尝试，优先使用兼顾速度与质量的模型，失败则自动向后降级
-    default_model: "claude-sonnet-4-6"
-    default_models:
-      - "gpt-5.5"
-      - "claude-sonnet-4-6"
-      - "deepseek-v4-flash"
-      - "gemini-3.1-pro-preview"
-      - "grok-4.2"
-
-
-  refine_chain:
-    enabled: true
-    # Layer 1: broad draft (cheap, wide coverage)
     layer1:
       name: "draft"
       temperature: 0.2
@@ -326,10 +198,8 @@ harness:
         1) 关键点列表
         2) 初步答案（可包含不确定性提示）
         3) 你认为需要进一步核查的点（如果有）
-    # Runtime Repair（critic_runtime 中段修订；未配置时回退 layer2.temperature）
     repair:
       temperature: 0.15
-    # Layer 2: critical review (find mistakes, add depth)
     layer2:
       name: "review"
       temperature: 0.1
@@ -340,15 +210,13 @@ harness:
         1) 初稿问题清单（要点化）
         2) 修正版答案（尽量严谨，必须用下列分隔符包裹正文，便于服务器稳定提取）
         3) 仍不确定处与需要补充信息
-        
+
         【关键格式约束】修正版答案必须严格按如下格式输出（分隔符独占一行）：
         <<<FINAL_ANSWER>>>
         <这里是给用户看的完整修正版答案正文>
         <<<END_FINAL_ANSWER>>>
-        
-        如需补充检索，仅在审查结论中非 FINAL 区域输出单行 JSON：
-        {"action":"web_search","query":"查询词","reason":"为何检索","priority":"high"}
-    # Layer 3: polish (format, coherence)
+
+        补充证据由运行时统一调度检索；不要输出 JSON action、工具协议或控制指令。
     layer3:
       name: "polish"
       temperature: 0.3

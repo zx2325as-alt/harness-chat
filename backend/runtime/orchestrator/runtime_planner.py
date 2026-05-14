@@ -11,7 +11,7 @@ class PlanDescription:
     parallel_searches: int
     parallel_critics: bool
     repair_rounds_max: int
-    use_agent_subgraph: bool
+    use_goal_subgraph: bool
     use_tool_gate: bool
     parallel_drafts: bool
     hedge_draft_delay_ms: int
@@ -28,7 +28,7 @@ def describe_plan(intent: RuntimeIntent, cfg: Dict[str, Any]) -> PlanDescription
         parallel_searches=n_search,
         parallel_critics=bool(dq.get("parallel_critics", True)),
         repair_rounds_max=max(1, min(4, int(dq.get("max_repair_rounds") or 2))),
-        use_agent_subgraph=bool(intent.tool_requirement and dq.get("agent_subgraph_enabled")),
+        use_goal_subgraph=bool(intent.tool_requirement and dq.get("goal_subgraph_enabled")),
         use_tool_gate=bool(intent.tool_requirement and dq.get("tool_capability_gate_enabled", True)),
         parallel_drafts=bool(dq.get("parallel_drafts", True)),
         hedge_draft_delay_ms=max(0, int(dq.get("hedge_draft_delay_ms") or 0)),

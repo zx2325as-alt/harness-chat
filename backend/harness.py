@@ -28,9 +28,7 @@ from semantic_utils import (
     semantic_similarity,
 )
 
-from tools.layer import HarnessTools
 from search_evidence import search_result_to_evidence
-from tools.parsing import next_review_search_action
 
 from chunk_channels import attach_chunk_channel
 from runtime_metrics import emit_product_metric, log_runtime_event
@@ -39,7 +37,7 @@ from runtime_state import (
     execution_evidence_context,
     need_search_allowed,
     note_search_consumed,
-    runtime_track,
+    runtime_phase,
 )
 
 from json_utils import extract_balanced_json_object, strip_markdown_json_fence
@@ -54,12 +52,6 @@ from runtime_executor import collect_sync_response_from_stream
 
 
 SSE_PROTOCOL_META: Dict[str, Any] = {"protocol_version": 1, "stream_schema": "harness-v1"}
-
-REFINE_REVIEW_RETRY_SUFFIX = (
-    "\n\n请结合上述联网信息更新审查结论；若仍需核实请在正文内输出合法 JSON 对象："
-    "{\"action\":\"web_search\",\"query\":\"查询词\",\"reason\":\"说明\",\"priority\":\"high\"}。"
-)
-
 
 def _msg_content_to_text(content: Any) -> str:
     if isinstance(content, str):
@@ -180,12 +172,11 @@ class ModelRegistry:
         return self._adapters[model_key]
 
 
-class DualTrackHarness:
+class RuntimeHarness:
     def __init__(self, cfg: Dict[str, Any], redis_client: Any = None):
         self.cfg = cfg
         self.registry = ModelRegistry(cfg.get("models", {}))
         self.search = SearchService(cfg, redis_client=redis_client)
-        self.tools = HarnessTools(self)
         self._redis = redis_client
         self._search_request_cache_prefix = "harness:reqsearch:"
         self._analysis_cache_prefix = "harness:analysis:v1:"
@@ -201,11 +192,10 @@ class DualTrackHarness:
             return d
         return _tag
 
-    def _track_search_overrides(self, track: str, analysis: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _search_policy_overrides(self, profile: str, analysis: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         search_cfg = (self.cfg.get("harness") or {}).get("search") or {}
-        by_track = search_cfg.get("by_track") or {}
-        # 统一 DAG Runtime：优先 harness.search.by_track.dag，其次 refine，最后兼容传入 track
-        base = by_track.get("dag") or by_track.get("refine") or by_track.get(track) or {}
+        policies = search_cfg.get("by_intent") or search_cfg.get("profiles") or {}
+        base = policies.get(profile) or policies.get("search") or {}
         ov = {
             "override_max_results": base.get("max_results"),
             "override_search_depth": base.get("search_depth"),
@@ -304,7 +294,7 @@ class DualTrackHarness:
             f"{block}"
         )
 
-    def _build_refine_layer1_prompt(
+    def _build_quality_layer1_prompt(
         self,
         prompt: str,
         instruction: str,
@@ -323,7 +313,7 @@ class DualTrackHarness:
             max_history_chars=max_history_chars,
         )
 
-    def _build_refine_layer2_prompt(
+    def _build_quality_layer2_prompt(
         self,
         question: str,
         instruction: str,
@@ -350,7 +340,7 @@ class DualTrackHarness:
             )
         return prompt
 
-    def _build_refine_layer3_prompt(
+    def _build_quality_layer3_prompt(
         self,
         question: str,
         instruction: str,
@@ -369,7 +359,7 @@ class DualTrackHarness:
             max_history_chars=max_history_chars,
         )
 
-    def _build_refine_layer2_fallback_text(self, draft_answer: str, entry_block: str = "") -> str:
+    def _build_quality_layer2_fallback_text(self, draft_answer: str, entry_block: str = "") -> str:
         """审查层失败时，至少回退到 Layer1；若已有入口检索摘要则一并保留。"""
         draft = str(draft_answer or "").strip()
         entry = str(entry_block or "").strip()
@@ -377,7 +367,7 @@ class DualTrackHarness:
             return draft
         return f"{draft}\n\n{entry}".strip()
 
-    async def _refine_layer2_ask_with_polish_rescue(
+    async def _quality_layer2_ask_with_polish_rescue(
         self,
         l2_candidates: List[str],
         l2_prompt: str,
@@ -404,34 +394,6 @@ class DualTrackHarness:
         if r3.success:
             return r3, merged, True, True
         return r2, merged, False, True
-
-    def _resolve_agent_model(self, hcfg: Dict[str, Any], analysis: Dict[str, Any], routing_default: str) -> str:
-        acfg = hcfg.get("agent") or {}
-        base = str(acfg.get("model") or analysis.get("selected_model") or routing_default or "").strip()
-        by_tt = acfg.get("model_by_task_type") or {}
-        tt = str(analysis.get("task_type") or "").strip().lower()
-        if isinstance(by_tt, dict) and tt:
-            pick = str(by_tt.get(tt) or "").strip()
-            if pick:
-                return pick
-        return base or routing_default
-
-    def _agent_model_candidates(self, hcfg: Dict[str, Any], analysis: Dict[str, Any], routing_default: str) -> List[str]:
-        primary = self._resolve_agent_model(hcfg, analysis, routing_default)
-        routing = hcfg.get("routing") or {}
-        defaults = routing.get("default_models") or [routing.get("default_model", routing_default)]
-        if not isinstance(defaults, list):
-            defaults = [primary]
-        fb = analysis.get("fallback_models")
-        extra: List[str] = list(fb) if isinstance(fb, list) else []
-        out: List[str] = []
-        for x in [primary] + extra + list(defaults):
-            s = str(x or "").strip()
-            if s and s not in out:
-                out.append(s)
-        # 严格过滤未注册模型，避免主循环因配置错误直接崩链
-        out = [m for m in out if self.registry.is_registered(m)]
-        return out or [routing_default or "gpt-5.5"]
 
     def _should_force_relevance_filter_sync(self, analysis: Dict[str, Any], options: Dict[str, Any]) -> bool:
         if bool(options.get("relevance_filter_sync", False)):
@@ -483,10 +445,13 @@ class DualTrackHarness:
         options["_web_search_blocked"] = blk
         options["_web_search_block_reason"] = breason
 
-        default_mode = hcfg.get("default_mode", "auto")
-        mode = (mode or default_mode).lower()
-        if mode not in ("auto", "fast", "refine", "agent", "dag"):
-            mode = "auto"
+        default_runtime = str(hcfg.get("runtime") or "adaptive_dag_v3").strip().lower()
+        requested_runtime = str(mode or default_runtime).strip().lower()
+        if requested_runtime in ("", "auto", "dag"):
+            requested_runtime = default_runtime
+        if requested_runtime not in ("adaptive_dag_v3",):
+            requested_runtime = "adaptive_dag_v3"
+        mode = requested_runtime
 
         cx_cfg = hcfg.get("complexity") or {}
         analyzer_deadline = float(cx_cfg.get("analyzer_total_timeout_s", 45))
@@ -518,7 +483,7 @@ class DualTrackHarness:
             if guessed_query:
                 speculative_guess_key = self._normalized_search_key(guessed_query)
                 # 注意：此处 analysis 尚未产出，只能使用 spec_analysis 作为 intent 参考
-                sub_opts = {**options, **{k: v for k, v in self._track_search_overrides("fast", spec_analysis).items() if v is not None}}
+                sub_opts = {**options, **{k: v for k, v in self._search_policy_overrides("search", spec_analysis).items() if v is not None}}
                 speculative_search_task = asyncio.create_task(self.perform_web_search(guessed_query, sub_opts))
         try:
             analysis = await asyncio.wait_for(
@@ -538,8 +503,6 @@ class DualTrackHarness:
         # 执行统一走 DAG：analyzer / planner 仅产出意图与能力信号，不再做 fast|refine|agent 互斥轨决策。
         analysis["route_rule"] = "dag_runtime_only"
         analysis["runtime_execution"] = "dag"
-        intended_track = "dag"
-        initial_track = "dag"
 
         entry_search_required, search_reason = self._runtime_need_entry_search(prompt, analysis, options)
         # 路由显式要求：即便检索信号未命中，也允许快轨入口注入一次联网摘要（禁止联网时不生效）
@@ -578,37 +541,27 @@ class DualTrackHarness:
             "mode": mode,
             "analysis": analysis,
             "sig_base": sig_base,
-            "intended_track": intended_track,
-            "initial_track": initial_track,
             "entry_search_required": entry_search_required,
             "search_reason": search_reason,
             "search_mandatory": search_mandatory,
         }
 
-    def _resolve_refine_context(self, analysis: Dict[str, Any], hcfg: Dict[str, Any]) -> Dict[str, Any]:
-        chain = hcfg.get("refine_chain") or {}
+    def _resolve_quality_context(self, analysis: Dict[str, Any], hcfg: Dict[str, Any]) -> Dict[str, Any]:
+        chain = hcfg.get("quality_pipeline") or {}
         l1 = chain.get("layer1") or {}
         l2 = chain.get("layer2") or {}
         l3 = chain.get("layer3") or {}
         routing = hcfg.get("routing") or {}
         default_model = routing.get("default_model", "gpt-5.5")
-        refine_models = analysis.get("refine_models") or {}
+        quality_models = analysis.get("quality_models") or {}
         return {
             "chain": chain,
             "l1": l1,
             "l2": l2,
             "l3": l3,
             "default_model": default_model,
-            "refine_models": refine_models,
+            "quality_models": quality_models,
         }
-
-    def _keyword_hit(self, text: str, keywords: List[str]) -> List[str]:
-        t = (text or "").lower()
-        hits = []
-        for k in keywords or []:
-            if k and k.lower() in t:
-                hits.append(k)
-        return hits
 
     def _feature_enabled(self, key: str, default: bool = True) -> bool:
         h = self.cfg.get("harness") or {}
@@ -621,7 +574,9 @@ class DualTrackHarness:
             complexity = "low"
         selected_model = data.get("selected_model", "")
         fallback_models = data.get("fallback_models", [])
-        refine_models = data.get("refine_models", {})
+        quality_models = data.get("quality_models")
+        if not isinstance(quality_models, dict):
+            quality_models = {}
         reason = data.get("reason", "")
         task_type = str(data.get("task_type") or "").strip().lower()
         if task_type not in ("conversation", "generation", "reasoning", "code"):
@@ -649,7 +604,7 @@ class DualTrackHarness:
             "search_query": str(data.get("search_query") or ""),
             "selected_model": selected_model,
             "fallback_models": fallback_models,
-            "refine_models": refine_models,
+            "quality_models": quality_models,
             "reason": reason,
             "raw_llm_response": raw_llm_response,
             "confidence": confidence,
@@ -705,7 +660,7 @@ class DualTrackHarness:
             "search_query": "",
             "selected_model": "",
             "fallback_models": [],
-            "refine_models": {},
+            "quality_models": {},
             "reason": "；".join(reasons),
             "raw_llm_response": raw_response,
             "confidence": conf,
@@ -744,7 +699,7 @@ class DualTrackHarness:
             "下列文本本应是一段 JSON 意图判定（Runtime-centric，无 fast/refine/agent 互斥轨），但可能损坏。"
             "请只输出一个合法 JSON 对象，键需包含："
             "complexity, task_type, type, search_required, search_query, confidence, "
-            "selected_model, fallback_models, refine_models, freshness_hint, reason, search_queries（可选数组）。"
+            "selected_model, fallback_models, quality_models, freshness_hint, reason, search_queries（可选数组）。"
             "不要 markdown 围栏，不要解释。\n\n"
             f"<<<BROKEN>>>\n{snippet}\n<<<END>>>"
         )
@@ -765,21 +720,8 @@ class DualTrackHarness:
 
     async def analyze_complexity(self, prompt: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         hcfg = (self.cfg.get("harness") or {}).get("complexity") or {}
-        manual = hcfg.get("manual_triggers") or []
         opts = dict(options or {})
         norm_prompt = self._norm_cache_prompt(prompt)
-
-        manual_hits = self._keyword_hit(prompt, manual)
-        if manual_hits:
-            return {
-                "reasons": ["manual:" + ",".join(manual_hits[:3])],
-                "manual_hits": manual_hits,
-                "complexity": "high",
-                "type": "general",
-                "task_type": "generation",
-                "confidence": 1.0,
-                "analyzer_schema": "runtime_centric_v1",
-            }
 
         use_llm = bool(hcfg.get("use_llm_analyzer", False))
         if not use_llm:
@@ -886,7 +828,7 @@ class DualTrackHarness:
             "analyzer_schema": "runtime_centric_v1",
         }
 
-    def route_fast_model(self, prompt: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
+    def resolve_model_route(self, prompt: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
         routing = (self.cfg.get("harness") or {}).get("routing") or {}
         default_model = routing.get("default_model", "gpt-5.5")
         default_models = routing.get("default_models") or [default_model]
@@ -927,14 +869,6 @@ class DualTrackHarness:
             "selected": unique_candidates[0],
         }
 
-    def _max_review_web_rounds(self) -> int:
-        h = self.cfg.get("harness") or {}
-        rt = h.get("refine_chain_tuning") or {}
-        try:
-            return max(1, min(8, int(rt.get("max_review_web_rounds", 3))))
-        except (TypeError, ValueError):
-            return 3
-
     def _registered_model_list(self, keys: Any) -> List[str]:
         out: List[str] = []
         if not isinstance(keys, list):
@@ -966,17 +900,17 @@ class DualTrackHarness:
             analysis["fallback_models"] = self._registered_model_list(fb)
         elif not analysis.get("fallback_models") and tpl.get("fallback_models"):
             analysis["fallback_models"] = self._registered_model_list(tpl["fallback_models"])
-        rm = analysis.get("refine_models")
-        if not isinstance(rm, dict):
-            rm = {}
-        rtpl = tpl.get("refine_models") or {}
+        qm = analysis.get("quality_models")
+        if not isinstance(qm, dict):
+            qm = {}
+        qtpl = tpl.get("quality_models") or {}
         for k in ("draft", "review", "polish"):
-            if rm.get(k):
-                rm[k] = self._registered_model_list(rm[k])
-            elif rtpl.get(k):
-                rm[k] = self._registered_model_list(rtpl[k])
-        if rm:
-            analysis["refine_models"] = rm
+            if qm.get(k):
+                qm[k] = self._registered_model_list(qm[k])
+            elif qtpl.get(k):
+                qm[k] = self._registered_model_list(qtpl[k])
+        if qm:
+            analysis["quality_models"] = qm
 
     def _postprocess_analysis(self, prompt: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
         out = {**analysis}
@@ -1014,7 +948,7 @@ class DualTrackHarness:
         return self._analysis_cache_prefix + hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def _layer_opts(self, hcfg: Dict[str, Any], layer_key: str, base: Dict[str, Any]) -> Dict[str, Any]:
-        chain = hcfg.get("refine_chain") or {}
+        chain = hcfg.get("quality_pipeline") or {}
         if layer_key == "runtime_repair":
             lay = chain.get("repair") or chain.get("layer2") or {}
         else:
@@ -1386,7 +1320,7 @@ class DualTrackHarness:
         return False
 
     def _effective_relevance_filter_sync(self, options: Dict[str, Any]) -> bool:
-        """是否对本请求同步跑检索相关性过滤（可显式覆盖；否则由 sync_default_mode + 当前轨决定）。"""
+        """是否对本请求同步跑检索相关性过滤（可显式覆盖；否则由 sync_default_mode + 当前 phase 决定）。"""
         v = options.get("relevance_filter_sync")
         if v is True:
             return True
@@ -1394,15 +1328,13 @@ class DualTrackHarness:
             return False
         h = self.cfg.get("harness") or {}
         rcfg = (h.get("search") or {}).get("relevance_filter") or {}
-        mode = str(rcfg.get("sync_default_mode", "quality_tracks")).strip().lower()
+        mode = str(rcfg.get("sync_default_mode", "runtime_phases")).strip().lower()
         if mode in ("always", "all", "true", "1"):
             return True
         if mode in ("never", "none", "false", "0"):
             return False
-        track = str(options.get("_runtime_track") or "").strip().lower()
-        raw = rcfg.get("sync_tracks") or ["refine", "agent"]
-        allowed = {str(x).strip().lower() for x in raw if str(x).strip()}
-        return track in allowed
+        phase = runtime_phase(options)
+        return phase in {"evaluate", "repair", "verify", "finalize"}
 
     def _relevance_needs_reapply(self, sr: Dict[str, Any]) -> bool:
         """会话/内存缓存中仍为 deferred 或未成功过滤时，需要补跑。"""
@@ -1602,85 +1534,6 @@ class DualTrackHarness:
         self._capture_search_evidence_for_runtime(options, sr)
         return sr
 
-    async def _iter_refine_review_web_rounds(
-        self,
-        review_body: str,
-        l2_prompt: str,
-        l2_candidates: List[str],
-        layer_opts: Dict[str, Any],
-        options: Dict[str, Any],
-        review_search_chars: int,
-        track: str,
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """共享：审查层内 JSON web_search 多轮核查的状态机（供 run / run_stream / refine_pipeline 复用）。"""
-        extra_ctx = ""
-        search_loops = 0
-        rb = (review_body or "").strip()
-        if options.get("_web_search_blocked"):
-            yield {"kind": "complete", "review_body": rb, "search_loops": 0}
-            return
-        # 智能停止：连续多轮“无新增信息”则提前终止，减少无效联网与重复审查
-        stagnant_rounds = 0
-        last_sources_sig = ""
-        last_snip_head = ""
-        overrides = {k: v for k, v in self._track_search_overrides(track).items() if v is not None}
-        for _ in range(self._max_review_web_rounds()):
-            q, _src = next_review_search_action(rb)
-            if not q:
-                break
-            search_loops += 1
-            yield {"kind": "round_start", "loop": search_loops, "query": q}
-            vq, vfc, vreason = validate_search_query(q)
-            if vfc:
-                sr = {
-                    "context": "",
-                    "sources": [],
-                    "error": vreason or vfc,
-                    "failure_code": vfc,
-                    "provider_used": "none",
-                    "latency_ms": 0,
-                }
-            else:
-                sr = await self.perform_web_search(
-                    vq, {**options, **overrides}
-                )
-            snip = (sr.get("context") or "")[:review_search_chars]
-            rc = len(sr.get("sources") or [])
-            yield {"kind": "after_search", "loop": search_loops, "query": q, "sr": sr, "snip": snip, "result_count": rc}
-
-            # 计算“新增信息”签名：urls + snippet 前缀（轻量）
-            try:
-                urls = [str(s.get("url") or "") for s in (sr.get("sources") or []) if isinstance(s, dict)]
-                urls = [u for u in urls if u.strip()]
-                urls_key = "|".join(urls[:10])
-            except Exception:
-                urls_key = ""
-            snip_head = normalize_text(snip)[:800]
-            sources_sig = hashlib.sha256((urls_key + "\n" + snip_head).encode("utf-8")).hexdigest()[:12]
-            if sources_sig and sources_sig == last_sources_sig:
-                stagnant_rounds += 1
-            elif last_snip_head and snip_head and ngram_overlap_ratio(last_snip_head, snip_head) >= 0.92:
-                stagnant_rounds += 1
-            else:
-                stagnant_rounds = 0
-            last_sources_sig = sources_sig or last_sources_sig
-            last_snip_head = snip_head or last_snip_head
-            if stagnant_rounds >= 2:
-                yield {"kind": "early_stop", "loop": search_loops, "reason": "no_new_information"}
-                break
-
-            if sr.get("error"):
-                extra_ctx += f"\n\n【联网核查失败】{sr.get('error')}"
-            else:
-                extra_ctx += f"\n\n【联网核查补充】\n{snip}"
-            retry_prompt = l2_prompt + extra_ctx + REFINE_REVIEW_RETRY_SUFFIX
-            r2b, _ = await self._ask_with_fallback(l2_candidates, retry_prompt, layer_opts, messages=None)
-            if r2b.success:
-                rb = _clean_review_body((r2b.content or "").strip())
-            else:
-                break
-        yield {"kind": "complete", "review_body": rb, "search_loops": search_loops}
-
     def _infer_task_type_from_json(self, data: Dict[str, Any]) -> str:
         """当模型未返回 task_type 时，由 complexity/type 推断。"""
         raw_type = str(data.get("type") or "").lower()
@@ -1709,7 +1562,7 @@ class DualTrackHarness:
         default_slice = int(hcfg.get("stream_slice_chars", 72))
         v = int(options.get("stream_slice_chars") or default_slice)
         # 中文更细粒度；英文/代码可更大粒度减少事件数
-        probe = str(options.get("search_prompt_base") or options.get("_fast_cache_identity") or "")
+        probe = str(options.get("search_prompt_base") or options.get("_runtime_cache_identity") or "")
         if probe:
             zh = len(re.findall(r"[\u4e00-\u9fff]", probe))
             total = max(1, len(probe))
@@ -1730,10 +1583,10 @@ class DualTrackHarness:
             yield attach_chunk_channel({"event": "chunk", "data": {"content": text[start:end]}}, channel, options)
             await asyncio.sleep(0)
 
-    def _runtime_max_escalations(self, hcfg: Dict[str, Any]) -> int:
-        orch = hcfg.get("runtime_orchestrator") if isinstance(hcfg.get("runtime_orchestrator"), dict) else {}
+    def _runtime_max_repair_rounds(self, hcfg: Dict[str, Any]) -> int:
+        dag = hcfg.get("dag_runtime") if isinstance(hcfg.get("dag_runtime"), dict) else {}
         try:
-            return max(1, min(8, int(orch.get("max_escalations", 2))))
+            return max(1, min(8, int(dag.get("max_repair_rounds", 2))))
         except (TypeError, ValueError):
             return 2
 
@@ -1762,16 +1615,13 @@ class DualTrackHarness:
         mode = runtime["mode"]
         analysis = runtime["analysis"]
         # 执行轨统一为 DAG：analyzer / planner 仅产出意图信号，不再决定互斥 fast|refine|agent。
-        intended_track = "dag"
-        initial_track = "dag"
         entry_search_required = runtime["entry_search_required"]
         search_reason = runtime["search_reason"]
         search_mandatory = runtime["search_mandatory"]
 
-        options["_runtime_track"] = initial_track
         h0 = self.cfg.get("harness") or {}
-        options["_fast_cache_model_version"] = str(analysis.get("selected_model") or "")
-        options["_fast_cache_prompt_version"] = str(h0.get("system_prompt_version") or h0.get("prompt_version") or "1")
+        options["_runtime_cache_model_version"] = str(analysis.get("selected_model") or "")
+        options["_runtime_cache_prompt_version"] = str(h0.get("system_prompt_version") or h0.get("prompt_version") or "1")
         self._init_runtime_search_budget(options, hcfg)
         options.pop("output_intent", None)
         disc = str(analysis.get("runtime_answer_disclaimer") or "").strip()
@@ -1782,10 +1632,9 @@ class DualTrackHarness:
         bootstrap_execution_state(
             trace_id,
             prompt,
-            initial_track,
             analysis,
             options,
-            max_escalations=self._runtime_max_escalations(hcfg),
+            max_repair_rounds=self._runtime_max_repair_rounds(hcfg),
             messages=messages,
         )
         options.setdefault("response_style", str(analysis.get("response_style") or "normal"))
@@ -1794,8 +1643,6 @@ class DualTrackHarness:
             "hcfg": hcfg,
             "mode": mode,
             "analysis": analysis,
-            "intended_track": intended_track,
-            "initial_track": initial_track,
             "entry_search_required": entry_search_required,
             "search_reason": search_reason,
             "search_mandatory": search_mandatory,
@@ -1814,38 +1661,13 @@ class DualTrackHarness:
         note_search_consumed(options)
         self._ingest_web_search_into_execution_state(options, sr)
 
-    async def _run_agent_stream(
-        self,
-        prompt: str,
-        analysis: Dict[str, Any],
-        options: Dict[str, Any],
-        messages: Optional[List[Dict[str, Any]]],
-        trace_id: str,
-        hcfg: Dict[str, Any],
-        _tag,
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """旧 ReAct / ACTION 循环已移除；遗留调用仅返回错误事件（主路径为 DAG Runtime）。"""
-        yield {
-            "event": "step",
-            "step": {
-                "name": "agent_runtime_removed",
-                "status": "skipped",
-                "meta": _pg(
-                    {"reason": "dag_runtime_only"},
-                    "reasoning",
-                    "互斥 Agent 轨已删除；工具与推理由 DAG 能力与并行节点编排。",
-                ),
-            },
-        }
-        yield {"event": "error", "error": "agent_track_removed"}
-
-    async def run_stream(self, prompt: str, mode: str = "auto", options: Optional[Dict[str, Any]] = None, messages: Optional[List[Dict[str, Any]]] = None) -> AsyncGenerator[Dict[str, Any], None]:
+    async def run_stream(self, prompt: str, mode: str = "adaptive_dag_v3", options: Optional[Dict[str, Any]] = None, messages: Optional[List[Dict[str, Any]]] = None) -> AsyncGenerator[Dict[str, Any], None]:
         """流式 SSE 主路径；同步 ``run`` 经 ``runtime_executor.collect_sync_response_from_stream`` 消费同一序列。"""
         options = options or {}
         options.setdefault("_history_signature", self._messages_signature(messages))
         options.setdefault("_documents_signature", self._documents_signature(options.get("documents")))
-        if "_fast_cache_identity" not in options:
-            options["_fast_cache_identity"] = str(options.get("search_prompt_base") or prompt or "").strip()
+        if "_runtime_cache_identity" not in options:
+            options["_runtime_cache_identity"] = str(options.get("search_prompt_base") or prompt or "").strip()
         trace_id = options.get("trace_id") or new_trace_id()
         _tag = self._make_tagger()
 
@@ -1874,13 +1696,13 @@ class DualTrackHarness:
             yield ev
         return
 
-    async def run(self, prompt: str, mode: str = "auto", options: Optional[Dict[str, Any]] = None, messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    async def run(self, prompt: str, mode: str = "adaptive_dag_v3", options: Optional[Dict[str, Any]] = None, messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """与 SSE 共用 ``run_stream`` 运行时；同步响应仅对流事件聚合成最终 JSON。"""
         options = options or {}
         options.setdefault("_history_signature", self._messages_signature(messages))
         options.setdefault("_documents_signature", self._documents_signature(options.get("documents")))
-        if "_fast_cache_identity" not in options:
-            options["_fast_cache_identity"] = str(options.get("search_prompt_base") or prompt or "").strip()
+        if "_runtime_cache_identity" not in options:
+            options["_runtime_cache_identity"] = str(options.get("search_prompt_base") or prompt or "").strip()
         if not options.get("trace_id"):
             options["trace_id"] = new_trace_id()
         return await collect_sync_response_from_stream(self, prompt, mode, options, messages)

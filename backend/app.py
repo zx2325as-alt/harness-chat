@@ -20,11 +20,11 @@ import asyncio
 import math
 import re
 import hashlib
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 import redis
 
-from harness import DualTrackHarness
+from harness import RuntimeHarness
 from chunk_channels import chunk_writes_history
 from document_extract import (
     SUPPORTED_DOCUMENT_EXTS,
@@ -46,6 +46,10 @@ from config_runtime import (
     sanitize_harness_patch,
     strip_secrets_from_mapping,
 )
+from runtime.kernel.kernel_events import KernelEventPublisher
+from runtime.kernel.kernel_models import RunStatus
+from runtime.kernel.kernel_runner import KernelRunner
+from runtime.kernel.sqlite_store import SQLiteKernelStore, resolve_kernel_sqlite_path
 
 
 CONFIG_PATH = os.path.join(ROOT, "config.yaml")
@@ -57,6 +61,7 @@ ALLOWED_DOCUMENT_EXTS = set(SUPPORTED_DOCUMENT_EXTS)
 DEFAULT_MAX_UPLOAD_FILES = 6
 DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 DEFAULT_REDIS_HISTORY_ITEMS = 40
+_ACTIVE_STREAM_SENTINEL = object()
 
 # /api/feedback 事件名 → 第十六章用户质量指标（写入 observability JSONL）
 _FEEDBACK_PRODUCT_METRICS = {
@@ -75,12 +80,14 @@ class Message(BaseModel):
     content: Any
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     session_id: Optional[str] = None  # Added session_id for Redis tracking
     prompt: Any = Field(default="", description="The new user message")
     messages: List[Message] = Field(default_factory=list, description="Historical conversation messages")
-    mode: str = Field(
-        default="auto",
-        description="auto | dag | fast | refine | agent（后端统一走 DAG Runtime；后三者仅影响预判/意图信号）",
+    runtime: str = Field(
+        default="adaptive_dag_v3",
+        description="adaptive_dag_v3",
     )
     options: Dict[str, Any] = Field(default_factory=dict)
 
@@ -112,7 +119,6 @@ class AskOut(BaseModel):
 
 class ChatResponse(BaseModel):
     trace_id: str
-    track: str
     final: AskOut
     steps: List[StepOut]
     meta: Optional[Dict[str, Any]] = None
@@ -121,7 +127,14 @@ class ChatResponse(BaseModel):
 class HarnessRuntimePatch(BaseModel):
     """合并进 harness 的配置片段（不含密钥字段；写入 config.runtime.yaml）。"""
 
+    model_config = ConfigDict(extra="forbid")
     harness: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CancelRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
 
 
 def _content_to_text(content: Any) -> str:
@@ -372,7 +385,7 @@ def _format_documents_context_compact(rows: List[Dict[str, Any]], *, max_items: 
     return "\n".join(lines)
 
 
-async def _prepare_documents_context_block_async(prompt: str, options: Dict[str, Any], harness: DualTrackHarness, cfg: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+async def _prepare_documents_context_block_async(prompt: str, options: Dict[str, Any], harness: RuntimeHarness, cfg: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     doc_budget = _int_option(options, "doc_context_chars", 40_000, minimum=2_000, maximum=60_000)
     bw = float(options.get("_doc_bm25_weight", 0.55))
     ew = float(options.get("_doc_embedding_weight", 0.45))
@@ -525,6 +538,31 @@ def _sse_client_public_event(event: Dict[str, Any]) -> bool:
     return True
 
 
+def _load_public_event_seq(event: Dict[str, Any]) -> int:
+    try:
+        return max(0, int(event.get("event_seq") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _store_run_status(status: Any) -> str:
+    value = str(status or "").strip().lower()
+    if value in {
+        RunStatus.CREATED,
+        RunStatus.RUNNING,
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.RESUMABLE,
+    }:
+        return value
+    return ""
+
+
+def _history_already_stored(run_row: Optional[Dict[str, Any]]) -> bool:
+    return bool(isinstance(run_row, dict) and run_row.get("history_stored"))
+
+
 def _init_redis_client(cfg: Dict[str, Any]) -> Optional[redis.Redis]:
     redis_cfg = ((cfg.get("server") or {}).get("redis") or {})
     host = str(redis_cfg.get("host") or env_get("REDIS_HOST", "localhost"))
@@ -668,6 +706,35 @@ def _normalise_stream_event(event: Dict[str, Any]) -> Dict[str, Any]:
     return normalize_stream_event_step(event)
 
 
+class _ActiveStreamRun:
+    def __init__(self, *, run_id: str, trace_id: str, cancel_event: asyncio.Event, producer_task: Optional[asyncio.Task] = None) -> None:
+        self.run_id = run_id
+        self.trace_id = trace_id
+        self.producer_task = producer_task
+        self.cancel_event = cancel_event
+        self.publisher = KernelEventPublisher()
+        self.subscribers: List[asyncio.Queue] = []
+        self.history_stored = False
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self.subscribers.append(q)
+        return q
+
+    async def fanout(self, item: Any) -> None:
+        stale: List[asyncio.Queue] = []
+        for q in self.subscribers:
+            try:
+                await q.put(item)
+            except RuntimeError:
+                stale.append(q)
+        if stale:
+            self.subscribers = [q for q in self.subscribers if q not in stale]
+
+    async def close(self) -> None:
+        await self.fanout(_ACTIVE_STREAM_SENTINEL)
+
+
 def _validate_harness_models(cfg: Dict[str, Any]) -> None:
     """启动时校验配置中引用的模型名是否已在 models 注册（效果优先：直接阻断）。"""
     models = set((cfg.get("models") or {}).keys())
@@ -708,14 +775,6 @@ def _validate_harness_models(cfg: Dict[str, Any]) -> None:
         s = str(mk or "").strip()
         if s and s not in models:
             errors.append(f"harness.routing.default_models[] -> {s!r}")
-    ag = h.get("agent") or {}
-    am = str(ag.get("model") or "").strip()
-    if am and am not in models:
-        errors.append(f"harness.agent.model -> {am!r}")
-    for _tt, mk in (ag.get("model_by_task_type") or {}).items():
-        s = str(mk or "").strip()
-        if s and s not in models:
-            errors.append(f"harness.agent.model_by_task_type.{_tt} -> {s!r}")
     tpl = h.get("task_model_templates") or {}
     for tt, block in tpl.items():
         if not isinstance(block, dict):
@@ -727,13 +786,13 @@ def _validate_harness_models(cfg: Dict[str, Any]) -> None:
             s = str(fb or "").strip()
             if s and s not in models:
                 errors.append(f"harness.task_model_templates.{tt}.fallback_models[] -> {s!r}")
-        rmd = block.get("refine_models") or {}
-        if isinstance(rmd, dict):
+        qmd = block.get("quality_models") or {}
+        if isinstance(qmd, dict):
             for pool in ("draft", "review", "polish"):
-                for mk in rmd.get(pool) or []:
+                for mk in qmd.get(pool) or []:
                     s = str(mk or "").strip()
                     if s and s not in models:
-                        errors.append(f"harness.task_model_templates.{tt}.refine_models.{pool}[] -> {s!r}")
+                        errors.append(f"harness.task_model_templates.{tt}.quality_models.{pool}[] -> {s!r}")
     allowed_tt = {"conversation", "generation", "reasoning", "code"}
     for tt in (h.get("task_model_templates") or {}).keys():
         if str(tt) not in allowed_tt:
@@ -781,7 +840,10 @@ def create_app() -> FastAPI:
     _warn_analyzer_timeout_budget(cfg)
     _validate_harness_models(cfg)
     redis_client = _init_redis_client(cfg)
-    app = FastAPI(title="Harness Chat (Dual-Track)", version="0.1.0")
+    app = FastAPI(title="Harness Chat Runtime", version="0.1.0")
+    kernel_store = SQLiteKernelStore(resolve_kernel_sqlite_path(cfg.get("harness") or {}))
+    active_stream_runs: Dict[str, _ActiveStreamRun] = {}
+    active_stream_lock = asyncio.Lock()
 
     cors = (cfg.get("server") or {}).get("cors_allow_origins") or ["*"]
     app.add_middleware(
@@ -792,7 +854,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    harness = DualTrackHarness(cfg, redis_client=redis_client)
+    harness = RuntimeHarness(cfg, redis_client=redis_client)
 
     @app.on_event("startup")
     async def _warmup_startup() -> None:
@@ -928,19 +990,14 @@ def create_app() -> FastAPI:
     @app.get("/api/config")
     async def get_config() -> Dict[str, Any]:
         h = cfg.get("harness") or {}
-        ag = h.get("agent") or {}
         return {
             "harness": strip_secrets_from_mapping(copy.deepcopy(h)),
             "harness_summary": {
-                "default_mode": h.get("default_mode", "auto"),
-                "complexity": strip_secrets_from_mapping(copy.deepcopy(h.get("complexity") or {})),
-                "routing": strip_secrets_from_mapping(copy.deepcopy(h.get("routing") or {})),
-                "refine_chain": strip_secrets_from_mapping(copy.deepcopy(h.get("refine_chain") or {})),
-                "agent": {
-                    "enabled": bool(ag.get("enabled", True)),
-                    "max_iterations": ag.get("max_iterations", 5),
-                    "model": ag.get("model"),
-                },
+                "runtime": h.get("runtime", "adaptive_dag_v3"),
+                "dag_runtime": strip_secrets_from_mapping(copy.deepcopy(h.get("dag_runtime") or {})),
+                "quality_pipeline": strip_secrets_from_mapping(copy.deepcopy(h.get("quality_pipeline") or {})),
+                "runtime_orchestrator": strip_secrets_from_mapping(copy.deepcopy(h.get("runtime_orchestrator") or {})),
+                "search": strip_secrets_from_mapping(copy.deepcopy(h.get("search") or {})),
             },
             "models": list((cfg.get("models") or {}).keys()),
             "models_detail": redact_models_for_api(cfg.get("models") or {}),
@@ -948,8 +1005,8 @@ def create_app() -> FastAPI:
             "runtime_overlay_path": os.path.basename(CONFIG_RUNTIME_PATH),
             "runtime_overlay_active": os.path.isfile(CONFIG_RUNTIME_PATH),
             "routing_notes": {
-                "auto": "执行轨固定为 DAG Runtime；mode 主要影响预判与意图信号，Capability Planner 产出 capability_plan 供节点编排消费。",
-                "sync_api_agent": "非流式 POST /api/chat 与流式 SSE 共用同一 DAG Runtime（聚合 run_stream 事件）；不存在单独的同步降级 Agent/Refine 旁路。",
+                "runtime": "所有请求统一进入 Adaptive Self-Correcting Async DAG Runtime；前端与客户端应发送 runtime=adaptive_dag_v3。",
+                "sync_stream_contract": "POST /api/chat 与 POST /api/chat/stream 共用同一 DAG Runtime 事件序列；不再暴露 fast/refine/agent 轨道语义。",
             },
         }
 
@@ -988,10 +1045,24 @@ def create_app() -> FastAPI:
             "message": "已合并到当前进程中的配置，并已写入 config.runtime.yaml（下次启动仍会叠加在 config.yaml 之上）。",
         }
 
+    @app.post("/api/chat/cancel")
+    async def cancel_chat_run(body: CancelRunRequest) -> Dict[str, Any]:
+        run_id = str(body.run_id or "").strip()
+        if not run_id:
+            raise HTTPException(status_code=400, detail="run_id 不能为空")
+        async with active_stream_lock:
+            active_run = active_stream_runs.get(run_id)
+        if active_run is None:
+            return {"ok": True, "run_id": run_id, "cancelled": False, "reason": "not_active"}
+        active_run.cancel_event.set()
+        return {"ok": True, "run_id": run_id, "cancelled": True}
+
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(req: ChatRequest) -> Any:
         options = dict(req.options or {})
         options.setdefault("trace_id", new_trace_id())
+        options.setdefault("run_id", str(options.get("client_run_id") or options.get("trace_id") or new_trace_id()))
+        options.setdefault("_kernel_store", kernel_store)
 
         raw_msgs = [m.model_dump() for m in req.messages]
         hist, current = _split_current_from_history(raw_msgs, req.prompt)
@@ -1008,7 +1079,7 @@ def create_app() -> FastAPI:
         options["_documents_context_block"] = block
         options["_documents_context_meta"] = dmeta
         options["_documents_context_block_compact"] = str((dmeta or {}).get("compact_block") or "")
-        result = await harness.run(str(last_prompt), messages=hist, mode=req.mode, options=options)
+        result = await harness.run(str(last_prompt), messages=hist, mode=req.runtime, options=options)
         return result
 
     @app.post("/api/chat/stream")
@@ -1016,17 +1087,20 @@ def create_app() -> FastAPI:
         """流式 SSE 接口"""
         options = dict(req.options or {})
         trace_id = options.setdefault("trace_id", new_trace_id())
-        
+        client_run_id = str(options.get("client_run_id") or "").strip()
+        run_id = str(options.get("run_id") or client_run_id or trace_id).strip() or trace_id
+        options["run_id"] = run_id
+        after_seq = _int_option(options, "after_seq", 0, minimum=0, maximum=10**9)
+        stream_connect_attempt = _int_option(options, "stream_connect_attempt", 0, minimum=0, maximum=20)
+
         session_id = req.session_id
         redis_key = f"chat_session:{session_id}" if session_id else None
-        
-        # 仅当前端明确选择服务端历史时才用 Redis 覆盖请求体，避免编辑/重生成后混入旧上下文。
+
         historical_messages = [m.model_dump() for m in req.messages]
         prefer_server_history = bool(options.get("prefer_server_history"))
         history_cache_hit = False
-        if prefer_server_history and redis_client and redis_key:
+        if prefer_server_history and redis_client and redis_key and stream_connect_attempt == 0:
             try:
-                # 同步 Redis 会阻塞整个 asyncio 事件循环，导致 SSE 在首包发出前就卡死；放入线程并限时。
                 cached_msgs = await asyncio.wait_for(
                     asyncio.to_thread(redis_client.lrange, redis_key, 0, -1),
                     timeout=2.5,
@@ -1040,17 +1114,16 @@ def create_app() -> FastAPI:
         historical_messages, current_prompt_content = _split_current_from_history(
             historical_messages, req.prompt
         )
-
         current_user_msg = {"role": "user", "content": current_prompt_content}
 
         last_prompt_str = _content_to_text(current_prompt_content)
         if not str(last_prompt_str).strip() and isinstance(options.get("documents"), list) and options.get("documents"):
             last_prompt_str = "请根据上传的文档回答问题。"
-
         _ensure_non_empty_prompt(str(last_prompt_str), historical_messages)
 
         options["search_prompt_base"] = str(last_prompt_str)
         options["session_id"] = session_id or ""
+        options["_kernel_store"] = kernel_store
         hdoc = (cfg.get("harness") or {}).get("documents") or {}
         options["_doc_bm25_weight"] = float(hdoc.get("bm25_weight", 0.55))
         options["_doc_embedding_weight"] = float(hdoc.get("embedding_weight", 0.45))
@@ -1059,11 +1132,6 @@ def create_app() -> FastAPI:
         options["_documents_context_meta"] = dmeta2
         options["_documents_context_block_compact"] = str((dmeta2 or {}).get("compact_block") or "")
 
-        client_run_id = str(options.get("client_run_id") or "").strip()
-        stream_connect_attempt = _int_option(options, "stream_connect_attempt", 0, minimum=0, maximum=20)
-        harness_options = {
-            k: v for k, v in options.items() if k not in ("client_run_id", "stream_connect_attempt")
-        }
         redis_history_items = _redis_history_limit(cfg)
         try:
             sse_queue_timeout_s = float((cfg.get("server") or {}).get("sse_queue_timeout_s", 15))
@@ -1071,121 +1139,172 @@ def create_app() -> FastAPI:
             sse_queue_timeout_s = 15.0
         sse_queue_timeout_s = max(5.0, min(120.0, sse_queue_timeout_s))
 
+        active_run: Optional[_ActiveStreamRun] = None
+        started_new_run = False
+
+        async with active_stream_lock:
+            existing = active_stream_runs.get(run_id)
+            if existing and not existing.producer_task.done():
+                active_run = existing
+            elif existing and existing.producer_task.done():
+                active_stream_runs.pop(run_id, None)
+
+            if active_run is None:
+                cancel_event = asyncio.Event()
+                publisher = KernelEventPublisher()
+                runner = KernelRunner(store=kernel_store, publisher=publisher)
+                options["_dag_cancel_event"] = cancel_event
+                options["_kernel_publisher"] = publisher
+                options["_kernel_runner"] = runner
+                harness_options = {
+                    k: v for k, v in options.items() if k not in ("client_run_id", "stream_connect_attempt", "after_seq")
+                }
+
+                active_run = _ActiveStreamRun(run_id=run_id, trace_id=trace_id, cancel_event=cancel_event)
+
+                async def _produce_live(run_ref: _ActiveStreamRun) -> None:
+                    try:
+                        async for ev in harness.run_stream(
+                            str(last_prompt_str),
+                            messages=historical_messages,
+                            mode=req.runtime,
+                            options=harness_options,
+                        ):
+                            await run_ref.fanout(ev)
+                    except Exception as exc:
+                        await run_ref.fanout(
+                            {
+                                "event": "error",
+                                "error": str(exc),
+                                "error_code": "SERVER_STREAM_EXCEPTION",
+                                "trace_id": trace_id,
+                                "run_id": run_id,
+                            }
+                        )
+                    finally:
+                        await run_ref.close()
+                        async with active_stream_lock:
+                            cur = active_stream_runs.get(run_id)
+                            if cur is run_ref:
+                                active_stream_runs.pop(run_id, None)
+
+                producer_task = asyncio.create_task(_produce_live(active_run))
+                active_run.producer_task = producer_task
+                active_stream_runs[run_id] = active_run
+                started_new_run = True
+
         async def event_generator():
             final_answer = ""
             reset_pending = False
             stream_failed = False
             terminal_error: Optional[Dict[str, Any]] = None
-            queue: asyncio.Queue = asyncio.Queue()
+            live_queue = active_run.subscribe() if active_run else None
+            store_row = await kernel_store.load_run(run_id)
+            replay_seq = max(0, int(after_seq or 0))
+            replayed_terminal = False
 
-            async def _produce() -> None:
-                lock_key: Optional[str] = None
-                renew_task: Optional[asyncio.Task] = None
-                renew_stop: Optional[asyncio.Event] = None
-                try:
-                    if redis_client and session_id and client_run_id and stream_connect_attempt == 0:
-                        lock_key = f"harness:sse_run:{session_id}:{client_run_id}"
-
-                        def _try_lock() -> bool:
-                            return bool(redis_client.set(lock_key, trace_id, nx=True, ex=1800))
-
-                        got = await asyncio.to_thread(_try_lock)
-                        if not got:
-                            await queue.put(
-                                {
-                                    "event": "error",
-                                    "error": "同一会话下该 client_run_id 已有进行中的流；请勿重复发起或稍后重试。",
-                                    "error_code": "STREAM_CLIENT_RUN_ACTIVE",
-                                    "trace_id": trace_id,
-                                }
-                            )
-                            return
-
-                        # 续期机制：避免长时间流式输出导致锁过期而被误并发
-                        renew_stop = asyncio.Event()
-
-                        async def _renew_lock_loop() -> None:
-                            assert lock_key is not None
-                            while True:
-                                try:
-                                    await asyncio.wait_for(renew_stop.wait(), timeout=300.0)
-                                    return
-                                except asyncio.TimeoutError:
-                                    pass
-                                try:
-                                    # 仅当锁仍归属当前 trace_id 时才续期
-                                    def _renew_if_owner() -> None:
-                                        try:
-                                            val = redis_client.get(lock_key)
-                                            if val is None:
-                                                return
-                                            cur = val.decode("utf-8") if isinstance(val, (bytes, bytearray)) else str(val)
-                                            if cur == trace_id:
-                                                redis_client.expire(lock_key, 1800)
-                                        except Exception:
-                                            return
-
-                                    await asyncio.to_thread(_renew_if_owner)
-                                except Exception:
-                                    return
-
-                        renew_task = asyncio.create_task(_renew_lock_loop())
-                    async for ev in harness.run_stream(
-                        str(last_prompt_str),
-                        messages=historical_messages,
-                        mode=req.mode,
-                        options=harness_options,
-                    ):
-                        await queue.put(ev)
-                except Exception as exc:
-                    await queue.put(
-                        {
-                            "event": "error",
-                            "error": str(exc),
-                            "error_code": "SERVER_STREAM_EXCEPTION",
-                            "trace_id": trace_id,
-                        }
-                    )
-                finally:
-                    if renew_stop:
-                        try:
-                            renew_stop.set()
-                        except Exception:
-                            pass
-                    if renew_task and not renew_task.done():
-                        try:
-                            renew_task.cancel()
-                        except Exception:
-                            pass
-                    if lock_key and redis_client:
-                        try:
-                            await asyncio.to_thread(redis_client.delete, lock_key)
-                        except Exception:
-                            pass
-                    await queue.put(None)
-
-            task = asyncio.create_task(_produce())
             try:
-                if prefer_server_history and redis_key and redis_client and not history_cache_hit:
-                    yield f"data: {json.dumps({'event': 'history_miss', 'session_id': session_id, 'trace_id': trace_id}, ensure_ascii=False)}\n\n"
-                while True:
-                    if await request.is_disconnected():
-                        task.cancel()
-                        break
+                if prefer_server_history and redis_key and redis_client and not history_cache_hit and started_new_run:
+                    yield f"data: {json.dumps({'event': 'history_miss', 'session_id': session_id, 'trace_id': trace_id, 'run_id': run_id}, ensure_ascii=False)}\n\n"
 
-                    try:
-                        event = await asyncio.wait_for(queue.get(), timeout=sse_queue_timeout_s)
-                    except asyncio.TimeoutError:
-                        yield f"data: {json.dumps({'event': 'heartbeat', 'trace_id': trace_id}, ensure_ascii=False)}\n\n"
-                        continue
-
-                    if event is None:
-                        break
-
-                    event = _normalise_stream_event(event)
-
+                replay_events = await kernel_store.load_public_events(run_id, after_seq=replay_seq)
+                store_row = await kernel_store.load_run(run_id)
+                if _history_already_stored(store_row) and active_run:
+                    active_run.history_stored = True
+                for raw_event in replay_events:
+                    event = _normalise_stream_event(dict(raw_event))
                     if not _sse_client_public_event(event):
                         continue
+                    final_answer, event_failed = _capture_stream_text(final_answer, event)
+                    seq = _load_public_event_seq(event)
+                    if seq > replay_seq:
+                        replay_seq = seq
+                    if event.get("event") == "content_reset":
+                        reset_pending = True
+                    elif event.get("event") == "chunk" and (event.get("data") or {}).get("content"):
+                        reset_pending = False
+                    if event.get("event") == "error":
+                        stream_failed = True
+                        terminal_error = {
+                            "event": "error_terminal",
+                            "error": str(event.get("error") or "服务端流式处理失败"),
+                            "error_code": str(event.get("error_code") or "STREAM_ERROR"),
+                            "trace_id": str(event.get("trace_id") or trace_id),
+                            "run_id": run_id,
+                            "reset_pending": bool(reset_pending),
+                        }
+                    elif event_failed:
+                        stream_failed = True
+                        replayed_terminal = True
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    if stream_failed:
+                        break
+
+                current_status = _store_run_status((store_row or {}).get("status"))
+                producer_done = bool(active_run is None or active_run.producer_task.done())
+                if replayed_terminal or (producer_done and current_status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}):
+                    if current_status == RunStatus.FAILED and not stream_failed:
+                        terminal_error = {
+                            "event": "error_terminal",
+                            "error": str((store_row or {}).get("error") or "runtime_failed"),
+                            "error_code": "RUN_FAILED",
+                            "trace_id": str((store_row or {}).get("trace_id") or trace_id),
+                            "run_id": run_id,
+                            "reset_pending": bool(reset_pending),
+                        }
+                        yield f"data: {json.dumps(terminal_error, ensure_ascii=False)}\n\n"
+                    elif current_status == RunStatus.CANCELLED and not stream_failed:
+                        terminal_error = {
+                            "event": "error_terminal",
+                            "error": str((store_row or {}).get("error") or "runtime_cancelled"),
+                            "error_code": "RUN_CANCELLED",
+                            "trace_id": str((store_row or {}).get("trace_id") or trace_id),
+                            "run_id": run_id,
+                            "reset_pending": bool(reset_pending),
+                        }
+                        yield f"data: {json.dumps(terminal_error, ensure_ascii=False)}\n\n"
+                    elif not stream_failed and redis_client and redis_key and final_answer and not reset_pending and not _history_already_stored(store_row):
+                        try:
+                            await asyncio.to_thread(
+                                _store_history,
+                                redis_client,
+                                redis_key,
+                                current_user_msg,
+                                final_answer,
+                                redis_history_items,
+                            )
+                            if active_run:
+                                active_run.history_stored = True
+                            store_row = {**dict(store_row or {}), 'history_stored': True}
+                            await kernel_store.upsert_run(run_id, store_row)
+                            yield f"data: {json.dumps({'event': 'history_stored', 'session_id': session_id, 'run_id': run_id}, ensure_ascii=False)}\n\n"
+                        except Exception as e:
+                            print(f"Failed to save to redis: {e}")
+                    yield "data: [DONE]\n\n"
+                    return
+
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    if live_queue is None:
+                        break
+                    try:
+                        item = await asyncio.wait_for(live_queue.get(), timeout=sse_queue_timeout_s)
+                    except asyncio.TimeoutError:
+                        yield f"data: {json.dumps({'event': 'heartbeat', 'trace_id': trace_id, 'run_id': run_id, 'event_seq': replay_seq}, ensure_ascii=False)}\n\n"
+                        continue
+
+                    if item is _ACTIVE_STREAM_SENTINEL:
+                        break
+
+                    event = _normalise_stream_event(dict(item))
+                    if not _sse_client_public_event(event):
+                        continue
+                    seq = _load_public_event_seq(event)
+                    if seq and seq <= replay_seq:
+                        continue
+                    if seq > replay_seq:
+                        replay_seq = seq
 
                     final_answer, event_failed = _capture_stream_text(final_answer, event)
                     if event.get("event") == "content_reset":
@@ -1199,6 +1318,7 @@ def create_app() -> FastAPI:
                             "error": str(event.get("error") or "服务端流式处理失败"),
                             "error_code": str(event.get("error_code") or "STREAM_ERROR"),
                             "trace_id": str(event.get("trace_id") or trace_id),
+                            "run_id": run_id,
                             "reset_pending": bool(reset_pending),
                         }
                     elif event_failed:
@@ -1207,9 +1327,30 @@ def create_app() -> FastAPI:
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                     if stream_failed:
                         break
-                    
-                # If everything succeeded and we have a final answer, update Redis
-                if not stream_failed and redis_client and redis_key and final_answer and not reset_pending:
+
+                store_row = await kernel_store.load_run(run_id)
+                current_status = _store_run_status((store_row or {}).get("status"))
+                if not stream_failed and current_status == RunStatus.FAILED:
+                    terminal_error = {
+                        "event": "error_terminal",
+                        "error": str((store_row or {}).get("error") or "runtime_failed"),
+                        "error_code": "RUN_FAILED",
+                        "trace_id": str((store_row or {}).get("trace_id") or trace_id),
+                        "run_id": run_id,
+                        "reset_pending": bool(reset_pending),
+                    }
+                    stream_failed = True
+                elif not stream_failed and current_status == RunStatus.CANCELLED:
+                    terminal_error = {
+                        "event": "error_terminal",
+                        "error": str((store_row or {}).get("error") or "runtime_cancelled"),
+                        "error_code": "RUN_CANCELLED",
+                        "trace_id": str((store_row or {}).get("trace_id") or trace_id),
+                        "run_id": run_id,
+                        "reset_pending": bool(reset_pending),
+                    }
+                    stream_failed = True
+                elif not stream_failed and redis_client and redis_key and final_answer and not reset_pending and current_status == RunStatus.COMPLETED and not _history_already_stored(store_row):
                     try:
                         await asyncio.to_thread(
                             _store_history,
@@ -1219,7 +1360,11 @@ def create_app() -> FastAPI:
                             final_answer,
                             redis_history_items,
                         )
-                        yield f"data: {json.dumps({'event': 'history_stored', 'session_id': session_id}, ensure_ascii=False)}\n\n"
+                        if active_run:
+                            active_run.history_stored = True
+                        store_row = {**dict(store_row or {}), 'history_stored': True}
+                        await kernel_store.upsert_run(run_id, store_row)
+                        yield f"data: {json.dumps({'event': 'history_stored', 'session_id': session_id, 'run_id': run_id}, ensure_ascii=False)}\n\n"
                     except Exception as e:
                         print(f"Failed to save to redis: {e}")
                 if stream_failed and terminal_error:
@@ -1231,15 +1376,13 @@ def create_app() -> FastAPI:
                     "error": str(e),
                     "error_code": "SSE_GENERATOR_ERROR",
                     "trace_id": trace_id,
+                    "run_id": run_id,
                 }
                 yield f"data: {json.dumps(err_event, ensure_ascii=False)}\n\n"
                 yield (
-                    f"data: {json.dumps({'event': 'error_terminal', 'error': str(e), 'error_code': 'SSE_GENERATOR_ERROR', 'trace_id': trace_id, 'reset_pending': bool(reset_pending)}, ensure_ascii=False)}\n\n"
+                    f"data: {json.dumps({'event': 'error_terminal', 'error': str(e), 'error_code': 'SSE_GENERATOR_ERROR', 'trace_id': trace_id, 'run_id': run_id, 'reset_pending': bool(reset_pending)}, ensure_ascii=False)}\n\n"
                 )
                 yield "data: [DONE]\n\n"
-            finally:
-                if not task.done():
-                    task.cancel()
 
         return StreamingResponse(
             event_generator(),

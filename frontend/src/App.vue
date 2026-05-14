@@ -4,7 +4,7 @@
       <div class="brand">
         <div class="dot" />
         <div class="title">Harness Chat</div>
-        <div class="subtitle">Harness：Fast / Refine / Agent</div>
+        <div class="subtitle">Adaptive Self-Correcting Async DAG Runtime</div>
       </div>
       <div class="actions">
         <button class="tab" :class="{ active: view === 'chat' }" @click="view = 'chat'">聊天</button>
@@ -48,7 +48,7 @@
           <div v-if="view === 'chat'" class="chat">
             <header class="chat-head">
               <div class="chat-head-title">{{ chatHeadTitle }}</div>
-              <div class="chat-head-badge" :title="'当前发送使用的路由模式：' + modeHeadBadge">{{ modeHeadBadge }}</div>
+              <div class="chat-head-badge" :title="'当前发送使用的运行时：' + runtimeHeadBadge">{{ runtimeHeadBadge }}</div>
             </header>
             <div v-if="chatBanner" class="chat-banner" role="status">{{ chatBanner }}</div>
             <div class="messages" ref="msgRef">
@@ -69,9 +69,9 @@
             <ChatInput
               ref="chatInput"
               :busy="interactionBusy"
-              :mode="mode"
+              :runtime="runtime"
               :global-search-disabled="globalWebSearchDisabled"
-              @update:mode="mode = $event"
+              @update:runtime="runtime = $event"
               @send="onSend"
               @stop="onStop"
             />
@@ -124,6 +124,7 @@ import {
   createStepRun as createStepRunEntry,
   createStreamContext,
   createUserMessage,
+  DEFAULT_RUNTIME,
   getSessionTitle as deriveSessionTitle,
   getRunTitle as deriveRunTitle,
   normalizePayload as normalizeChatPayload,
@@ -153,7 +154,7 @@ export default {
   data() {
     return {
       view: "chat",
-      mode: "auto",
+      runtime: DEFAULT_RUNTIME,
       busy: false,
       sessions: [],
       currentSessionId: null,
@@ -195,15 +196,8 @@ export default {
       if (!this.currentSession) return "新对话";
       return this.getSessionTitle(this.currentSession);
     },
-    modeHeadBadge() {
-      const m = {
-        auto: "自动轨道",
-        fast: "快速轨",
-        refine: "精化轨",
-        agent: "Agent 轨",
-        dag: "DAG Runtime",
-      };
-      const base = m[this.mode] || this.mode || "自动轨道";
+    runtimeHeadBadge() {
+      const base = this.runtimeLabel(this.runtime);
       if (this.globalWebSearchDisabled) {
         return `${base} · 全局离线`;
       }
@@ -426,6 +420,11 @@ export default {
         this.scheduleSaveSessions();
       });
     },
+    runtimeLabel(runtime) {
+      const value = String(runtime || "").trim().toLowerCase();
+      if (!value || value === DEFAULT_RUNTIME) return "Adaptive DAG Runtime";
+      return runtime;
+    },
     getSessionTitle(session) {
       return deriveSessionTitle(session);
     },
@@ -449,12 +448,10 @@ export default {
         this.configLoading = false;
       }
     },
-    /** 配置刷新/保存后：聊天区轨道、联网锁定与输入组件对齐服务端 harness */
+    /** 配置刷新/保存后：聊天区运行时、联网锁定与输入组件对齐服务端 harness */
     applyHarnessUiFromConfig() {
-      const dm = this.config?.harness?.default_mode;
-      if (dm && ["auto", "fast", "refine", "agent", "dag"].includes(String(dm).toLowerCase())) {
-        this.mode = String(dm).toLowerCase();
-      }
+      const configuredRuntime = String(this.config?.harness?.runtime || "").trim();
+      this.runtime = configuredRuntime || DEFAULT_RUNTIME;
       this.$nextTick(() => {
         try {
           this.$refs.chatInput?.syncFromServerConfig?.(this.config);
@@ -487,7 +484,7 @@ export default {
     createStepRun(userMsg, documents = [], searchMode = "auto", session = this.currentSession) {
       if (!session) return null;
       if (!session.stepRuns) session.stepRuns = [];
-      const run = createStepRunEntry(userMsg, documents, searchMode);
+      const run = createStepRunEntry(userMsg, documents, searchMode, this.runtime || DEFAULT_RUNTIME);
       session.stepRuns.push(run);
       this.activeRunId = run.id;
       this.scheduleSaveSessions();
@@ -565,15 +562,26 @@ export default {
     },
     async _applyStreamSseEvent(event, ctx, bundle) {
       const { run, pending, session } = bundle;
+      const incomingSeq = Math.max(0, Number(event?.event_seq || 0));
+      const incomingRunId = String(event?.run_id || "");
+      if (incomingRunId) {
+        run.serverRunId = incomingRunId;
+        ctx.lastRunId = incomingRunId;
+        pending.meta.run_id = incomingRunId;
+      }
+      if (incomingSeq > 0) {
+        if (incomingSeq <= Math.max(0, Number(ctx.lastEventSeq || 0))) return;
+        ctx.lastEventSeq = incomingSeq;
+        run.lastEventSeq = incomingSeq;
+      }
       // 任意 SSE 业务事件都应刷新空闲计时：仅在有 chunk 正文时刷新会导致
       // 预判/联网/Agent 推理/精化层等长时间无流式正文时被误判为断流并 abort。
       this._lastChunkAt = Date.now();
       if (event.event === "trace") {
         run.traceId = event.trace_id;
-        if (event.track) {
-          run.track = event.track;
-          pending.meta.track = event.track;
-        }
+        run.runtime = event.runtime || run.runtime || DEFAULT_RUNTIME;
+        if (incomingRunId) run.serverRunId = incomingRunId;
+        pending.meta.runtime = run.runtime;
         this.bumpStepUi();
         await this.$nextTick();
       } else if (event.event === "status") {
@@ -588,9 +596,6 @@ export default {
         this.upsertStep(run, event.step);
         const st = event.step || {};
         const meta = st.meta || {};
-        if (st.name === "track_select" && meta.agent_disabled_fallback) {
-          this.chatBanner = "您选择了 Agent 轨，但当前配置已关闭 Agent，已自动使用精化轨。";
-        }
         if (st.name === "web_search_policy" && st.status === "skipped") {
           this.chatBanner =
             meta.reason ||
@@ -604,9 +609,10 @@ export default {
         await this.$nextTick();
         this.scheduleScrollBottom();
       } else if (event.event === "stream_start") {
-        run.track = event.track;
+        run.runtime = event.runtime || run.runtime || DEFAULT_RUNTIME;
+        run.phase = event.phase || run.phase || "";
         run.traceId = event.trace_id;
-        pending.meta.track = event.track;
+        pending.meta.runtime = run.runtime;
         this.bumpStepUi();
         await this.$nextTick();
       } else if (event.event === "model_start") {
@@ -782,7 +788,7 @@ export default {
         this.removeAssistantMessageById(session, msg.id);
         this.scheduleSaveSessions();
       }
-      await this._triggerStream({ ...ctx, upgradeTrack: false, session });
+      await this._triggerStream({ ...ctx, session });
     },
     async onSend(payload) {
       if (!payload || this.interactionBusy) return;
@@ -808,7 +814,6 @@ export default {
         searchMode: userMsg.meta.searchMode,
         session,
         userMsg,
-        upgradeTrack: false,
       });
     },
     async _triggerStream(context = null) {
@@ -826,7 +831,6 @@ export default {
       }
       const documents = context?.documents || lastUser?.meta?.documents || [];
       const searchMode = context?.searchMode || lastUser?.meta?.searchMode || "auto";
-      const upgradeTrack = Boolean(context?.upgradeTrack);
       const run = this.createStepRun(lastUser || { content: "" }, documents, searchMode, session);
       if (!run) {
         this.busy = false;
@@ -839,6 +843,8 @@ export default {
 
       const promptBody = this._userContentToPrompt(lastUser && lastUser.content);
       const ctx = createStreamContext();
+      ctx.lastRunId = run.serverRunId || run.id;
+      ctx.lastEventSeq = Math.max(0, Number(run.lastEventSeq || 0));
       const { modelErrors } = ctx;
       const preferServerHistory = Boolean(session.useServerHistoryOnly);
       session.useServerHistoryOnly = false;
@@ -851,7 +857,7 @@ export default {
         const MAX_SSE_CONNECTS = 8;
 
         pending.content = "";
-        pending.meta = { ...pending.meta, streaming: true, track: "" };
+        pending.meta = { ...pending.meta, streaming: true, runtime: run.runtime || DEFAULT_RUNTIME };
         this._lastChunkAt = Date.now();
         if (this._streamIdleTimer) clearInterval(this._streamIdleTimer);
         this._streamIdleTimer = setInterval(() => {
@@ -888,13 +894,14 @@ export default {
             sessionId: session.id,
             prompt: promptBody,
             history,
-            mode: this.mode,
+            runtime: run.runtime || this.runtime || DEFAULT_RUNTIME,
             documents,
             searchMode,
-            upgradeTrack,
             preferServerHistory,
             clientRunId: run.id,
             streamConnectAttempt: attempt,
+            runId: run.serverRunId || run.id,
+            afterSeq: ctx.lastEventSeq || run.lastEventSeq || 0,
           });
 
           let res;
@@ -1008,6 +1015,7 @@ export default {
           this._streamIdleTimer = null;
         }
         if (e.name === "AbortError") {
+          await this._cancelActiveRun();
           const idle = Date.now() - this._lastChunkAt > CHAT_STREAM_IDLE_MS - 10000;
           pending.content += idle
             ? "\n\n[长时间无任何服务端推送，已中止连接；若模型仍在推理，可稍后重试。]"
@@ -1051,9 +1059,24 @@ export default {
         this.scrollToBottom();
       }
     },
-    onStop() {
+    async onStop() {
+      await this._cancelActiveRun();
       if (this.abortController) {
         this.abortController.abort();
+      }
+    },
+    async _cancelActiveRun() {
+      const run = (this.currentStepRuns || []).find((item) => item.id === this.activeRunId) || null;
+      const runId = String(run?.serverRunId || run?.id || "").trim();
+      if (!runId) return;
+      try {
+        await fetch(`${API_BASE}/api/chat/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ run_id: runId }),
+        });
+      } catch (_) {
+        /* ignore */
       }
     },
     async onEditMessage(msg) {
@@ -1124,7 +1147,6 @@ export default {
           documents: lastUser?.meta?.documents || [],
           searchMode: lastUser?.meta?.searchMode || "auto",
           session,
-          upgradeTrack: true,
         };
       });
       if (rerunContext) {

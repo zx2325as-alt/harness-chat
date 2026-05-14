@@ -29,8 +29,8 @@ def _clamp01(x: Any, default: float = 0.0) -> float:
     return max(0.0, min(1.0, v))
 
 
-def intent_from_legacy_analysis(analysis: Dict[str, Any]) -> RuntimeIntent:
-    """将现有 analyze_complexity 字典映射为 RuntimeIntent（迁移期兼容）。"""
+def intent_from_analysis(analysis: Dict[str, Any]) -> RuntimeIntent:
+    """将 analyze_complexity 字典映射为 RuntimeIntent。"""
     cx = str(analysis.get("complexity") or "low").lower()
     reasoning = 0.85 if cx == "high" else 0.62 if cx == "medium" else 0.38
 

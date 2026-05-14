@@ -1,4 +1,4 @@
-"""从用户文案与 options 推导 search_intent / response_style，并与分析器 suggested_track 对齐。"""
+"""从用户文案与 options 推导 search_intent / response_style 等 runtime signals。"""
 from __future__ import annotations
 
 import re
@@ -129,13 +129,6 @@ def _norm_si(v: str) -> str:
     return ""
 
 
-def norm_suggested_track(v: str) -> str:
-    x = (v or "").strip().lower()
-    if x in ("fast", "refine", "agent"):
-        return x
-    return ""
-
-
 def detect_high_risk_domain(prompt: str) -> Tuple[bool, List[str]]:
     t = (prompt or "").strip()
     hits: List[str] = []
@@ -236,25 +229,10 @@ def derive_user_signals(prompt: str, options: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def apply_suggested_track_on_conflict(signals: Dict[str, Any], analysis: Dict[str, Any]) -> Dict[str, Any]:
-    """当快速/深入表述冲突时，以分析器 suggested_track 覆盖 response_style（仅输出形态，不是轨道）。"""
-    out = dict(signals)
-    if not signals.get("intent_conflict"):
-        return out
-    st = norm_suggested_track(str(analysis.get("suggested_track") or ""))
-    if st == "fast":
-        out["response_style"] = "short"
-        out["response_style_source"] = "analyzer_suggested_track"
-    elif st in ("refine", "agent"):
-        out["response_style"] = "deep"
-        out["response_style_source"] = "analyzer_suggested_track"
-    return out
-
-
 def merge_signals_into_analysis(
     analysis: Dict[str, Any], signals: Dict[str, Any], user_prompt: str = ""
 ) -> Dict[str, Any]:
-    sig2 = apply_suggested_track_on_conflict(signals, analysis)
+    sig2 = dict(signals)
     out = {**analysis}
     out["search_intent"] = sig2.get("search_intent", "none")
     out["_routing_signals"] = sig2

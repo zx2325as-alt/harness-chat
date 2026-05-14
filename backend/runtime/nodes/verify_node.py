@@ -3,12 +3,38 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from escalation_engine import merge_issues_into_execution_state
 from refine_shared import _pg
 from runtime.dag_common import user_status
 from runtime.kernel.runtime_context import DAGRuntimeContext
 from runtime.quality.verification_engine import run_verify_with_evidence_mapping
 from runtime_metrics import emit_product_metric
+
+
+def _merge_verify_result_into_execution_state(options: Dict[str, Any], result: Dict[str, Any]) -> None:
+    from runtime_state import get_execution_state
+
+    st = get_execution_state(options)
+    if not st:
+        return
+    issues = result.get("issues")
+    if isinstance(issues, list):
+        for x in issues[:16]:
+            s = str(x).strip()
+            if s and s not in st.critic_issues:
+                st.critic_issues.append(s)
+    missing_constraints = result.get("missing_constraints")
+    if isinstance(missing_constraints, list):
+        for x in missing_constraints[:8]:
+            s = str(x).strip()
+            if s:
+                st.critic_issues.append(f"constraint:{s}")
+    try:
+        st.quality_score = float(result.get("quality_score") or st.quality_score)
+        st.hallucination_risk = float(result.get("hallucination_risk") or st.hallucination_risk)
+        st.completeness_score = float(result.get("completeness") or st.completeness_score)
+        st.confidence_score = float(result.get("factuality") or st.confidence_score)
+    except (TypeError, ValueError):
+        pass
 
 
 async def execute_round(
@@ -30,7 +56,7 @@ async def execute_round(
             "step": {
                 "name": "dag_verify",
                 "status": "running",
-                "meta": _pg({"round": round_idx}, "review", "DAG：Verify Node"),
+                "meta": _pg({"round": round_idx}, "verify", "DAG：Verify Node"),
             },
         }
     )
@@ -44,14 +70,14 @@ async def execute_round(
         hcfg,
         search_context=ev_text,
     )
-    merge_issues_into_execution_state(opt, uc)
+    _merge_verify_result_into_execution_state(opt, uc)
     if st:
         st.verification_reports.append({"round": round_idx, "verify": uc})
     try:
         after_q = float(uc.get("quality_score") or 0.0)
         emit_product_metric(
             hcfg,
-            "refine_quality_delta",
+            "verify_quality_delta",
             trace_id=trace_id,
             before_verify=before_q,
             after_verify=after_q,
@@ -66,7 +92,7 @@ async def execute_round(
             "step": {
                 "name": "dag_verify",
                 "status": "ok",
-                "meta": _pg({"unified_critic": uc}, "review", "验证完成。"),
+                "meta": _pg({"unified_critic": uc}, "verify", "验证完成。"),
             },
         }
     )

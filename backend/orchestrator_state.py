@@ -1,19 +1,18 @@
 """
 Capability Planner + ExecutionState 引导启动。
-轨道真相源：runtime_state.ExecutionState.current_track（与 options["_runtime_track"] 同步）。
+执行状态真相源：runtime_state.ExecutionState.current_phase / active_capabilities。
 """
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from runtime_state import ExecutionState, is_strict_track_upgrade
+from runtime_state import ExecutionState
+from runtime.kernel.kernel_models import RunStatus, now_ts_ms
 
 __all__ = [
     "ExecutionState",
     "apply_capability_planner",
     "bootstrap_execution_state",
-    "record_track_escalation",
-    "can_escalate",
 ]
 
 
@@ -95,7 +94,7 @@ def _compact_documents_meta(documents: Any) -> List[Dict[str, Any]]:
 def apply_capability_planner(analysis: Dict[str, Any]) -> Dict[str, Any]:
     """
     Capability Planner：产出 capability_plan（能力与检索策略），供 DAG Runtime 节点消费。
-    执行轨固定为 DAG；运行中真相源为 ExecutionState.current_track（与 options["_runtime_track"] 同步）。
+    运行时统一由 Adaptive DAG Runtime 执行，不再维护互斥 track 真相源。
     """
     cx = str(analysis.get("complexity") or "low").lower()
     if cx not in ("low", "medium", "high"):
@@ -113,11 +112,10 @@ def apply_capability_planner(analysis: Dict[str, Any]) -> Dict[str, Any]:
 def bootstrap_execution_state(
     trace_id: str,
     prompt: str,
-    initial_track: str,
     analysis: Dict[str, Any],
     options: Dict[str, Any],
     *,
-    max_escalations: int = 2,
+    max_repair_rounds: int = 2,
     messages: Optional[List[Dict[str, Any]]] = None,
 ) -> ExecutionState:
     lims = list(analysis.get("limitations") or [])
@@ -126,6 +124,10 @@ def bootstrap_execution_state(
     bud = options.get("_search_budget_remaining")
     st = ExecutionState(
         request_id=trace_id,
+        run_id=str(options.get("run_id") or trace_id),
+        run_status=RunStatus.RUNNING,
+        started_at_ms=now_ts_ms(),
+        updated_at_ms=now_ts_ms(),
         prompt=(prompt or "")[:8000],
         history_digest=hist,
         documents_digest=docs,
@@ -133,36 +135,13 @@ def bootstrap_execution_state(
         documents=_documents_snapshot(options.get("documents")),
         history_tail=_compact_history_tail(messages),
         documents_meta=_compact_documents_meta(options.get("documents")),
-        initial_track=str(initial_track).strip().lower(),
-        current_track=str(initial_track).strip().lower(),
         limitations=lims,
         search_budget=bud if isinstance(bud, int) else None,
         search_budget_remaining=bud if isinstance(bud, int) else None,
-        max_escalations=max(1, min(8, int(max_escalations))),
+        max_repair_rounds=max(1, min(8, int(max_repair_rounds))),
     )
+    st.set_phase("intake", bootstrap=True)
     options["_execution_state"] = st
-    options["_runtime_track"] = st.current_track
+    options["_runtime_name"] = st.runtime_name
+    options["_runtime_phase"] = st.current_phase
     return st
-
-
-def record_track_escalation(options: Dict[str, Any], from_track: str, to_track: str) -> bool:
-    """仅在严格升级（runtime_state.TRACK_RANK 秩上升）时更新状态并计入 escalation_count。"""
-    ft = str(from_track).strip().lower()
-    tt = str(to_track).strip().lower()
-    if not is_strict_track_upgrade(ft, tt):
-        return False
-    st: Optional[ExecutionState] = options.get("_execution_state")
-    if not isinstance(st, ExecutionState):
-        return False
-    st.escalation_count += 1
-    st.current_track = tt
-    st.escalation_path.append(f"{ft}->{tt}")
-    options["_runtime_track"] = st.current_track
-    return True
-
-
-def can_escalate(options: Dict[str, Any]) -> bool:
-    st: Optional[ExecutionState] = options.get("_execution_state")
-    if not isinstance(st, ExecutionState):
-        return True
-    return st.escalation_count < st.max_escalations

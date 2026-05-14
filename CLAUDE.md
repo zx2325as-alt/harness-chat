@@ -5,107 +5,128 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Development commands
 
 ### Full stack
-- Start both services: `./start_all.sh`
+- Start both services: `./start_all.sh` (Windows: `start_all.bat`)
 - Stop both services: `./stop_all.sh`
-- Windows launcher: `start_all.bat`
+- Logs land in `logs/backend.log` and `logs/frontend.log`
 
-`start_all.sh` starts:
-- backend API on `http://127.0.0.1:8000`
-- frontend dev server on `http://127.0.0.1:6008`
-- logs under `logs/backend.log` and `logs/frontend.log`
-
-### Backend
-Run from `backend/` unless noted otherwise.
-
-- Install dependencies: `pip install -r requirements.txt`
-- Start dev server: `uvicorn app:app --reload --port 8000`
-- Alternate start: `python -m uvicorn app:app --reload --port 8000`
+### Backend (run from `backend/`)
+- Install: `pip install -r requirements.txt`
+- Start: `uvicorn app:app --reload --port 8000`
 - Smoke check: `python scripts/smoke_check.py`
 
-There is no established pytest/lint configuration in the repo root or backend at the moment. Prefer the smoke check plus targeted manual verification of the affected API path.
+There is no pytest/lint configuration. Use the smoke check plus targeted manual verification of affected API paths.
 
-### Frontend
-Run from `frontend/`.
-
-- Install dependencies: `npm install`
-- Start dev server: `npm run serve`
+### Frontend (run from `frontend/`)
+- Install: `npm install`
+- Dev server (port 6008, proxies `/api` → `localhost:8000`): `npm run serve`
 - Production build: `npm run build`
 
-There is no frontend lint or automated test script in `frontend/package.json` currently.
+There is no frontend lint or automated test script.
 
 ## Architecture overview
 
-This is a FastAPI + Vue 3 monorepo for a chat-style “Harness Chat” application.
+FastAPI + Vue 3 monorepo. The backend implements an **adaptive self-correcting async DAG runtime** (`adaptive_dag_v3`). Both `/api/chat` (sync) and `/api/chat/stream` (SSE) share the same underlying `harness.run_stream()` event source — the sync endpoint simply aggregates the stream into a `ChatResponse`. Any change to streaming format affects both endpoints.
 
-### Backend shape
-- API entrypoint: `backend/app.py`
-- Core harness orchestration: `backend/harness.py`
-- Shared stream/sync runtime wrapper: `backend/runtime_executor.py`
-- Runtime DAG implementation: `backend/runtime/`
-- Runtime config overlay helpers: `backend/config_runtime.py`
-- Search abstraction: `backend/search_service.py`
+### Request lifecycle
 
-`backend/app.py` constructs the FastAPI app, loads `config.yaml`, overlays `config.runtime.yaml`, initializes Redis if configured, creates `DualTrackHarness`, and exposes both synchronous and SSE chat endpoints plus config/document APIs.
+```
+POST /api/chat[/stream]
+  → app.py: validate, resolve session, call runtime_executor
+  → runtime_executor.py: calls harness.run_stream()
+  → harness.py: complexity analysis → RuntimeIntent → RuntimeHarness.run()
+  → runtime/dag_stream.py: Intent → Planner → DAG construction
+  → runtime/nodes/dag_phases.py: parallel search / draft / critic / repair / finalize
+  → event stream: trace | step | chunk | content_reset | model_end | error
+```
 
-The backend is now organized around a unified runtime stream rather than separate fully independent execution tracks. `backend/runtime_executor.py` makes synchronous REST responses and streaming responses share the same underlying event stream. The main execution path is the adaptive DAG runtime in `backend/runtime/dag_stream.py`.
+### SSE event types
+Events are dicts with an `event` key, parsed in `frontend/src/chatShared.js` and rendered by `App.vue` / `StepDisplay.vue`:
+- `trace`: Protocol metadata, phase, trace ID
+- `step`: Execution step with name, status, meta, latency
+- `chunk`: Progressive text content for rendering
+- `content_reset`: Clear render buffer (new answer phase starting)
+- `model_end`: Model call completion with latency/token counts
+- `error`: Failure details
 
-The DAG runtime is conceptually:
-- analyze intent/complexity
-- plan execution
-- run a DAG of search / draft / quality / finalize stages
-- stream step events and answer chunks back to the client
+### Runtime intent scoring (`runtime/models/runtime_intent.py`)
+The analyzer outputs continuous scores (not mutually exclusive tracks):
+- `reasoning_score`, `search_score`, `risk_score` (0–1)
+- `latency_budget`: low (5s) / medium (20s) / high (45s)
+- `quality_requirement`: low / medium / high
+- `realtime_requirement`, `tool_requirement`: booleans
 
-The `backend/runtime/` package is split by concern:
-- `orchestrator/`: runtime planning, scheduling, budgets, escalation
-- `nodes/`: executable DAG nodes such as search, draft, critic, verify, repair, finalize, agent
-- `quality/`: verification / sufficiency / hallucination / repair logic
-- `parallel/`: parallel search and speculative execution helpers
-- `streaming/`: progressive streaming behavior
-- `state/` and `cache/`: execution state, evidence, semantic memory, caches
-- `models/`: router / critic / verifier / runtime-intent data models
+These scores drive DAG parallelism levels dynamically — there are no fixed fast/refine/agent tracks.
 
-### API surface
-Key routes live in `backend/app.py`:
-- `POST /api/chat`
-- `POST /api/chat/stream`
-- `GET /api/config`
-- `PUT /api/config/runtime`
-- `POST /api/documents/parse`
-- `POST /api/documents/parse_folder`
-- `POST /api/feedback`
-- `DELETE /api/session/{session_id}/history`
-- `GET /api/health`
+### DAG execution phases (`runtime/nodes/dag_phases.py`, 38KB)
+1. **Intake**: Complexity analysis + runtime planning
+2. **Search**: Parallel web/doc searches (query count from config)
+3. **Draft**: Parallel drafts with hedged delay
+4. **Quality**: Parallel critics → repair loop (max 2 rounds) if issues found
+5. **Finalize**: Markdown formatting + polish
 
-### Configuration model
-Backend behavior is heavily config-driven:
-- base config: `backend/config.yaml`
-- runtime overrides persisted separately: `backend/config.runtime.yaml`
+Critic facets (in `runtime/quality/critic_engine.py`): coverage, logic, evidence, hallucination, policy. Each outputs structured JSON with optional `needs_search` hints.
 
-When changing runtime behavior, check whether the change belongs in the base config schema, the runtime patch schema, or both. The frontend config screen writes runtime overrides through `PUT /api/config/runtime`, so config changes often require keeping API serialization and UI expectations aligned.
+Quality pipeline has three layers configured in `config.yaml`:
+- Layer 1 (draft): Wide coverage gap detection
+- Layer 2 (review): Error correction; delimited by `<<<FINAL_ANSWER>>>...<<<END_FINAL_ANSWER>>>`
+- Layer 3 (polish): Final refinement
 
-### Frontend shape
-- App bootstrap: `frontend/src/main.js`
-- Top-level UI/state container: `frontend/src/App.vue`
-- Shared chat helpers and SSE parsing: `frontend/src/chatShared.js`
-- Session persistence and quota fallback: `frontend/src/sessionPersistence.js`
-- Config screen: `frontend/src/components/ConfigView.vue`
-- Step/run visualization: `frontend/src/components/StepDisplay.vue`
+### Two-layer configuration system
+- **`backend/config.yaml`**: Full schema — model registry, search settings, quality pipeline, API keys
+- **`backend/config.runtime.yaml`**: Runtime overrides persisted via `PUT /api/config/runtime`; deep-merged on top of base config
 
-The frontend is a single-page Vue 3 app with two main views:
-- chat UI
-- runtime configuration UI
+When changing runtime behavior, determine whether the change belongs in the base schema, the runtime patch schema, or both. The frontend config screen writes runtime overrides through the API, so serialization and UI expectations must stay aligned.
 
-`App.vue` owns the main session state, active run state, request lifecycle, and step panel visibility. It sends chat requests to the backend, consumes SSE frames for `/api/chat/stream`, and stores conversation/session state in IndexedDB with localStorage fallback.
+**Secret handling**: `config_runtime.py` detects secret keys by prefix/suffix (`api_key*`, `*_secret`, `*_token`, `*_api_key`). API responses redact secrets; client patches are sanitized to prevent accidental overwrites. Add new secret keys to the `SECRET_KEY_*` sets in `config_runtime.py`.
 
-Frontend development uses Vue CLI dev server on port `6008`. `frontend/vue.config.js` proxies `/api` to `http://127.0.0.1:8000`, so frontend code should generally use same-origin `/api` paths instead of hardcoding backend hosts.
+Key config sections:
+| Section | Controls |
+|---|---|
+| `harness.dag_runtime` | Parallel search count, critic count, max repair rounds |
+| `harness.task_model_templates` | Model pools per task type (reasoning / generation / code / conversation) with draft/review/polish tiers |
+| `harness.search` | Tavily/DuckDuckGo, depth, result count, cache TTL, authority ranking |
+| `harness.documents` | BM25 (55%) + embedding (45%) weights, chunk size (7000 chars), reranking (BGE-v2-m3) |
+| `harness.quality_pipeline` | Per-layer temperatures and instructions |
+| `harness.runtime_orchestrator` | Budget manager, unified critic, metrics storage |
+| `models.*` | Per-model OpenAI-compatible config: base_url, api_key, timeout |
 
-### Persistence and streaming details
-- Client sessions are persisted locally in the browser, primarily via IndexedDB.
-- Server-side conversation history can also be used via session IDs and Redis-backed state.
-- The UI exposes detailed execution steps; backend SSE step payloads are therefore part of the product contract, not just debugging output.
+### Search service (`backend/search_service.py`)
+- Primary: Tavily; fallback: DuckDuckGo
+- Session caching with 30-min default TTL
+- Speculative markers: keywords (weather, news, stock, etc.) trigger implicit search
+- Authority ranking blends official domain hints with BM25/embedding scores
 
-## Working notes for future changes
-- If you change the backend streaming event format, also inspect the frontend SSE parsing and step rendering path in `frontend/src/chatShared.js`, `frontend/src/App.vue`, and `frontend/src/components/StepDisplay.vue`.
-- If you change runtime configuration fields, verify all of: `backend/config.yaml`, `backend/config.runtime.yaml`, `backend/config_runtime.py`, `backend/app.py`, and `frontend/src/components/ConfigView.vue`.
-- If you change chat execution flow, verify both sync and streaming endpoints because they share the same runtime event source but have different response assembly.
-- The repo currently contains checked-in runtime/logical evolution artifacts and some generated Python cache directories under `backend/runtime/__pycache__`; avoid treating those as architectural sources.
+### Document processing
+- Hybrid retrieval: BM25 (55%) + embedding (45%), embedding model `text-embedding-3-large`
+- Chunking: 7000 chars, 900-char overlap
+- Reranking: BGE v2 M3 (top-8 from top-12)
+- Limits: 100 PDF pages, 2500 sheet rows
+
+### State tracking (`runtime/state/`)
+- `ExecutionState`: Goals, resolved/unresolved list, risk scores, phases
+- `EvidenceGraph`: Search result references with source tracking for quality auditing
+- `SemanticMemory`: Turn-local caching to avoid redundant searches
+
+### Observability
+- Product metrics emitted as JSONL via `emit_product_metric()`
+- Metrics SQLite: `data/runtime_metrics.sqlite`
+- Tracked: thumb_down_rate, retry_rate, followup_rate, latency_breakdown, escalation_rate
+
+### Frontend (`frontend/src/`)
+- `App.vue`: Owns session state, active run state, SSE consumption, step panel visibility
+- `chatShared.js`: SSE event parsing, session/run/message ID generation
+- `sessionPersistence.js`: IndexedDB primary, localStorage fallback
+- `ConfigView.vue`: Writes runtime overrides through `PUT /api/config/runtime`
+- `StepDisplay.vue`: Right sidebar — step visualization, resizable, syncs with live run
+- Rendering: `marked` (Markdown), KaTeX (math), DOMPurify (sanitization)
+
+### Session persistence
+- Client sessions: IndexedDB (primary) → localStorage (fallback), UUID-based
+- Server-side: optional Redis-backed history via session IDs
+
+## Cross-cutting change rules
+
+- **Streaming format change** → inspect `chatShared.js`, `App.vue`, `StepDisplay.vue`
+- **Runtime config field change** → update all of: `config.yaml`, `config.runtime.yaml`, `config_runtime.py`, `app.py`, `ConfigView.vue`
+- **Chat execution flow change** → verify both sync and streaming endpoints
+- **New secret key** → add to `SECRET_KEY_*` sets in `config_runtime.py`

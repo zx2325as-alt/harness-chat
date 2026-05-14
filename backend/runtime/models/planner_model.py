@@ -20,15 +20,15 @@ def describe_dynamic_plan(intent: RuntimeIntent, plan: "PlanDescription", prompt
     if plan.layered_critics:
         then.append("layered_parallel_critics")
     elif plan.parallel_critics:
-        then.append("dual_track_critics")
+        then.append("paired_parallel_critics")
     else:
         then.append("unified_critic")
     then.extend(["targeted_repair_loop", "verify_answer", "deterministic_finalize"])
     caps = ["search", "draft", "critic", "repair", "verify", "finalize"]
     if plan.use_tool_gate:
         caps.insert(2, "tool_use_gate")
-    if plan.use_agent_subgraph:
-        caps.insert(3, "agent_goal_gate")
+    if plan.use_goal_subgraph:
+        caps.insert(3, "goal_capability_gate")
     return {
         "parallel_wave_1": parallel,
         "sequential_core": then,

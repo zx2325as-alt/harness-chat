@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 from json_utils import extract_balanced_json_object, strip_markdown_json_fence
 
-RECOMMENDED_ACTIONS = frozenset({"accept", "refine", "search_more", "agent_recover", "reject"})
+RECOMMENDED_ACTIONS = frozenset({"accept", "repair", "search_more", "tool_use", "reject"})
 
 
 def _orch(hcfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -72,9 +72,9 @@ async def evaluate_unified_critic(
         "parse_ok": False,
     }
     orch_cfg = _orch(hcfg)
-    stages = orch_cfg.get("rollout_stages") if isinstance(orch_cfg.get("rollout_stages"), dict) else {}
-    if stages.get("unified_critic") is False:
-        return {**defaults, "issues": ["rollout_unified_critic_disabled"], "parse_ok": False}
+    critic_cfg = orch_cfg.get("unified_critic") if isinstance(orch_cfg.get("unified_critic"), dict) else {}
+    if critic_cfg.get("enabled") is False:
+        return {**defaults, "issues": ["unified_critic_disabled"], "parse_ok": False}
 
     cands = _critic_models(harness, hcfg)
     if not cands:
@@ -94,16 +94,16 @@ async def evaluate_unified_critic(
             "你是答案验证器，只输出 JSON。检查：是否回答全部子问题、是否遗漏用户约束、是否与检索摘要冲突、是否存在臆测。\n"
             "字段：quality_score(0-10), completeness(0-1), factuality(0-1), clarity(0-1), hallucination_risk(0-1), "
             "missing_constraints(string[]), issues(string[]), recommended_action。\n"
-            "recommended_action 只能是：accept | refine | search_more | agent_recover | reject。\n"
-            "若不通过验证应优先 refine；缺证据用 search_more；需多步推理工具链用 agent_recover；严重违规用 reject。\n"
+            "recommended_action 只能是：accept | repair | search_more | tool_use | reject。\n"
+            "若不通过验证应优先 repair；缺证据用 search_more；需启用工具能力或外部执行用 tool_use；严重违规用 reject。\n"
         )
     else:
         instruction = (
             "你是统一质量评估器，只输出 JSON，不要 markdown 围栏。\n"
             "字段：quality_score(0-10), completeness(0-1), factuality(0-1), clarity(0-1), hallucination_risk(0-1), "
             "missing_constraints(string[]), issues(string[]), recommended_action。\n"
-            "recommended_action 只能是：accept | refine | search_more | agent_recover | reject。\n"
-            "明显遗漏、论证不足、事实风险高、与用户约束冲突时应 refine；缺实时证据 search_more；复杂工具推理 agent_recover。\n"
+            "recommended_action 只能是：accept | repair | search_more | tool_use | reject。\n"
+            "明显遗漏、论证不足、事实风险高、与用户约束冲突时应 repair；缺实时证据 search_more；需要工具能力或外部执行时 tool_use。\n"
         )
 
     critic_prompt = (
@@ -115,14 +115,14 @@ async def evaluate_unified_critic(
     opts = {**options, "temperature": 0.05, "max_retries": 0}
     res, _ = await harness._ask_with_fallback(cands, critic_prompt, opts, messages=None)
     if not res or not res.success:
-        return {**defaults, "issues": ["unified_critic_failed"], "recommended_action": "refine"}
+        return {**defaults, "issues": ["unified_critic_failed"], "recommended_action": "repair"}
 
     raw_txt = strip_markdown_json_fence(res.content or "")
     blob = extract_balanced_json_object(raw_txt) or raw_txt
     try:
         data = json.loads(blob) if isinstance(blob, str) else {}
     except json.JSONDecodeError:
-        return {**defaults, "issues": ["unified_critic_json_invalid"], "recommended_action": "refine"}
+        return {**defaults, "issues": ["unified_critic_json_invalid"], "recommended_action": "repair"}
 
     def _str_list(k: str) -> List[str]:
         v = data.get(k)
@@ -146,90 +146,8 @@ async def evaluate_unified_critic(
     return out
 
 
-async def evaluate_fast_answer(
-    harness: Any,
-    prompt: str,
-    draft: str,
-    analysis: Dict[str, Any],
-    options: Dict[str, Any],
-    hcfg: Dict[str, Any],
-    *,
-    search_context: str = "",
-) -> Dict[str, Any]:
-    """
-    文档第四章 Fast Critic：委托 unified_critic，并映射 score / factual_risk / needs_escalation。
-    """
-    orch = _orch(hcfg)
-    gate = orch.get("fast_quality_gate") if isinstance(orch.get("fast_quality_gate"), dict) else {}
-    min_chars = int(gate.get("min_draft_chars", 48))
-    if len((draft or "").strip()) < min_chars:
-        stub = {
-            "quality_score": 8.0,
-            "completeness": 0.85,
-            "factuality": 0.85,
-            "clarity": 0.8,
-            "hallucination_risk": 0.15,
-            "missing_constraints": [],
-            "issues": ["draft_too_short_skip_gate"],
-            "recommended_action": "accept",
-            "parse_ok": False,
-        }
-        return {
-            "score": 8.0,
-            "completeness": 0.85,
-            "factual_risk": 0.15,
-            "hallucination_risk": 0.15,
-            "needs_escalation": False,
-            "issues": ["draft_too_short_skip_gate"],
-            "recommended_action": "accept",
-            "parse_ok": False,
-            "critic_model": None,
-            "latency_ms": 0,
-            "_unified": stub,
-        }
 
-    uc = await evaluate_unified_critic(
-        harness,
-        prompt,
-        draft,
-        analysis,
-        options,
-        hcfg,
-        search_context=search_context,
-        mode="general",
-    )
-    score_min = float(gate.get("score_threshold", 7.5))
-    hall_max = float(gate.get("hallucination_risk_threshold", 0.4))
-    comp_min = float(gate.get("completeness_threshold", 0.7))
-    try:
-        qs = float(uc.get("quality_score") or 0)
-        hal = float(uc.get("hallucination_risk") or 0)
-        comp = float(uc.get("completeness") or 0)
-        fact = float(uc.get("factuality") or 0)
-    except (TypeError, ValueError):
-        qs, hal, comp, fact = 0.0, 1.0, 0.0, 0.0
-    factual_risk = max(0.0, min(1.0, 1.0 - fact))
-    ra = normalize_recommended(uc.get("recommended_action"))
-    numeric_escalate = qs < score_min or hal > hall_max or comp < comp_min or factual_risk > 0.55
-    if numeric_escalate and ra == "accept":
-        ra = "refine"
-    needs_escalation = numeric_escalate or ra in ("refine", "search_more", "agent_recover", "reject")
-    return {
-        "score": qs,
-        "completeness": comp,
-        "factual_risk": factual_risk,
-        "hallucination_risk": hal,
-        "needs_escalation": needs_escalation,
-        "issues": list(uc.get("issues") or []),
-        "recommended_action": ra,
-        "parse_ok": bool(uc.get("parse_ok")),
-        "critic_model": uc.get("critic_model"),
-        "latency_ms": uc.get("latency_ms"),
-        "_unified": uc,
-    }
-
-
-async def evaluate_structured_refine_critic(
+async def evaluate_structured_quality_critic(
     harness: Any,
     question: str,
     draft: str,
@@ -237,7 +155,7 @@ async def evaluate_structured_refine_critic(
     hcfg: Dict[str, Any],
     candidates: List[str],
 ) -> Dict[str, Any]:
-    """Refine 中段结构化批评（事实与逻辑），供 Repair 使用。"""
+    """结构化质量批评（事实与逻辑），供 Repair 使用。"""
     defaults = {
         "missing_points": [],
         "logic_issues": [],

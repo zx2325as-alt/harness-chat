@@ -9,10 +9,11 @@
       </button>
     </div>
 
-    <p v-if="config?.routing_notes" class="note">
-      <strong>关于 auto 与「降级」：</strong>{{ config.routing_notes.auto }}
-      {{ config.routing_notes.sync_api_agent }}
-    </p>
+    <div v-if="config?.routing_notes" class="note">
+      <div v-if="config.routing_notes.runtime"><strong>运行时：</strong>{{ config.routing_notes.runtime }}</div>
+      <div v-if="config.routing_notes.sync_stream_contract"><strong>同步 / 流式：</strong>{{ config.routing_notes.sync_stream_contract }}</div>
+    </div>
+
     <p v-if="config" class="meta">
       基础文件：<code>config.yaml</code>；可写叠加层：
       <code>{{ config.runtime_overlay_path || "config.runtime.yaml" }}</code>
@@ -21,434 +22,180 @@
     </p>
 
     <div v-if="saveMsg" class="save-banner" :class="saveOk ? 'ok' : 'err'">{{ saveMsg }}</div>
-
     <div v-if="loading" class="hint">加载中…</div>
     <div v-else-if="error" class="error">{{ error }}</div>
+
     <div v-else-if="editedHarness" class="config-root">
-      <div class="pipeline-legend">
-        <p class="legend-lead">
-          下列卡片按<strong>单次请求在后端的大致执行顺序</strong>从左到右排列；请<strong>横向滑动</strong>查看整条链路。每列内部可独立上下滚动。
-        </p>
-        <ul class="legend-list">
-          <li><strong>保存并生效</strong>会把当前表单合并写入 <code>config.runtime.yaml</code>，并触发聊天页重新拉取配置（默认模式、全局联网锁等与服务器对齐）。</li>
-          <li><strong>密钥类字段</strong>（如检索 API Key）不会出现在此页，保存时也不会被前端空值覆盖。</li>
-          <li>下列顺序为便于理解的<strong>逻辑流水线</strong>：文档与预判在后端可能并行，以实际代码为准。</li>
-        </ul>
-      </div>
+      <section class="card-grid">
+        <article class="card">
+          <h3>运行时基础</h3>
+          <label class="field">
+            <span class="field-label">runtime</span>
+            <input v-model="editedHarness.runtime" class="inp" />
+          </label>
+          <label class="field inline">
+            <span class="field-label">stream_slice_chars</span>
+            <input v-model.number="editedHarness.stream_slice_chars" type="number" min="24" max="256" class="inp" />
+          </label>
+          <label class="row-check">
+            <input v-model="webSearchCfg.globally_disabled" type="checkbox" />
+            <span>全局禁止联网</span>
+          </label>
+        </article>
 
-      <div class="pipeline-scroller">
-        <div class="pipeline-track" role="list">
-          <!-- 1 入口策略 -->
-          <article class="pipeline-step" role="listitem">
-            <header class="pipeline-step-head">
-              <span class="step-badge">1</span>
-              <div class="step-titles">
-                <div class="step-title">入口策略</div>
-                <div class="step-sub">default_mode · 全局联网锁</div>
-              </div>
-            </header>
-            <div class="pipeline-step-body">
-              <p class="step-blurb">
-                请求进入后最先生效的全局策略：<strong>默认走哪条轨</strong>，以及是否在<strong>服务器级禁止一切联网检索</strong>。此处改动会影响所有会话；单条消息若在输入区单独关了搜索，仍对本条优先，但挡不住全局部署锁。
-              </p>
-              <label class="field">
-                <span class="field-label">harness.default_mode</span>
-                <select v-model="editedHarness.default_mode" class="inp inp-fill">
-                  <option value="auto">auto（预判选轨）</option>
-                  <option value="fast">fast</option>
-                  <option value="refine">refine</option>
-                  <option value="agent">agent</option>
-                </select>
-                <span class="field-help">用户在聊天里未手动切换轨道时采用。<strong>auto</strong> 会在后续「预判」步骤由模型在 fast / refine / agent 间抉择。</span>
-              </label>
-              <div class="divider" />
-              <label class="row-check">
-                <input v-model="editedHarness.web_search.globally_disabled" type="checkbox" />
-                <span>全局禁止联网 web_search.globally_disabled</span>
-              </label>
-              <p class="mini">
-                <strong>部署锁：</strong>勾选后全轨道、Agent 工具与审查层检索均被短路，不调外部检索 API。聊天页「搜索」会与服务器同步为关闭并禁用切换。取消勾选并保存后，才允许按轨道与用户选择恢复检索。
-              </p>
+        <article class="card">
+          <h3>执行规划</h3>
+          <label class="field inline"><span class="field-label">parallel_search_queries</span><input v-model.number="dagRuntime.parallel_search_queries" type="number" min="1" max="8" class="inp" /></label>
+          <label class="field inline"><span class="field-label">hedge_draft_delay_ms</span><input v-model.number="dagRuntime.hedge_draft_delay_ms" type="number" min="0" max="5000" class="inp" /></label>
+          <label class="field inline"><span class="field-label">max_repair_rounds</span><input v-model.number="dagRuntime.max_repair_rounds" type="number" min="0" max="8" class="inp" /></label>
+          <label class="row-check"><input v-model="dagRuntime.parallel_critics" type="checkbox" /><span>parallel_critics</span></label>
+          <label class="row-check"><input v-model="dagRuntime.layered_critics" type="checkbox" /><span>layered_critics</span></label>
+          <label class="row-check"><input v-model="dagRuntime.parallel_drafts" type="checkbox" /><span>parallel_drafts</span></label>
+          <label class="row-check"><input v-model="dagRuntime.goal_subgraph_enabled" type="checkbox" /><span>goal_subgraph_enabled</span></label>
+          <label class="row-check"><input v-model="dagRuntime.tool_capability_gate_enabled" type="checkbox" /><span>tool_capability_gate_enabled</span></label>
+          <label class="row-check"><input v-model="dagRuntime.semantic_cache_short_circuit" type="checkbox" /><span>semantic_cache_short_circuit</span></label>
+        </article>
+
+        <article class="card">
+          <h3>运行时编排</h3>
+          <label class="row-check"><input v-model="runtimeOrchestrator.enabled" type="checkbox" /><span>runtime_orchestrator.enabled</span></label>
+          <label class="field inline"><span class="field-label">search_budget_per_request</span><input v-model.number="runtimeOrchestrator.search_budget_per_request" type="number" min="1" max="200" class="inp" /></label>
+          <label class="row-check"><input v-model="unifiedCritic.enabled" type="checkbox" /><span>unified_critic.enabled</span></label>
+          <label class="field"><span class="field-label">unified_critic.model_key</span><select v-model="unifiedCritic.model_key" class="inp"><option value="">（未设置）</option><option v-for="k in modelKeys" :key="`uc-${k}`" :value="k">{{ k }}</option></select></label>
+          <label class="row-check"><input v-model="searchSufficiency.enabled" type="checkbox" /><span>search_sufficiency.enabled</span></label>
+          <label class="field"><span class="field-label">search_sufficiency.model_key</span><select v-model="searchSufficiency.model_key" class="inp"><option value="">（未设置）</option><option v-for="k in modelKeys" :key="`ss-${k}`" :value="k">{{ k }}</option></select></label>
+          <label class="field"><span class="field-label">metrics_sqlite_path</span><input v-model="observability.metrics_sqlite_path" class="inp" /></label>
+          <label class="field"><span class="field-label">metrics_jsonl_path</span><input v-model="observability.metrics_jsonl_path" class="inp" /></label>
+        </article>
+
+        <article class="card card-wide">
+          <h3>检索策略</h3>
+          <div class="grid two">
+            <label class="field"><span class="field-label">provider</span><input v-model="searchCfg.provider" class="inp" /></label>
+            <label class="field"><span class="field-label">fallback</span><input v-model="searchCfg.fallback" class="inp" /></label>
+            <label class="field"><span class="field-label">search_depth</span><select v-model="searchCfg.search_depth" class="inp"><option value="basic">basic</option><option value="advanced">advanced</option></select></label>
+            <label class="field"><span class="field-label">topic</span><input v-model="searchCfg.topic" class="inp" /></label>
+            <label class="field inline"><span class="field-label">max_results</span><input v-model.number="searchCfg.max_results" type="number" min="1" max="24" class="inp" /></label>
+            <label class="field inline"><span class="field-label">timeout_s</span><input v-model.number="searchCfg.timeout_s" type="number" min="1" max="120" class="inp" /></label>
+            <label class="field inline"><span class="field-label">timeout_s_max</span><input v-model.number="searchCfg.timeout_s_max" type="number" min="1" max="180" class="inp" /></label>
+            <label class="field inline"><span class="field-label">session_cache_ttl_s</span><input v-model.number="searchCfg.session_cache_ttl_s" type="number" min="0" max="86400" class="inp" /></label>
+            <label class="field inline"><span class="field-label">session_cache_ttl_freshness_s</span><input v-model.number="searchCfg.session_cache_ttl_freshness_s" type="number" min="0" max="86400" class="inp" /></label>
+            <label class="field inline"><span class="field-label">session_cache_ttl_required_s</span><input v-model.number="searchCfg.session_cache_ttl_required_s" type="number" min="0" max="86400" class="inp" /></label>
+            <label class="field inline"><span class="field-label">session_cache_ttl_explicit_s</span><input v-model.number="searchCfg.session_cache_ttl_explicit_s" type="number" min="0" max="86400" class="inp" /></label>
+          </div>
+          <label class="row-check"><input v-model="searchCfg.query_enrich" type="checkbox" /><span>query_enrich</span></label>
+          <label class="row-check"><input v-model="searchCfg.include_answer" type="checkbox" /><span>include_answer</span></label>
+          <div class="subcard">
+            <div class="subcard-title">by_intent</div>
+            <div class="grid two">
+              <label class="field inline"><span class="field-label">search.max_results</span><input v-model.number="searchByIntent.search.max_results" type="number" min="1" max="24" class="inp" /></label>
+              <label class="field"><span class="field-label">search.search_depth</span><select v-model="searchByIntent.search.search_depth" class="inp"><option value="basic">basic</option><option value="advanced">advanced</option></select></label>
+              <label class="field inline"><span class="field-label">dag.max_results</span><input v-model.number="searchByIntent.dag.max_results" type="number" min="1" max="24" class="inp" /></label>
+              <label class="field"><span class="field-label">dag.search_depth</span><select v-model="searchByIntent.dag.search_depth" class="inp"><option value="basic">basic</option><option value="advanced">advanced</option></select></label>
             </div>
-          </article>
-
-          <span class="pipeline-arrow" aria-hidden="true">›</span>
-
-          <!-- 2 预判 -->
-          <article class="pipeline-step" role="listitem">
-            <header class="pipeline-step-head">
-              <span class="step-badge">2</span>
-              <div class="step-titles">
-                <div class="step-title">预判</div>
-                <div class="step-sub">complexity · features</div>
-              </div>
-            </header>
-            <div class="pipeline-step-body">
-              <p class="step-blurb">
-                在 <strong>auto</strong> 或需要意图分类时，由<strong>预判模型</strong>解析复杂度、是否检索、建议轨道等。超时过短容易退回规则预判，过长则首包变慢。<strong>analyzer_json_repair</strong> 在解析失败时多一次「只修格式」的补救。
-              </p>
-              <label class="row-check">
-                <input v-model="complexity.use_llm_analyzer" type="checkbox" />
-                <span>use_llm_analyzer</span>
-              </label>
-              <span class="field-help block">关闭后不再调用预判 LLM，轨道与检索意图改由规则/默认值推断，速度可能更快但灵活性下降。</span>
-              <label class="field">
-                <span class="field-label">analyzer_model</span>
-                <select v-model="complexity.analyzer_model" class="inp inp-fill">
-                  <option value="">（未设置）</option>
-                  <option v-for="k in modelKeys" :key="'an-' + k" :value="k">{{ k }}</option>
-                </select>
-                <span class="field-help">必须已在服务端 <code>models</code> 注册；宜选延迟较低、能稳定输出 JSON 的模型。</span>
-              </label>
-              <label class="field">
-                <span class="field-label">超时 / 重试 / 总预算（秒）</span>
-                <span class="inline-pair inp-fill-row">
-                  <input v-model.number="complexity.analyzer_request_timeout_s" type="number" min="5" max="120" class="inp inp-tiny" title="单次请求超时" />
-                  <input v-model.number="complexity.analyzer_max_retries" type="number" min="0" max="5" class="inp inp-tiny" title="失败后的重试次数" />
-                  <input v-model.number="complexity.analyzer_total_timeout_s" type="number" min="10" max="300" class="inp inp-tiny" title="整段预判硬超时" />
-                </span>
-                <span class="field-help">从左到右：单次 RPC 上限、额外重试次数、整段预判不得超过的秒数。<strong>总预算建议 ≥ 单次超时 × (1 + 重试次数)</strong>，否则可能被服务端警告或提前取消。</span>
-              </label>
-              <label class="field">
-                <span class="field-label">analysis_cache_ttl_s</span>
-                <input v-model.number="complexity.analysis_cache_ttl_s" type="number" min="0" max="86400" class="inp inp-fill" />
-                <span class="field-help">预判结果在会话内可复用的缓存时间（秒）；适当增大可减少重复预判成本。</span>
-              </label>
-              <div class="divider" />
-              <div class="cardTitle tight">features（预判配套）</div>
-              <label class="row-check">
-                <input v-model="features.analyzer_json_repair" type="checkbox" />
-                <span>analyzer_json_repair</span>
-              </label>
-              <span class="field-help block">当预判输出不是合法 JSON 时，追加一次极短的「仅修复 JSON 结构」调用，有利于稳定性，会增加少量延迟与费用。</span>
+          </div>
+          <div class="subcard">
+            <div class="subcard-title">relevance_filter</div>
+            <label class="row-check"><input v-model="searchRelevance.enabled" type="checkbox" /><span>enabled</span></label>
+            <div class="grid two">
+              <label class="field"><span class="field-label">model</span><select v-model="searchRelevance.model" class="inp"><option value="">（未设置）</option><option v-for="k in modelKeys" :key="`rf-${k}`" :value="k">{{ k }}</option></select></label>
+              <label class="field"><span class="field-label">sync_default_mode</span><select v-model="searchRelevance.sync_default_mode" class="inp"><option value="runtime_phases">runtime_phases</option><option value="always">always</option><option value="never">never</option></select></label>
             </div>
-          </article>
+          </div>
+          <label class="field"><span class="field-label">speculative_markers（每行一个）</span><textarea :value="joinLines(searchCfg.speculative_markers)" class="ta" rows="4" @input="searchCfg.speculative_markers = parseLines($event.target.value)" /></label>
+        </article>
 
-          <span class="pipeline-arrow" aria-hidden="true">›</span>
-
-          <!-- 3 路由与置信度 -->
-          <article class="pipeline-step" role="listitem">
-            <header class="pipeline-step-head">
-              <span class="step-badge">3</span>
-              <div class="step-titles">
-                <div class="step-title">路由与回退</div>
-                <div class="step-sub">routing · routing_tuning</div>
-              </div>
-            </header>
-            <div class="pipeline-step-body">
-              <p class="step-blurb">
-                预判之后，系统按<strong>模板与默认模型池</strong>选出实际调用的模型；失败则沿列表降级。当前<strong>执行主路径为 DAG Runtime</strong>，不再按置信度在 fast/refine/agent 之间<strong>互斥换轨</strong>；下方 <strong>routing_tuning</strong> 字段仅为<strong>兼容保留</strong>（后端暂不读取）。
-              </p>
-              <label class="field">
-                <span class="field-label">routing.default_model</span>
-                <select v-model="routing.default_model" class="inp inp-fill">
-                  <option value="">（未设置）</option>
-                  <option v-for="k in modelKeys" :key="k" :value="k">{{ k }}</option>
-                </select>
-                <span class="field-help">无更具体模板命中时的首选模型；须已在 <code>models</code> 注册。</span>
-              </label>
-              <label class="field">
-                <span class="field-label">default_models（每行一个）</span>
-                <textarea v-model="defaultModelsText" class="ta ta-short" rows="4" placeholder="gpt-5.5&#10;claude-sonnet-4-6" />
-                <span class="field-help">自上而下依次尝试，某一模型报错或不可用则换下一个，用于提高可用性与兜底。</span>
-              </label>
-              <div class="divider" />
-              <div class="cardTitle tight">routing_tuning（兼容保留 · 当前 DAG 不生效）</div>
-              <label class="field">
-                <span class="field-label">guard_threshold（0～1）</span>
-                <input v-model.number="routingTuning.confidence_track_guard_threshold" type="number" min="0" max="1" step="0.01" class="inp inp-fill" />
-                <span class="field-help">历史字段：曾为低置信度时从快轨升到精化轨。DAG 主路径<strong>不使用</strong>该阈值。</span>
-              </label>
-              <label class="field">
-                <span class="field-label">guard_min_prompt_chars</span>
-                <input v-model.number="routingTuning.confidence_track_guard_min_prompt_chars" type="number" min="0" max="2000" class="inp inp-fill" />
-                <span class="field-help">历史字段：短输入不触发升轨。DAG 主路径<strong>不使用</strong>。</span>
-              </label>
+        <article class="card card-wide">
+          <h3>文档检索</h3>
+          <div class="grid two">
+            <label class="field inline"><span class="field-label">bm25_weight</span><input v-model.number="documents.bm25_weight" type="number" min="0" max="1" step="0.05" class="inp" /></label>
+            <label class="field inline"><span class="field-label">embedding_weight</span><input v-model.number="documents.embedding_weight" type="number" min="0" max="1" step="0.05" class="inp" /></label>
+            <label class="field inline"><span class="field-label">max_text_chars</span><input v-model.number="documents.max_text_chars" type="number" min="1000" max="1000000" class="inp" /></label>
+            <label class="field inline"><span class="field-label">chunk_size</span><input v-model.number="documents.chunk_size" type="number" min="100" max="20000" class="inp" /></label>
+            <label class="field inline"><span class="field-label">chunk_overlap</span><input v-model.number="documents.chunk_overlap" type="number" min="0" max="5000" class="inp" /></label>
+            <label class="field inline"><span class="field-label">max_pdf_pages</span><input v-model.number="documents.max_pdf_pages" type="number" min="1" max="500" class="inp" /></label>
+            <label class="field inline"><span class="field-label">max_sheet_rows</span><input v-model.number="documents.max_sheet_rows" type="number" min="1" max="10000" class="inp" /></label>
+          </div>
+          <div class="subcard">
+            <div class="subcard-title">embedding</div>
+            <label class="row-check"><input v-model="docEmbedding.enabled" type="checkbox" /><span>enabled</span></label>
+            <div class="grid two">
+              <label class="field"><span class="field-label">model_key</span><select v-model="docEmbedding.model_key" class="inp"><option value="">（未设置）</option><option v-for="k in modelKeys" :key="`emb-${k}`" :value="k">{{ k }}</option></select></label>
+              <label class="field inline"><span class="field-label">max_items</span><input v-model.number="docEmbedding.max_items" type="number" min="1" max="200" class="inp" /></label>
+              <label class="field inline"><span class="field-label">text_chars</span><input v-model.number="docEmbedding.text_chars" type="number" min="100" max="20000" class="inp" /></label>
+              <label class="field inline"><span class="field-label">timeout_s</span><input v-model.number="docEmbedding.timeout_s" type="number" min="1" max="120" class="inp" /></label>
+              <label class="field inline"><span class="field-label">rrf_k</span><input v-model.number="docEmbedding.rrf_k" type="number" min="1" max="500" class="inp" /></label>
             </div>
-          </article>
-
-          <span class="pipeline-arrow" aria-hidden="true">›</span>
-
-          <!-- 4 文档上下文 -->
-          <article class="pipeline-step" role="listitem">
-            <header class="pipeline-step-head">
-              <span class="step-badge">4</span>
-              <div class="step-titles">
-                <div class="step-title">文档上下文</div>
-                <div class="step-sub">documents</div>
-              </div>
-            </header>
-            <div class="pipeline-step-body">
-              <p class="step-blurb">
-                用户<strong>上传文档或文件夹</strong>后，服务端用 BM25 与向量召回混合检索片段，并可<strong>重排序</strong>选出最相关段落写入上下文。<strong>compact.max_items</strong> 影响精化链里「指针式」摘要条数；权重和接近 1 时语义更直观。
-              </p>
-              <label class="field">
-                <span class="field-label">bm25 / embedding 权重</span>
-                <span class="inline-pair inp-fill-row">
-                  <input v-model.number="documents.bm25_weight" type="number" min="0" max="1" step="0.05" class="inp inp-half" title="BM25" />
-                  <input v-model.number="documents.embedding_weight" type="number" min="0" max="1" step="0.05" class="inp inp-half" title="向量" />
-                </span>
-                <span class="field-help">二者大致表示两类召回在融合时的相对重要性；二者之和不必严格为 1，但<strong>同时调高一侧、调低另一侧</strong>可分别偏向关键词字面匹配或语义相似。</span>
-              </label>
-              <label class="row-check">
-                <input v-model="docEmbedding.enabled" type="checkbox" />
-                <span>embedding.enabled</span>
-              </label>
-              <label class="field">
-                <span class="field-label">embedding.model_key</span>
-                <select v-model="docEmbedding.model_key" class="inp inp-fill">
-                  <option value="">（未设置）</option>
-                  <option v-for="k in modelKeys" :key="'emb-' + k" :value="k">{{ k }}</option>
-                </select>
-              </label>
-              <label class="field">
-                <span class="field-label">embedding.max_items</span>
-                <input v-model.number="docEmbedding.max_items" type="number" min="5" max="200" class="inp inp-fill" />
-                <span class="field-help">仅对 BM25 前几名候选做向量化时的上限；增大通常提升召回质量但增加 embedding 调用成本。</span>
-              </label>
-              <label class="row-check">
-                <input v-model="docRerank.enabled" type="checkbox" />
-                <span>rerank.enabled</span>
-              </label>
-              <label class="field">
-                <span class="field-label">rerank.model</span>
-                <select v-model="docRerank.model" class="inp inp-fill">
-                  <option value="">（未设置）</option>
-                  <option v-for="k in modelKeys" :key="'rr-' + k" :value="k">{{ k }}</option>
-                </select>
-              </label>
-              <label class="field">
-                <span class="field-label">rerank max_items / top_k</span>
-                <span class="inline-pair inp-fill-row">
-                  <input v-model.number="docRerank.max_items" type="number" min="1" max="48" class="inp inp-half" title="参与重排的候选数" />
-                  <input v-model.number="docRerank.top_k" type="number" min="1" max="24" class="inp inp-half" title="重排后保留条数" />
-                </span>
-                <span class="field-help"><strong>max_items</strong>：送入重排模型的片段数量上限；<strong>top_k</strong>：重排后实际拼进上下文的条数。</span>
-              </label>
-              <label class="field">
-                <span class="field-label">compact.max_items</span>
-                <input v-model.number="docCompact.max_items" type="number" min="1" max="24" class="inp inp-fill" />
-                <span class="field-help">精化链使用的「紧凑文档指针」列表长度；过大增加上下文长度与费用。</span>
-              </label>
+          </div>
+          <div class="subcard">
+            <div class="subcard-title">rerank / compact</div>
+            <label class="row-check"><input v-model="docRerank.enabled" type="checkbox" /><span>rerank.enabled</span></label>
+            <div class="grid two">
+              <label class="field"><span class="field-label">rerank.model</span><select v-model="docRerank.model" class="inp"><option value="">（未设置）</option><option v-for="k in modelKeys" :key="`rr-${k}`" :value="k">{{ k }}</option></select></label>
+              <label class="field inline"><span class="field-label">rerank.max_items</span><input v-model.number="docRerank.max_items" type="number" min="1" max="200" class="inp" /></label>
+              <label class="field inline"><span class="field-label">rerank.top_k</span><input v-model.number="docRerank.top_k" type="number" min="1" max="50" class="inp" /></label>
+              <label class="field inline"><span class="field-label">compact.max_items</span><input v-model.number="docCompact.max_items" type="number" min="1" max="50" class="inp" /></label>
             </div>
-          </article>
+          </div>
+        </article>
 
-          <span class="pipeline-arrow" aria-hidden="true">›</span>
+        <article class="card">
+          <h3>复杂度分析</h3>
+          <label class="row-check"><input v-model="complexity.use_llm_analyzer" type="checkbox" /><span>use_llm_analyzer</span></label>
+          <label class="field"><span class="field-label">analyzer_model</span><select v-model="complexity.analyzer_model" class="inp"><option value="">（未设置）</option><option v-for="k in modelKeys" :key="`an-${k}`" :value="k">{{ k }}</option></select></label>
+          <label class="field inline"><span class="field-label">analyzer_request_timeout_s</span><input v-model.number="complexity.analyzer_request_timeout_s" type="number" min="1" max="180" class="inp" /></label>
+          <label class="field inline"><span class="field-label">analyzer_max_retries</span><input v-model.number="complexity.analyzer_max_retries" type="number" min="0" max="8" class="inp" /></label>
+          <label class="field inline"><span class="field-label">analyzer_total_timeout_s</span><input v-model.number="complexity.analyzer_total_timeout_s" type="number" min="1" max="300" class="inp" /></label>
+          <label class="field inline"><span class="field-label">analysis_cache_ttl_s</span><input v-model.number="complexity.analysis_cache_ttl_s" type="number" min="0" max="86400" class="inp" /></label>
+          <label class="field"><span class="field-label">analyzer_prompt</span><textarea v-model="complexity.analyzer_prompt" class="ta" rows="8" /></label>
+        </article>
 
-          <!-- 5 联网检索 -->
-          <article class="pipeline-step" role="listitem">
-            <header class="pipeline-step-head">
-              <span class="step-badge">5</span>
-              <div class="step-titles">
-                <div class="step-title">联网检索</div>
-                <div class="step-sub">search · relevance_filter</div>
-              </div>
-            </header>
-            <div class="pipeline-step-body">
-              <p class="step-blurb">
-                当预判或用户打开「搜索」且未被全局禁网时，后端调用检索提供商拉取网页摘要。<strong>relevance_filter</strong> 可用另一路模型丢掉明显不相关的条目；<strong>sync_*</strong> 决定是否在主链路里同步等待过滤（慢但顺序确定）。
-              </p>
-              <label class="row-check">
-                <input v-model="searchCfg.query_enrich" type="checkbox" />
-                <span>query_enrich</span>
-              </label>
-              <span class="field-help block">开启时可能对查询词做自动扩展；关闭则更依赖预判给出的 <code>search_query</code>，便于你要「搜什么就 strictly 搜什么」。</span>
-              <label class="field">
-                <span class="field-label">search_depth</span>
-                <select v-model="searchCfg.search_depth" class="inp inp-fill">
-                  <option value="basic">basic</option>
-                  <option value="advanced">advanced</option>
-                </select>
-                <span class="field-help">一般由提供商解释「浅 / 深」抓取；advanced 往往更全但更慢、更贵。</span>
-              </label>
-              <label class="field">
-                <span class="field-label">max_results</span>
-                <input v-model.number="searchCfg.max_results" type="number" min="1" max="24" class="inp inp-fill" />
-                <span class="field-help">单次检索最多保留的摘要条数；过大上下文膨胀，过小可能漏关键来源。</span>
-              </label>
-              <label class="field">
-                <span class="field-label">timeout_s / max</span>
-                <span class="inline-pair inp-fill-row">
-                  <input v-model.number="searchCfg.timeout_s" type="number" min="5" max="120" class="inp inp-half" title="起始超时" />
-                  <input v-model.number="searchCfg.timeout_s_max" type="number" min="5" max="180" class="inp inp-half" title="放宽上限" />
-                </span>
-                <span class="field-help">控制检索 RPC 的等待时间尺度；过短易超时失败，过长拖慢整条响应。</span>
-              </label>
-              <label class="row-check">
-                <input v-model="searchCfg.include_answer" type="checkbox" />
-                <span>include_answer</span>
-              </label>
-              <span class="field-help block">若提供商支持「摘要答案」字段，开启后可能多一段聚合文案（依提供商语义而定）。</span>
-              <div class="divider" />
-              <label class="row-check">
-                <input v-model="searchRelFilter.enabled" type="checkbox" />
-                <span>relevance_filter.enabled</span>
-              </label>
-              <label class="field">
-                <span class="field-label">filter model</span>
-                <select v-model="searchRelFilter.model" class="inp inp-fill">
-                  <option value="">（未设置）</option>
-                  <option v-for="k in modelKeys" :key="'rf-' + k" :value="k">{{ k }}</option>
-                </select>
-              </label>
-              <label class="field">
-                <span class="field-label">sync_default_mode</span>
-                <select v-model="searchRelFilter.sync_default_mode" class="inp inp-fill">
-                  <option value="quality_tracks">quality_tracks</option>
-                  <option value="always">always</option>
-                  <option value="never">never</option>
-                </select>
-                <span class="field-help"><strong>quality_tracks</strong>：仅下方列表中的轨道同步过滤；<strong>always</strong>：总是同步（延迟↑）；<strong>never</strong>：默认不同步，快轨更轻。</span>
-              </label>
-              <label class="field">
-                <span class="field-label">sync_tracks（每行）</span>
-                <textarea v-model="syncTracksText" class="ta ta-short" rows="2" placeholder="refine&#10;agent" />
-                <span class="field-help">轨道名小写，如 <code>refine</code>、<code>agent</code>；在 quality_tracks 模式下只有这些轨会「边检索边等相关性过滤」。</span>
-              </label>
-              <p class="mini"><strong>说明：</strong>API Key、provider 等密钥不在此页展示；保存时服务端会剥离密钥字段，不会用浏览器里的空值覆盖磁盘上的密钥。</p>
+        <article class="card card-wide">
+          <h3>任务模型模板</h3>
+          <div class="template-grid">
+            <div v-for="(tpl, key) in taskTemplates" :key="key" class="subcard template-card">
+              <div class="subcard-title">{{ key }}</div>
+              <label class="field"><span class="field-label">selected_model</span><select v-model="tpl.selected_model" class="inp"><option value="">（未设置）</option><option v-for="k in modelKeys" :key="`${key}-sel-${k}`" :value="k">{{ k }}</option></select></label>
+              <label class="field"><span class="field-label">fallback_models（每行一个）</span><textarea :value="joinLines(tpl.fallback_models)" class="ta" rows="3" @input="tpl.fallback_models = parseLines($event.target.value)" /></label>
+              <template v-if="tpl.quality_models">
+                <label class="field"><span class="field-label">quality_models.draft</span><textarea :value="joinLines(tpl.quality_models.draft)" class="ta" rows="2" @input="tpl.quality_models.draft = parseLines($event.target.value)" /></label>
+                <label class="field"><span class="field-label">quality_models.review</span><textarea :value="joinLines(tpl.quality_models.review)" class="ta" rows="2" @input="tpl.quality_models.review = parseLines($event.target.value)" /></label>
+                <label class="field"><span class="field-label">quality_models.polish</span><textarea :value="joinLines(tpl.quality_models.polish)" class="ta" rows="2" @input="tpl.quality_models.polish = parseLines($event.target.value)" /></label>
+              </template>
             </div>
-          </article>
+          </div>
+        </article>
 
-          <span class="pipeline-arrow" aria-hidden="true">›</span>
+        <article class="card card-wide">
+          <h3>质量流程</h3>
+          <label class="row-check"><input v-model="qualityPipeline.enabled" type="checkbox" /><span>quality_pipeline.enabled</span></label>
+          <div class="grid three">
+            <label class="field inline"><span class="field-label">repair.temperature</span><input v-model.number="qualityRepair.temperature" type="number" min="0" max="2" step="0.05" class="inp" /></label>
+            <label class="field inline"><span class="field-label">layer1.temperature</span><input v-model.number="qualityLayer1.temperature" type="number" min="0" max="2" step="0.05" class="inp" /></label>
+            <label class="field inline"><span class="field-label">layer2.temperature</span><input v-model.number="qualityLayer2.temperature" type="number" min="0" max="2" step="0.05" class="inp" /></label>
+            <label class="field inline"><span class="field-label">layer3.temperature</span><input v-model.number="qualityLayer3.temperature" type="number" min="0" max="2" step="0.05" class="inp" /></label>
+          </div>
+          <div class="grid three">
+            <label class="field"><span class="field-label">layer1.name</span><input v-model="qualityLayer1.name" class="inp" /></label>
+            <label class="field"><span class="field-label">layer2.name</span><input v-model="qualityLayer2.name" class="inp" /></label>
+            <label class="field"><span class="field-label">layer3.name</span><input v-model="qualityLayer3.name" class="inp" /></label>
+          </div>
+          <label class="field"><span class="field-label">layer1.instruction</span><textarea v-model="qualityLayer1.instruction" class="ta" rows="6" /></label>
+          <label class="field"><span class="field-label">layer2.instruction</span><textarea v-model="qualityLayer2.instruction" class="ta" rows="8" /></label>
+          <label class="field"><span class="field-label">layer3.instruction</span><textarea v-model="qualityLayer3.instruction" class="ta" rows="5" /></label>
+        </article>
 
-          <!-- 6 精化链 -->
-          <article class="pipeline-step" role="listitem">
-            <header class="pipeline-step-head">
-              <span class="step-badge">6</span>
-              <div class="step-titles">
-                <div class="step-title">精化链</div>
-                <div class="step-sub">refine_chain · 审查联网轮数</div>
-              </div>
-            </header>
-            <div class="pipeline-step-body">
-              <p class="step-blurb">
-                <strong>精化轨</strong>走多层草稿 → 审查 → 润色。审查层可通过指令发起<strong>联网核查</strong>再迭代。<code>max_review_web_rounds</code> 限制这种「查资料 → 再审」最多循环几轮，防止费用与延迟失控。
-              </p>
-              <label class="row-check">
-                <input v-model="refineChain.enabled" type="checkbox" />
-                <span>refine_chain.enabled</span>
-              </label>
-              <span class="field-help block">关闭后精化多段流水线不可用或降级（以后端实现为准），一般仅调试或极简部署时关闭。</span>
-              <label class="field">
-                <span class="field-label">refine_chain_tuning.max_review_web_rounds</span>
-                <input v-model.number="refineChainTuning.max_review_web_rounds" type="number" min="1" max="8" class="inp inp-fill" />
-                <span class="field-help">审查层通过 JSON 工具协议（例如 <code v-pre>{"action":"web_search","query":"..."}</code>）触发的外查与再审最大轮数（1～8）。数字越大越「较真」，但响应越慢。</span>
-              </label>
-            </div>
-          </article>
-
-          <span class="pipeline-arrow" aria-hidden="true">›</span>
-
-          <!-- 7 Agent -->
-          <article class="pipeline-step" role="listitem">
-            <header class="pipeline-step-head">
-              <span class="step-badge">7</span>
-              <div class="step-titles">
-                <div class="step-title">Agent 循环</div>
-                <div class="step-sub">agent · agent_tuning</div>
-              </div>
-            </header>
-            <div class="pipeline-step-body">
-              <p class="step-blurb">
-                <strong>Agent 轨</strong>以「思考—工具—观察」循环执行，可多次联网或调用封装能力。<strong>max_iterations</strong> 与按复杂度分解的上限控制最长循环；<strong>progress_eval</strong> 在进度停滞时中止并走 Refine 兜底，避免空转。
-              </p>
-              <label class="row-check">
-                <input v-model="agent.enabled" type="checkbox" />
-                <span>agent.enabled</span>
-              </label>
-              <span class="field-help block">关闭后需要 Agent 的场景往往退回精化链或其它兜底，复杂工具链能力会受限。</span>
-              <label class="field">
-                <span class="field-label">model</span>
-                <select v-model="agent.model" class="inp inp-fill">
-                  <option value="">（未设置）</option>
-                  <option v-for="k in modelKeys" :key="'ag-' + k" :value="k">{{ k }}</option>
-                </select>
-              </label>
-              <label class="field">
-                <span class="field-label">model_by_task_type.code / reasoning</span>
-                <select v-model="agent.model_by_task_type.code" class="inp inp-fill">
-                  <option value="">code → 默认</option>
-                  <option v-for="k in modelKeys" :key="'agc-' + k" :value="k">{{ k }}</option>
-                </select>
-                <select v-model="agent.model_by_task_type.reasoning" class="inp inp-fill mt-6">
-                  <option value="">reasoning → 默认</option>
-                  <option v-for="k in modelKeys" :key="'agr-' + k" :value="k">{{ k }}</option>
-                </select>
-              </label>
-              <label class="field">
-                <span class="field-label">max_iterations</span>
-                <input v-model.number="agent.max_iterations" type="number" min="1" max="20" class="inp inp-fill" />
-                <span class="field-help">未命中下方按复杂度覆盖时的默认最大步数。</span>
-              </label>
-              <label class="field">
-                <span class="field-label">iterations：low / med / high</span>
-                <span class="inline-pair inp-fill-row">
-                  <input v-model.number="agent.max_iterations_by_complexity.low" type="number" min="1" max="20" class="inp inp-tiny" title="低复杂度" />
-                  <input v-model.number="agent.max_iterations_by_complexity.medium" type="number" min="1" max="20" class="inp inp-tiny" title="中复杂度" />
-                  <input v-model.number="agent.max_iterations_by_complexity.high" type="number" min="1" max="20" class="inp inp-tiny" title="高复杂度" />
-                </span>
-                <span class="field-help">与预判给出的 complexity 联动；高档任务允许更多轮工具调用，但也更容易耗时。</span>
-              </label>
-              <div class="divider" />
-              <span class="field-help block">独立 Agent 循环已移除；下列 progress_eval 为<strong>兼容保留</strong>（DAG 主路径不调用进度评估模块）。</span>
-              <label class="row-check">
-                <input v-model="agentTuning.progress_eval.enabled" type="checkbox" />
-                <span>progress_eval.enabled</span>
-              </label>
-              <label class="field">
-                <span class="field-label">every_n_iterations</span>
-                <input v-model.number="agentTuning.progress_eval.every_n_iterations" type="number" min="1" max="8" class="inp inp-fill" />
-              </label>
-              <label class="field">
-                <span class="field-label">progress_score_delta_threshold / progress_delta_low_abort_after</span>
-                <span class="inline-pair inp-fill-row">
-                  <input v-model.number="agentTuning.progress_eval.progress_score_delta_threshold" type="number" min="0" max="1" step="0.01" class="inp inp-tiny" title="Δ 阈值" />
-                  <input v-model.number="agentTuning.progress_eval.progress_delta_low_abort_after" type="number" min="1" max="12" class="inp inp-tiny" title="连续轮数" />
-                </span>
-                <span class="field-help">连续多轮进度评分变化低于阈值达到次数后终止 Agent。</span>
-              </label>
-            </div>
-          </article>
-
-          <span class="pipeline-arrow" aria-hidden="true">›</span>
-
-          <!-- 8 输出流式 -->
-          <article class="pipeline-step" role="listitem">
-            <header class="pipeline-step-head">
-              <span class="step-badge">8</span>
-              <div class="step-titles">
-                <div class="step-title">输出与流式</div>
-                <div class="step-sub">stream_slice · stream_tuning</div>
-      </div>
-            </header>
-            <div class="pipeline-step-body">
-              <p class="step-blurb">
-                模型生成文本后，服务端按块推送到前端。<strong>stream_slice_chars</strong> 主要作用于<strong>非流式接口模拟流式</strong>时的切块粒度；<strong>smart_chunk_boundary</strong> 尽量在标点处断开，中文阅读更顺；<strong>emit_content_reset</strong> 会在精化层切换时通知前端「清空展示缓冲区」，有利步骤区分也可能带来闪烁感。
-              </p>
-              <label class="field">
-                <span class="field-label">stream_slice_chars（非流式切片）</span>
-                <input v-model.number="editedHarness.stream_slice_chars" type="number" min="24" max="256" class="inp inp-fill" />
-                <span class="field-help">每块大约多少字符触发一次向前端的增量输出；偏小事件更密、更「丝滑」，偏大则包数少、开销低。</span>
-              </label>
-              <label class="row-check">
-                <input v-model="streamTuning.smart_chunk_boundary" type="checkbox" />
-                <span>smart_chunk_boundary</span>
-              </label>
-              <span class="field-help block">优先在句号、逗号等断点切块，减少单词或汉字被拦腰截断的感觉。</span>
-              <label class="row-check">
-                <input v-model="streamTuning.emit_content_reset" type="checkbox" />
-                <span>emit_content_reset</span>
-              </label>
-              <span class="field-help block">精化流水线阶段切换时是否发送 content_reset 事件。关闭后 UI 可能连续追加全文，但层次边界需靠步骤组件区分。</span>
-      </div>
-          </article>
-      </div>
-      </div>
+        <article class="card">
+          <h3>流式输出</h3>
+          <label class="row-check"><input v-model="streamTuning.smart_chunk_boundary" type="checkbox" /><span>smart_chunk_boundary</span></label>
+          <label class="row-check"><input v-model="streamTuning.emit_content_reset" type="checkbox" /><span>emit_content_reset</span></label>
+        </article>
+      </section>
 
       <section class="json-panel">
         <header class="json-panel-head">
           <span class="json-panel-title">完整 harness JSON（只读）</span>
-          <span class="json-panel-hint">与上方表单为同一对象；便于核对未做表单化的字段。保存时整体提交；密钥类键仍不会由浏览器覆盖。</span>
+          <span class="json-panel-hint">保存时整体提交；密钥类字段仍会在服务端剥离。</span>
         </header>
         <pre class="mono">{{ pretty(editedHarness) }}</pre>
       </section>
@@ -477,32 +224,25 @@ export default {
   },
   computed: {
     modelKeys() {
-      const m = this.config && this.config.models;
-      return Array.isArray(m) ? m.slice() : [];
+      return Array.isArray(this.config?.models) ? this.config.models.slice() : [];
     },
-    routing() {
-      return this.editedHarness?.routing || {};
+    webSearchCfg() {
+      return this.editedHarness?.web_search || {};
     },
-    routingTuning() {
-      return this.editedHarness?.routing_tuning || {};
+    dagRuntime() {
+      return this.editedHarness?.dag_runtime || {};
     },
-    agent() {
-      return this.editedHarness?.agent || {};
+    runtimeOrchestrator() {
+      return this.editedHarness?.runtime_orchestrator || {};
     },
-    agentTuning() {
-      return this.editedHarness?.agent_tuning || {};
+    unifiedCritic() {
+      return this.runtimeOrchestrator.unified_critic || {};
     },
-    complexity() {
-      return this.editedHarness?.complexity || {};
+    searchSufficiency() {
+      return this.runtimeOrchestrator.search_sufficiency || {};
     },
-    features() {
-      return this.editedHarness?.features || {};
-    },
-    refineChain() {
-      return this.editedHarness?.refine_chain || {};
-    },
-    refineChainTuning() {
-      return this.editedHarness?.refine_chain_tuning || {};
+    observability() {
+      return this.runtimeOrchestrator.observability || {};
     },
     streamTuning() {
       return this.editedHarness?.stream_tuning || {};
@@ -510,9 +250,11 @@ export default {
     searchCfg() {
       return this.editedHarness?.search || {};
     },
-    searchRelFilter() {
-      const s = this.editedHarness?.search || {};
-      return s.relevance_filter || {};
+    searchByIntent() {
+      return this.searchCfg.by_intent || {};
+    },
+    searchRelevance() {
+      return this.searchCfg.relevance_filter || {};
     },
     documents() {
       return this.editedHarness?.documents || {};
@@ -526,46 +268,40 @@ export default {
     docCompact() {
       return this.documents.compact || {};
     },
-    defaultModelsText: {
-      get() {
-        const m = this.routing.default_models;
-        return Array.isArray(m) ? m.join("\n") : "";
-      },
-      set(v) {
-        const lines = String(v || "")
-          .split("\n")
-          .map((s) => s.trim())
-          .filter(Boolean);
-        this.routing.default_models = lines;
-      },
+    taskTemplates() {
+      return this.editedHarness?.task_model_templates || {};
     },
-    syncTracksText: {
-      get() {
-        const raw = this.searchRelFilter.sync_tracks;
-        return Array.isArray(raw) ? raw.join("\n") : "";
-      },
-      set(v) {
-        const lines = String(v || "")
-          .split("\n")
-          .map((s) => s.trim())
-          .filter(Boolean)
-          .map((s) => s.toLowerCase());
-        this.searchRelFilter.sync_tracks = lines;
-      },
+    complexity() {
+      return this.editedHarness?.complexity || {};
+    },
+    qualityPipeline() {
+      return this.editedHarness?.quality_pipeline || {};
+    },
+    qualityRepair() {
+      return this.qualityPipeline.repair || {};
+    },
+    qualityLayer1() {
+      return this.qualityPipeline.layer1 || {};
+    },
+    qualityLayer2() {
+      return this.qualityPipeline.layer2 || {};
+    },
+    qualityLayer3() {
+      return this.qualityPipeline.layer3 || {};
     },
   },
   watch: {
     config: {
       deep: true,
-      handler(c) {
-        if (c && c.harness) {
-          this.editedHarness = JSON.parse(JSON.stringify(c.harness));
-          this.ensureShapes();
-        } else {
-          this.editedHarness = null;
-        }
-      },
       immediate: true,
+      handler(config) {
+        if (!config?.harness) {
+          this.editedHarness = null;
+          return;
+        }
+        this.editedHarness = JSON.parse(JSON.stringify(config.harness));
+        this.ensureShapes();
+      },
     },
   },
   methods: {
@@ -576,68 +312,79 @@ export default {
         return String(obj);
       }
     },
+    joinLines(value) {
+      return Array.isArray(value) ? value.join("\n") : "";
+    },
+    parseLines(value) {
+      return String(value || "")
+        .split("\n")
+        .map((item) => item.trim())
+        .filter(Boolean);
+    },
     ensureShapes() {
       const h = this.editedHarness;
       if (!h) return;
+
+      if (!h.runtime) h.runtime = "adaptive_dag_v3";
+      if (h.stream_slice_chars == null) h.stream_slice_chars = 72;
+
       h.web_search = h.web_search || {};
       if (typeof h.web_search.globally_disabled !== "boolean") h.web_search.globally_disabled = false;
 
-      h.routing = h.routing || {};
-      if (!Array.isArray(h.routing.default_models)) h.routing.default_models = [];
+      h.dag_runtime = h.dag_runtime || {};
+      if (h.dag_runtime.parallel_search_queries == null) h.dag_runtime.parallel_search_queries = 2;
+      if (typeof h.dag_runtime.parallel_critics !== "boolean") h.dag_runtime.parallel_critics = true;
+      if (typeof h.dag_runtime.layered_critics !== "boolean") h.dag_runtime.layered_critics = true;
+      if (typeof h.dag_runtime.parallel_drafts !== "boolean") h.dag_runtime.parallel_drafts = true;
+      if (h.dag_runtime.hedge_draft_delay_ms == null) h.dag_runtime.hedge_draft_delay_ms = 0;
+      if (h.dag_runtime.max_repair_rounds == null) h.dag_runtime.max_repair_rounds = 2;
+      if (typeof h.dag_runtime.goal_subgraph_enabled !== "boolean") h.dag_runtime.goal_subgraph_enabled = false;
+      if (typeof h.dag_runtime.tool_capability_gate_enabled !== "boolean") h.dag_runtime.tool_capability_gate_enabled = true;
+      if (typeof h.dag_runtime.semantic_cache_short_circuit !== "boolean") h.dag_runtime.semantic_cache_short_circuit = false;
 
-      h.routing_tuning = h.routing_tuning || {};
-      if (h.routing_tuning.confidence_track_guard_threshold == null) h.routing_tuning.confidence_track_guard_threshold = 0.52;
-      if (h.routing_tuning.confidence_track_guard_min_prompt_chars == null) h.routing_tuning.confidence_track_guard_min_prompt_chars = 150;
-
-      h.agent = h.agent || {};
-      if (typeof h.agent.enabled !== "boolean") h.agent.enabled = true;
-      h.agent.model_by_task_type = h.agent.model_by_task_type || {};
-      h.agent.max_iterations_by_complexity = h.agent.max_iterations_by_complexity || {};
-      if (h.agent.max_iterations_by_complexity.low == null) h.agent.max_iterations_by_complexity.low = 3;
-      if (h.agent.max_iterations_by_complexity.medium == null) h.agent.max_iterations_by_complexity.medium = 5;
-      if (h.agent.max_iterations_by_complexity.high == null) h.agent.max_iterations_by_complexity.high = 8;
-
-      h.agent_tuning = h.agent_tuning || {};
-      h.agent_tuning.progress_eval = h.agent_tuning.progress_eval || {};
-      const pe = h.agent_tuning.progress_eval;
-      if (typeof pe.enabled !== "boolean") pe.enabled = true;
-      if (pe.every_n_iterations == null) pe.every_n_iterations = 2;
-      if (pe.max_calls_per_request == null) pe.max_calls_per_request = 4;
-      if (pe.low_progress_abort_after == null) pe.low_progress_abort_after = 2;
-      if (pe.min_progress_score == null) pe.min_progress_score = 0.22;
-      if (pe.min_delta_vs_previous == null) pe.min_delta_vs_previous = 0.1;
-      if (pe.progress_score_delta_threshold == null) pe.progress_score_delta_threshold = 0.05;
-      if (pe.progress_delta_low_abort_after == null) pe.progress_delta_low_abort_after = 2;
-
-      h.complexity = h.complexity || {};
-      if (typeof h.complexity.use_llm_analyzer !== "boolean") h.complexity.use_llm_analyzer = true;
-
-      h.features = h.features || {};
-      if (typeof h.features.analyzer_json_repair !== "boolean") h.features.analyzer_json_repair = true;
-
-      h.refine_chain = h.refine_chain || {};
-      if (typeof h.refine_chain.enabled !== "boolean") h.refine_chain.enabled = true;
-
-      h.refine_chain_tuning = h.refine_chain_tuning || {};
-      if (h.refine_chain_tuning.max_review_web_rounds == null) h.refine_chain_tuning.max_review_web_rounds = 3;
+      h.runtime_orchestrator = h.runtime_orchestrator || {};
+      if (typeof h.runtime_orchestrator.enabled !== "boolean") h.runtime_orchestrator.enabled = true;
+      if (h.runtime_orchestrator.search_budget_per_request == null) h.runtime_orchestrator.search_budget_per_request = 24;
+      h.runtime_orchestrator.unified_critic = h.runtime_orchestrator.unified_critic || {};
+      if (typeof h.runtime_orchestrator.unified_critic.enabled !== "boolean") h.runtime_orchestrator.unified_critic.enabled = true;
+      if (h.runtime_orchestrator.unified_critic.model_key == null) h.runtime_orchestrator.unified_critic.model_key = "";
+      h.runtime_orchestrator.search_sufficiency = h.runtime_orchestrator.search_sufficiency || {};
+      if (typeof h.runtime_orchestrator.search_sufficiency.enabled !== "boolean") h.runtime_orchestrator.search_sufficiency.enabled = true;
+      if (h.runtime_orchestrator.search_sufficiency.model_key == null) h.runtime_orchestrator.search_sufficiency.model_key = "";
+      h.runtime_orchestrator.observability = h.runtime_orchestrator.observability || {};
+      if (h.runtime_orchestrator.observability.metrics_jsonl_path == null) h.runtime_orchestrator.observability.metrics_jsonl_path = "";
+      if (h.runtime_orchestrator.observability.metrics_sqlite_path == null) h.runtime_orchestrator.observability.metrics_sqlite_path = "data/runtime_metrics.sqlite";
 
       h.stream_tuning = h.stream_tuning || {};
       if (typeof h.stream_tuning.smart_chunk_boundary !== "boolean") h.stream_tuning.smart_chunk_boundary = true;
       if (typeof h.stream_tuning.emit_content_reset !== "boolean") h.stream_tuning.emit_content_reset = true;
 
       h.search = h.search || {};
+      if (!h.search.provider) h.search.provider = "tavily";
+      if (!h.search.fallback) h.search.fallback = "duckduckgo";
       if (typeof h.search.query_enrich !== "boolean") h.search.query_enrich = false;
       if (!h.search.search_depth) h.search.search_depth = "basic";
       if (h.search.max_results == null) h.search.max_results = 8;
+      h.search.by_intent = h.search.by_intent || {};
+      h.search.by_intent.search = h.search.by_intent.search || {};
+      if (h.search.by_intent.search.max_results == null) h.search.by_intent.search.max_results = 8;
+      if (!h.search.by_intent.search.search_depth) h.search.by_intent.search.search_depth = "basic";
+      h.search.by_intent.dag = h.search.by_intent.dag || {};
+      if (h.search.by_intent.dag.max_results == null) h.search.by_intent.dag.max_results = 12;
+      if (!h.search.by_intent.dag.search_depth) h.search.by_intent.dag.search_depth = "advanced";
+      if (!h.search.topic) h.search.topic = "general";
       if (h.search.timeout_s == null) h.search.timeout_s = 15;
       if (h.search.timeout_s_max == null) h.search.timeout_s_max = 28;
       if (typeof h.search.include_answer !== "boolean") h.search.include_answer = false;
-
       h.search.relevance_filter = h.search.relevance_filter || {};
-      const rf = h.search.relevance_filter;
-      if (typeof rf.enabled !== "boolean") rf.enabled = true;
-      if (!rf.sync_default_mode) rf.sync_default_mode = "quality_tracks";
-      if (!Array.isArray(rf.sync_tracks)) rf.sync_tracks = ["dag", "refine", "agent"];
+      if (typeof h.search.relevance_filter.enabled !== "boolean") h.search.relevance_filter.enabled = true;
+      if (h.search.relevance_filter.model == null) h.search.relevance_filter.model = "claude-sonnet-4-6";
+      if (!h.search.relevance_filter.sync_default_mode) h.search.relevance_filter.sync_default_mode = "runtime_phases";
+      if (h.search.session_cache_ttl_s == null) h.search.session_cache_ttl_s = 1800;
+      if (h.search.session_cache_ttl_freshness_s == null) h.search.session_cache_ttl_freshness_s = 180;
+      if (h.search.session_cache_ttl_required_s == null) h.search.session_cache_ttl_required_s = 900;
+      if (h.search.session_cache_ttl_explicit_s == null) h.search.session_cache_ttl_explicit_s = 1800;
+      if (!Array.isArray(h.search.speculative_markers)) h.search.speculative_markers = [];
 
       h.documents = h.documents || {};
       if (h.documents.bm25_weight == null) h.documents.bm25_weight = 0.55;
@@ -646,12 +393,60 @@ export default {
       if (typeof h.documents.embedding.enabled !== "boolean") h.documents.embedding.enabled = true;
       if (h.documents.embedding.model_key == null) h.documents.embedding.model_key = "n1n-embedding-3-large";
       if (h.documents.embedding.max_items == null) h.documents.embedding.max_items = 40;
-      h.documents.rerank = h.documents.rerank || {};
-      if (typeof h.documents.rerank.enabled !== "boolean") h.documents.rerank.enabled = true;
-      if (h.documents.rerank.max_items == null) h.documents.rerank.max_items = 12;
-      if (h.documents.rerank.top_k == null) h.documents.rerank.top_k = 8;
+      if (h.documents.embedding.text_chars == null) h.documents.embedding.text_chars = 2000;
+      if (h.documents.embedding.timeout_s == null) h.documents.embedding.timeout_s = 30;
+      if (h.documents.embedding.rrf_k == null) h.documents.embedding.rrf_k = 60;
       h.documents.compact = h.documents.compact || {};
       if (h.documents.compact.max_items == null) h.documents.compact.max_items = 8;
+      if (h.documents.max_text_chars == null) h.documents.max_text_chars = 220000;
+      if (h.documents.chunk_size == null) h.documents.chunk_size = 7000;
+      if (h.documents.chunk_overlap == null) h.documents.chunk_overlap = 900;
+      if (h.documents.max_pdf_pages == null) h.documents.max_pdf_pages = 100;
+      if (h.documents.max_sheet_rows == null) h.documents.max_sheet_rows = 2500;
+      h.documents.rerank = h.documents.rerank || {};
+      if (typeof h.documents.rerank.enabled !== "boolean") h.documents.rerank.enabled = true;
+      if (h.documents.rerank.model == null) h.documents.rerank.model = "bge-reranker-v2-m3";
+      if (h.documents.rerank.max_items == null) h.documents.rerank.max_items = 12;
+      if (h.documents.rerank.top_k == null) h.documents.rerank.top_k = 8;
+
+      h.task_model_templates = h.task_model_templates || {};
+      ["reasoning", "generation", "code", "conversation"].forEach((key) => {
+        h.task_model_templates[key] = h.task_model_templates[key] || {};
+        const block = h.task_model_templates[key];
+        if (!Array.isArray(block.fallback_models)) block.fallback_models = [];
+        if (key !== "conversation") {
+          block.quality_models = block.quality_models || {};
+          if (!Array.isArray(block.quality_models.draft)) block.quality_models.draft = [];
+          if (!Array.isArray(block.quality_models.review)) block.quality_models.review = [];
+          if (!Array.isArray(block.quality_models.polish)) block.quality_models.polish = [];
+        }
+      });
+
+      h.complexity = h.complexity || {};
+      if (typeof h.complexity.use_llm_analyzer !== "boolean") h.complexity.use_llm_analyzer = true;
+      if (h.complexity.analyzer_model == null) h.complexity.analyzer_model = "claude-sonnet-4-6";
+      if (h.complexity.analyzer_request_timeout_s == null) h.complexity.analyzer_request_timeout_s = 18;
+      if (h.complexity.analyzer_max_retries == null) h.complexity.analyzer_max_retries = 2;
+      if (h.complexity.analyzer_total_timeout_s == null) h.complexity.analyzer_total_timeout_s = 60;
+      if (h.complexity.analysis_cache_ttl_s == null) h.complexity.analysis_cache_ttl_s = 300;
+      if (h.complexity.analyzer_prompt == null) h.complexity.analyzer_prompt = "";
+
+      h.quality_pipeline = h.quality_pipeline || {};
+      if (typeof h.quality_pipeline.enabled !== "boolean") h.quality_pipeline.enabled = true;
+      h.quality_pipeline.repair = h.quality_pipeline.repair || {};
+      if (h.quality_pipeline.repair.temperature == null) h.quality_pipeline.repair.temperature = 0.15;
+      h.quality_pipeline.layer1 = h.quality_pipeline.layer1 || {};
+      if (!h.quality_pipeline.layer1.name) h.quality_pipeline.layer1.name = "draft";
+      if (h.quality_pipeline.layer1.temperature == null) h.quality_pipeline.layer1.temperature = 0.2;
+      if (h.quality_pipeline.layer1.instruction == null) h.quality_pipeline.layer1.instruction = "";
+      h.quality_pipeline.layer2 = h.quality_pipeline.layer2 || {};
+      if (!h.quality_pipeline.layer2.name) h.quality_pipeline.layer2.name = "review";
+      if (h.quality_pipeline.layer2.temperature == null) h.quality_pipeline.layer2.temperature = 0.1;
+      if (h.quality_pipeline.layer2.instruction == null) h.quality_pipeline.layer2.instruction = "";
+      h.quality_pipeline.layer3 = h.quality_pipeline.layer3 || {};
+      if (!h.quality_pipeline.layer3.name) h.quality_pipeline.layer3.name = "polish";
+      if (h.quality_pipeline.layer3.temperature == null) h.quality_pipeline.layer3.temperature = 0.3;
+      if (h.quality_pipeline.layer3.instruction == null) h.quality_pipeline.layer3.instruction = "";
     },
     async saveRuntime() {
       if (!this.editedHarness) return;
@@ -659,27 +454,27 @@ export default {
       this.saving = true;
       this.saveMsg = "";
       try {
-        const res = await fetch(`${API_BASE}/api/config/runtime`, {
+        const response = await fetch(`${API_BASE}/api/config/runtime`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ harness: this.editedHarness }),
         });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
           let detail = data.detail;
           if (Array.isArray(detail)) {
-            detail = detail.map((x) => (x && x.msg ? x.msg : JSON.stringify(x))).join("; ");
+            detail = detail.map((item) => (item?.msg ? item.msg : JSON.stringify(item))).join("; ");
           } else if (detail && typeof detail === "object") {
             detail = JSON.stringify(detail);
           }
-          throw new Error(detail || data.message || `HTTP ${res.status}`);
+          throw new Error(detail || data.message || `HTTP ${response.status}`);
         }
         this.saveOk = true;
         this.saveMsg = data.message || "已保存";
         this.$emit("reload");
-      } catch (e) {
+      } catch (error) {
         this.saveOk = false;
-        this.saveMsg = String(e?.message || e);
+        this.saveMsg = String(error?.message || error);
       } finally {
         this.saving = false;
       }
@@ -730,8 +525,8 @@ export default {
 }
 .note {
   font-size: 13px;
-  line-height: 1.55;
-  color: #94a3b8;
+  line-height: 1.6;
+  color: #cbd5e1;
   margin: 0 0 10px;
   padding: 10px 12px;
   border-radius: 10px;
@@ -791,135 +586,106 @@ export default {
   flex-direction: column;
   gap: 16px;
 }
-.pipeline-legend {
-  margin: 0;
-  padding: 12px 14px 12px 16px;
-  border-radius: 12px;
-  background: rgba(15, 23, 42, 0.72);
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+}
+.card {
   border: 1px solid rgba(71, 85, 105, 0.5);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.72);
+  padding: 14px;
 }
-.legend-lead {
-  margin: 0 0 10px;
-  font-size: 12px;
-  line-height: 1.6;
-  color: #cbd5e1;
+.card-wide {
+  grid-column: 1 / -1;
 }
-.legend-list {
-  margin: 0;
-  padding-left: 1.15rem;
-  font-size: 11px;
-  line-height: 1.55;
-  color: #94a3b8;
-}
-.legend-list li {
-  margin-bottom: 6px;
-}
-.legend-list li:last-child {
-  margin-bottom: 0;
-}
-.legend-list code {
-  font-size: 10px;
-  color: #a5b4fc;
-  background: rgba(99, 102, 241, 0.12);
-  padding: 1px 5px;
-  border-radius: 4px;
-}
-.step-blurb {
+.card h3 {
   margin: 0 0 12px;
-  padding: 8px 10px;
-  font-size: 11px;
-  line-height: 1.55;
-  color: #94a3b8;
-  background: rgba(15, 23, 42, 0.55);
-  border-radius: 8px;
-  border: 1px solid rgba(51, 65, 85, 0.45);
+  color: #f1f5f9;
+  font-size: 14px;
 }
-.step-blurb strong {
+.subcard {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(30, 41, 59, 0.55);
+  border: 1px solid rgba(51, 65, 85, 0.55);
+}
+.subcard-title {
+  margin-bottom: 10px;
+  font-size: 12px;
+  font-weight: 700;
   color: #cbd5e1;
-  font-weight: 600;
 }
-.pipeline-scroller {
-  overflow-x: auto;
-  overflow-y: hidden;
-  padding-bottom: 12px;
-  margin: 0 -6px;
-  padding-left: 6px;
-  padding-right: 6px;
-  scrollbar-color: #475569 #1e293b;
+.template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
 }
-.pipeline-track {
-  display: flex;
-  flex-direction: row;
-  align-items: stretch;
-  gap: 0;
-  min-height: min(72vh, 680px);
+.template-card {
+  margin-top: 0;
 }
-.pipeline-step {
-  flex: 0 0 min(300px, 85vw);
+.grid {
+  display: grid;
+  gap: 10px;
+}
+.grid.two {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+.grid.three {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+.field {
   display: flex;
   flex-direction: column;
-  border-radius: 14px;
-  border: 1px solid rgba(71, 85, 105, 0.55);
-  background: linear-gradient(165deg, rgba(79, 70, 229, 0.14) 0%, rgba(30, 41, 59, 0.92) 42%, #1a1f2b 100%);
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
-  overflow: hidden;
+  gap: 6px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: #64748b;
 }
-.pipeline-step-head {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 12px 14px;
-  border-bottom: 1px solid rgba(51, 65, 85, 0.65);
-  background: rgba(15, 23, 42, 0.35);
-}
-.step-badge {
-  flex-shrink: 0;
-  width: 28px;
-  height: 28px;
-  border-radius: 9px;
-  display: flex;
+.field.inline {
+  flex-direction: row;
   align-items: center;
-  justify-content: center;
-  font-size: 13px;
-  font-weight: 800;
-  color: #e0e7ff;
-  background: linear-gradient(135deg, #6366f1, #4f46e5);
-  box-shadow: 0 2px 10px rgba(99, 102, 241, 0.35);
+  gap: 12px;
 }
-.step-titles {
-  min-width: 0;
+.field.inline .field-label {
+  min-width: 148px;
 }
-.step-title {
-  font-size: 14px;
-  font-weight: 700;
-  color: #f1f5f9;
+.field-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #94a3b8;
   letter-spacing: 0.02em;
 }
-.step-sub {
-  margin-top: 3px;
-  font-size: 11px;
-  color: #64748b;
+.row-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: #cbd5e1;
+  cursor: pointer;
+}
+.inp {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #3d4d64;
+  background: #1a1f2b;
+  color: #e2e8f0;
+  font-size: 13px;
+}
+.ta {
+  width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid #3d4d64;
+  background: #1a1f2b;
+  color: #e2e8f0;
   font-family: ui-monospace, monospace;
-  line-height: 1.35;
-  word-break: break-all;
-}
-.pipeline-step-body {
-  flex: 1;
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding: 12px 14px 16px;
-  scrollbar-width: thin;
-  scrollbar-color: #475569 transparent;
-}
-.pipeline-arrow {
-  flex: 0 0 22px;
-  align-self: center;
-  text-align: center;
-  font-size: 22px;
-  font-weight: 300;
-  color: #64748b;
-  opacity: 0.85;
-  user-select: none;
+  font-size: 12px;
+  resize: vertical;
 }
 .json-panel {
   border: 1px solid #334155;
@@ -945,140 +711,16 @@ export default {
   font-size: 11px;
   color: #64748b;
 }
-.json-panel .mono {
-  margin: 0;
-  padding: 12px 14px;
-  max-height: 320px;
-}
-.divider {
-  height: 1px;
-  background: rgba(51, 65, 85, 0.65);
-  margin: 12px 0;
-}
-.cardTitle {
-  font-weight: 700;
-  margin-bottom: 8px;
-  color: #94a3b8;
-  font-size: 12px;
-}
-.cardTitle.tight {
-  margin-top: 4px;
-}
-.field-label {
-  font-size: 11px;
-  font-weight: 600;
-  color: #64748b;
-  letter-spacing: 0.02em;
-}
-.inp-fill {
-  width: 100%;
-  max-width: none;
-}
-.inp-fill-row {
-  width: 100%;
-}
-.inp-fill-row .inp {
-  flex: 1;
-  min-width: 0;
-  max-width: none;
-}
-.inp-half {
-  flex: 1;
-  min-width: 0;
-  max-width: none;
-}
-.inp-tiny {
-  flex: 1;
-  min-width: 0;
-  max-width: none;
-}
-.mt-6 {
-  margin-top: 6px;
-}
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-bottom: 12px;
-  font-size: 12px;
-  color: #64748b;
-}
-.field.inline-num {
-  flex-direction: row;
-  align-items: center;
-  gap: 12px;
-}
-.field.inline-num span:first-child {
-  min-width: 64px;
-  color: #94a3b8;
-}
-.field-help {
-  font-size: 11px;
-  color: #64748b;
-  line-height: 1.45;
-}
-.field-help.block {
-  display: block;
-  margin: -6px 0 10px;
-}
-.row-check {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-  font-size: 13px;
-  color: #cbd5e1;
-  cursor: pointer;
-}
-.mini {
-  font-size: 11px;
-  color: #64748b;
-  margin: -4px 0 10px;
-  line-height: 1.45;
-}
-.inp {
-  padding: 8px 10px;
-  border-radius: 8px;
-  border: 1px solid #3d4d64;
-  background: #1a1f2b;
-  color: #e2e8f0;
-  font-size: 13px;
-}
-.inp.sm {
-  max-width: 120px;
-}
-.inp.wide-num {
-  max-width: 100px;
-}
-.inline-pair {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-}
-.ta {
-  width: 100%;
-  padding: 10px;
-  border-radius: 8px;
-  border: 1px solid #3d4d64;
-  background: #1a1f2b;
-  color: #e2e8f0;
-  font-family: ui-monospace, monospace;
-  font-size: 12px;
-  resize: vertical;
-}
-.ta-short {
-  min-height: 68px;
-}
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   margin: 0;
+  padding: 12px 14px;
   white-space: pre-wrap;
   word-break: break-word;
   font-size: 11px;
   line-height: 1.45;
   color: #94a3b8;
-  max-height: 420px;
+  max-height: 360px;
   overflow: auto;
 }
 </style>

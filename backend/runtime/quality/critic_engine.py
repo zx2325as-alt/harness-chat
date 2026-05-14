@@ -5,7 +5,7 @@ import json
 from typing import Any, Dict, List, Tuple
 
 from json_utils import extract_balanced_json_object, strip_markdown_json_fence
-from unified_critic import evaluate_structured_refine_critic, evaluate_unified_critic
+from unified_critic import evaluate_structured_quality_critic, evaluate_unified_critic
 
 FACET_LAYER_DEFS: List[Tuple[str, str]] = [
     ("coverage", "覆盖度：是否遗漏用户子问题、约束或未回答要点"),
@@ -43,7 +43,7 @@ async def run_parallel_critics(
         )
 
     async def _struct():
-        return await evaluate_structured_refine_critic(harness, prompt, draft, options, hcfg, review_cands)
+        return await evaluate_structured_quality_critic(harness, prompt, draft, options, hcfg, review_cands)
 
     if enabled:
         return await asyncio.gather(_uni(), _struct())
@@ -193,7 +193,7 @@ async def run_single_facet_review(
     )
 
 
-async def run_unified_with_layered_facets(
+async def run_unified_with_parallel_facets(
     harness: Any,
     prompt: str,
     draft: str,
@@ -203,8 +203,8 @@ async def run_unified_with_layered_facets(
     review_cands: List[str],
     ev_text: str,
     *,
-    layered: bool,
-    legacy_parallel: bool,
+    parallel_facets: bool,
+    paired_parallel: bool,
 ) -> Dict[str, Any]:
     """返回 merge_structured_with_parallel 可直接消费的 merged（内含 _facet_reports）。"""
     async def _uni():
@@ -219,7 +219,7 @@ async def run_unified_with_layered_facets(
             mode="general",
         )
 
-    if layered:
+    if parallel_facets:
         uni, facets = await asyncio.gather(
             _uni(),
             run_layered_critics_parallel(harness, prompt, draft, options, hcfg, review_cands, ev_text),
@@ -229,10 +229,13 @@ async def run_unified_with_layered_facets(
         merged["_facet_reports"] = facets
         return merged
 
-    if legacy_parallel:
-        uni, struct = await asyncio.gather(_uni(), evaluate_structured_refine_critic(harness, prompt, draft, options, hcfg, review_cands))
+    if paired_parallel:
+        uni, struct = await asyncio.gather(
+            _uni(),
+            evaluate_structured_quality_critic(harness, prompt, draft, options, hcfg, review_cands),
+        )
         return merge_structured_with_parallel(uni, struct)
 
     uni = await _uni()
-    struct = await evaluate_structured_refine_critic(harness, prompt, draft, options, hcfg, review_cands)
+    struct = await evaluate_structured_quality_critic(harness, prompt, draft, options, hcfg, review_cands)
     return merge_structured_with_parallel(uni, struct)

@@ -27,7 +27,7 @@ def _pick_model(cfg: Dict[str, Any], key: str) -> str:
     # 质量优先：默认用 generation.polish 的首选；否则 routing.default_model
     h = cfg.get("harness") or {}
     tpl = (h.get("task_model_templates") or {}).get("generation") or {}
-    pm = ((tpl.get("refine_models") or {}).get("polish") or [])
+    pm = ((tpl.get("quality_models") or {}).get("polish") or [])
     if isinstance(pm, list) and pm:
         return str(pm[0])
     return str((h.get("routing") or {}).get("default_model") or "gpt-5.5")

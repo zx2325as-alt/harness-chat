@@ -4,6 +4,81 @@ import {
   saveSessionsJsonToIdb,
 } from "./idbSessions.js";
 
+const DEFAULT_RUNTIME = "adaptive_dag_v3";
+const LEGACY_PHASE_BY_TRACK = {
+  fast: "draft",
+  refine: "evaluate",
+  agent: "reasoning",
+  dag: "draft",
+  auto: "intake",
+};
+
+function normalizeLegacyPhase(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (!v) return "";
+  if (["intake", "search", "reasoning", "draft", "evaluate", "repair", "verify", "finalize", "other"].includes(v)) {
+    return v;
+  }
+  return LEGACY_PHASE_BY_TRACK[v] || "";
+}
+
+function migrateRun(run) {
+  if (!run || typeof run !== "object") return run;
+  const next = { ...run };
+  next.runtime = String(next.runtime || "").trim() || DEFAULT_RUNTIME;
+  next.phase = normalizeLegacyPhase(next.phase) || "";
+  if (!next.phase && next.track) {
+    next.phase = normalizeLegacyPhase(next.track) || "";
+  }
+  if (!Array.isArray(next.steps)) next.steps = [];
+  next.steps = next.steps.map((step) => {
+    if (!step || typeof step !== "object") return step;
+    const migrated = { ...step };
+    const meta = migrated.meta && typeof migrated.meta === "object" ? { ...migrated.meta } : {};
+    meta.runtime = String(meta.runtime || "").trim() || next.runtime;
+    meta.phase_group = normalizeLegacyPhase(meta.phase_group) || normalizeLegacyPhase(next.phase) || meta.phase_group || "";
+    if (migrated.name === "track_select") {
+      migrated.name = "dag_runtime_plan";
+      migrated.status = migrated.status || "ok";
+      meta.event_summary = meta.event_summary || "已迁移的旧运行记录：原轨道选择步骤已归并为运行时规划。";
+      meta.phase_group = meta.phase_group || "intake";
+    }
+    if (meta.track && !meta.phase_group) {
+      meta.phase_group = normalizeLegacyPhase(meta.track) || meta.phase_group;
+    }
+    delete meta.track;
+    migrated.meta = meta;
+    return migrated;
+  });
+  delete next.track;
+  return next;
+}
+
+function migrateMessage(message, runsById) {
+  if (!message || typeof message !== "object") return message;
+  const next = { ...message };
+  const meta = next.meta && typeof next.meta === "object" ? { ...next.meta } : {};
+  const run = meta.runId ? runsById.get(meta.runId) : null;
+  meta.runtime = String(meta.runtime || run?.runtime || "").trim() || DEFAULT_RUNTIME;
+  delete meta.track;
+  next.meta = meta;
+  return next;
+}
+
+function migrateSession(session) {
+  if (!session || typeof session !== "object") return session;
+  const next = { ...session };
+  next.stepRuns = Array.isArray(next.stepRuns) ? next.stepRuns.map(migrateRun) : [];
+  const runsById = new Map(next.stepRuns.map((run) => [run?.id, run]));
+  next.messages = Array.isArray(next.messages) ? next.messages.map((message) => migrateMessage(message, runsById)) : [];
+  if (next.useServerHistoryOnly == null) next.useServerHistoryOnly = false;
+  return next;
+}
+
+function migrateSessions(sessions) {
+  return Array.isArray(sessions) ? sessions.map(migrateSession) : [];
+}
+
 export async function loadSessionsState() {
   let idbRaw = null;
   let localRaw = null;
@@ -22,7 +97,7 @@ export async function loadSessionsState() {
 
   const parsedState = resolveLoadedSessionsState(idbRaw, localRaw);
 
-  const sessions = parsedState.sessions;
+  const sessions = migrateSessions(parsedState.sessions);
   const currentSessionId = parsedState.currentSessionId;
   if (parsedState.ok && parsedState.source === "localStorage") {
     try {

@@ -5,16 +5,14 @@ import re
 from typing import Any, Dict, List
 
 from runtime.models.runtime_intent import RuntimeIntent
-from runtime_state import get_execution_state, need_search_allowed
-
-_ROUTING_ORPHAN_KEYS = frozenset({"decision", "suggested_track"})
+from runtime_state import get_execution_state, need_search_allowed, set_runtime_phase
 
 
 def project_analysis_for_dag_runtime(analysis: Dict[str, Any]) -> Dict[str, Any]:
-    """§五：DAG 执行轨只消费研判信号，不显式携带 fast/refine/agent 互斥轨字段（完整 dict 见 options['_analysis_full']）。"""
+    """DAG 执行轨只消费运行时研判信号。"""
     if not isinstance(analysis, dict):
         return {}
-    out = {k: v for k, v in analysis.items() if k not in _ROUTING_ORPHAN_KEYS}
+    out = dict(analysis)
     out["dag_runtime_projection"] = True
     return out
 
@@ -27,9 +25,8 @@ def sync_dag_execution_layer(options: Dict[str, Any], intent: RuntimeIntent) -> 
     st = get_execution_state(options)
     if not st:
         return
-    st.initial_track = "dag"
-    st.current_track = "dag"
-    options["_runtime_track"] = "dag"
+    st.runtime_name = "adaptive_dag_v3"
+    set_runtime_phase(options, "intake")
     caps = {"draft", "critic", "verify", "repair", "finalize", "planning", "reasoning"}
     if intent.search_score >= 0.25 and not options.get("_web_search_blocked"):
         caps.add("search")

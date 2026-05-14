@@ -3,7 +3,7 @@
     <div class="msg-stack">
       <div class="bubble" :class="{ 'user-bubble': role === 'user' }">
         <div class="meta" v-if="role !== 'user' && meta && (!meta.pending || meta.streaming)">
-          <span v-if="meta.track" class="pill" :title="metaTitle">{{ meta.track }}</span>
+          <span v-if="meta.runtime" class="pill" :title="metaTitle">{{ runtimeLabel(meta.runtime) }}</span>
           <span v-if="meta.provider" class="pill">{{ meta.provider }}</span>
           <span v-if="meta.model" class="pill" :title="'末段模型: ' + meta.model">{{ meta.model }}</span>
           <span v-if="meta.latency_ms != null" class="pill">{{ meta.latency_ms }}ms</span>
@@ -90,7 +90,7 @@ export default {
     metaTitle() {
       const m = this.meta || {};
       const parts = [];
-      if (m.track) parts.push("轨道: " + m.track);
+      if (m.runtime) parts.push("运行时: " + this.runtimeLabel(m.runtime));
       if (m.model_chain) parts.push(m.model_chain);
       return parts.join("\n") || "";
     },
@@ -103,26 +103,26 @@ export default {
     },
     showThinkingPane() {
       if (!this.liveRun) return false;
-      // 流式期间助手消息一直保持 meta.pending=true，若据此隐藏则气泡内「思考过程」永远不出现
       if (this.meta?.pending && !this.meta?.streaming) return false;
       const steps = this.liveRun.steps || [];
-      return (
-        steps.length > 0 ||
-        this.liveRun.status === "running" ||
-        Boolean(this.meta?.streaming)
-      );
+      return steps.length > 0 || this.liveRun.status === "running" || Boolean(this.meta?.streaming);
     },
     showUnderActions() {
       return !this.meta?.pending && !this.meta?.streaming && this.role !== "system";
     },
   },
   methods: {
+    runtimeLabel(runtime) {
+      const value = String(runtime || "").trim().toLowerCase();
+      if (!value || value === "adaptive_dag_v3") return "Adaptive DAG Runtime";
+      return runtime;
+    },
     escapeHtml(s) {
       return String(s || "")
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
+        .replace(/\"/g, "&quot;");
     },
     safeMarkdown(text) {
       try {

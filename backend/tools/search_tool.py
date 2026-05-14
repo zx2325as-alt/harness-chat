@@ -4,10 +4,10 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from harness import DualTrackHarness
+    from harness import RuntimeHarness
 
 
-async def web_search(harness: "DualTrackHarness", query: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def web_search(harness: "RuntimeHarness", query: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """执行联网检索，返回与 SearchService.search 一致的结构。"""
     q = (query or "").strip()
     if not q:

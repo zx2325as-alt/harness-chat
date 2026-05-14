@@ -29,33 +29,33 @@
 
       <div class="composer-footer" ref="dropRoot">
         <div class="footer-left">
-          <div class="dd" :class="{ open: openMenu === 'mode' }">
+          <div class="dd" :class="{ open: openMenu === 'runtime' }">
             <button
               type="button"
               class="dd-trigger dd-trigger-pill"
               :disabled="uiBusy"
-              :title="modeHint"
+              :title="runtimeHint"
               aria-haspopup="listbox"
-              :aria-expanded="openMenu === 'mode'"
-              @click.stop="toggleMenu('mode')"
+              :aria-expanded="openMenu === 'runtime'"
+              @click.stop="toggleMenu('runtime')"
             >
               <svg class="dd-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                 <path d="M4 7h16M7 12h10M9 17h6" />
               </svg>
-              <span class="dd-value">{{ modeLabel }}</span>
+              <span class="dd-value">{{ runtimeLabel }}</span>
               <svg class="dd-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M6 9l6 6 6-6" />
               </svg>
             </button>
             <transition name="dd-pop">
-              <ul v-show="openMenu === 'mode'" class="dd-list" role="listbox">
+              <ul v-show="openMenu === 'runtime'" class="dd-list" role="listbox">
                 <li
-                  v-for="o in modeOptions"
+                  v-for="o in runtimeOptions"
                   :key="o.value"
                   class="dd-item"
-                  :class="{ active: mode === o.value }"
+                  :class="{ active: runtime === o.value }"
                   role="option"
-                  @click.stop="pickMode(o.value)"
+                  @click.stop="pickRuntime(o.value)"
                 >
                   {{ o.label }}
                 </li>
@@ -147,18 +147,14 @@
 import { API_BASE } from "../apiBase.js";
 import { isSendableComposerState } from "../chatShared.js";
 
-const MODE_OPTIONS = [
-  { value: "auto", label: "自动" },
-  { value: "dag", label: "DAG Runtime" },
-  { value: "agent", label: "Agent轨(遗留)" },
-  { value: "refine", label: "精化轨(提示)" },
-  { value: "fast", label: "快速轨(提示)" },
+const RUNTIME_OPTIONS = [
+  { value: "adaptive_dag_v3", label: "Adaptive DAG Runtime" },
 ];
 
 const SEARCH_OPTIONS = [
-  { value: "auto", label: "自动（快轨）" },
-  { value: "on", label: "开启（快轨）" },
-  { value: "off", label: "关闭（快轨）" },
+  { value: "auto", label: "自动" },
+  { value: "on", label: "开启" },
+  { value: "off", label: "关闭" },
 ];
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const UPLOAD_CONCURRENCY = 3;
@@ -247,11 +243,11 @@ export default {
   name: "ChatInput",
   props: {
     busy: { type: Boolean, default: false },
-    mode: { type: String, default: "auto" },
+    runtime: { type: String, default: "adaptive_dag_v3" },
     /** 来自服务端 harness.web_search.globally_disabled，保存配置后与聊天区同步 */
     globalSearchDisabled: { type: Boolean, default: false },
   },
-  emits: ["send", "stop", "update:mode"],
+  emits: ["send", "stop", "update:runtime"],
   data() {
     return {
       draft: "",
@@ -259,7 +255,7 @@ export default {
       folderLoading: false,
       searchMode: "auto",
       openMenu: null,
-      modeOptions: MODE_OPTIONS,
+      runtimeOptions: RUNTIME_OPTIONS,
       searchOptions: SEARCH_OPTIONS,
       _parseControllers: new Set(),
       _parseControllerByAttachmentId: new Map(),
@@ -293,18 +289,18 @@ export default {
       }
       return "发送";
     },
-    modeLabel() {
-      return MODE_OPTIONS.find((o) => o.value === this.mode)?.label ?? this.mode;
+    runtimeLabel() {
+      return RUNTIME_OPTIONS.find((o) => o.value === this.runtime)?.label ?? this.runtime;
     },
-    modeHint() {
-      return "auto：由预判与 Capability Planner 参与首执轨选择；运行中可由后置 critic 单调升级。同步 POST /api/chat 与 SSE /api/chat/stream 共用同一 Runtime，Agent 轨在非流式下同样执行完整循环（注意超时与客户端等待）。";
+    runtimeHint() {
+      return "所有请求统一进入 Adaptive Self-Correcting Async DAG Runtime；同步 /api/chat 与 SSE /api/chat/stream 共用同一运行时执行图。";
     },
     searchLabel() {
       if (this.globalSearchDisabled) return "关闭（全局锁定）";
       return SEARCH_OPTIONS.find((o) => o.value === this.searchMode)?.label ?? this.searchMode;
     },
     searchModeHint() {
-      return "关闭联网：本条消息优先级最高，全轨道（含 auto）均不发起检索，Agent 的 web_search 与审查层联网也会跳过并提示。开启/自动：按服务端逻辑；若配置页启用「全局禁止联网」，则始终不检索。";
+      return "关闭联网：本条消息优先级最高，不发起联网检索；开启/自动：按服务端策略执行。若配置页启用「全局禁止联网」，则始终不检索。";
     },
     fileAccept() {
       return FILE_ACCEPT;
@@ -344,8 +340,8 @@ export default {
       if (which === "search" && this.globalSearchDisabled) return;
       this.openMenu = this.openMenu === which ? null : which;
     },
-    pickMode(value) {
-      this.$emit("update:mode", value);
+    pickRuntime(value) {
+      this.$emit("update:runtime", value);
       this.openMenu = null;
     },
     pickSearch(value) {

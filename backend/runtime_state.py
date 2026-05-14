@@ -1,20 +1,10 @@
-"""动态 Runtime 真相源：ExecutionState / AgentState（与文档对齐）。"""
+"""动态 Runtime 真相源：ExecutionState / GoalExecutionState（与文档对齐）。"""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-# 单调升级秩；dag 为当前默认执行轨（最高）。
-TRACK_RANK: Dict[str, int] = {"fast": 0, "refine": 1, "agent": 2, "dag": 3}
-
-
-def track_rank_value(track: str) -> int:
-    t = str(track or "fast").strip().lower()
-    return TRACK_RANK.get(t, 0)
-
-
-def is_strict_track_upgrade(from_track: str, to_track: str) -> bool:
-    return track_rank_value(to_track) > track_rank_value(from_track)
+from runtime.kernel.kernel_models import NodeStatus, RunStatus, now_ts_ms
 
 
 @dataclass
@@ -23,6 +13,19 @@ class ExecutionState:
     prompt: str
     history_digest: str = ""
     documents_digest: str = ""
+    runtime_name: str = "adaptive_dag_v3"
+    run_id: str = ""
+    run_status: str = RunStatus.CREATED
+    started_at_ms: int = 0
+    updated_at_ms: int = 0
+    ended_at_ms: int = 0
+    current_phase: str = "intake"
+    completed_phases: List[str] = field(default_factory=list)
+    phase_history: List[Dict[str, Any]] = field(default_factory=list)
+    capability_history: List[str] = field(default_factory=list)
+    repair_round: int = 0
+    max_repair_rounds: int = 2
+    repair_history: List[Dict[str, Any]] = field(default_factory=list)
     """近期用户/助手轮次（截断正文，供 Runtime 调试与追溯；大上下文仍以 digest 为准）。"""
     history: List[Dict[str, Any]] = field(default_factory=list)
     """上传文档快照（元数据为主，避免把全文塞进 state）。"""
@@ -31,8 +34,6 @@ class ExecutionState:
     history_tail: List[Dict[str, Any]] = field(default_factory=list)
     """上传文档摘要（文件名/状态等）。"""
     documents_meta: List[Dict[str, Any]] = field(default_factory=list)
-    initial_track: str = "dag"
-    current_track: str = "dag"
     draft_answer: Optional[str] = None
     final_answer: Optional[str] = None
     search_results: List[Dict[str, Any]] = field(default_factory=list)
@@ -48,11 +49,7 @@ class ExecutionState:
     confidence_score: float = 0.0
     critic_issues: List[str] = field(default_factory=list)
     limitations: List[str] = field(default_factory=list)
-    escalation_count: int = 0
-    max_escalations: int = 2
-    escalation_path: List[str] = field(default_factory=list)
     trace: List[Dict[str, Any]] = field(default_factory=list)
-    # DAG / 能力化 Runtime 扩展（默认执行轨为 dag；秩比较仍兼容历史 fast|refine|agent 字符串）
     active_capabilities: Set[str] = field(default_factory=set)
     critic_reports: List[Dict[str, Any]] = field(default_factory=list)
     verification_reports: List[Dict[str, Any]] = field(default_factory=list)
@@ -67,11 +64,19 @@ class ExecutionState:
     unresolved_goals: List[str] = field(default_factory=list)
     evidence_nodes: List[Dict[str, Any]] = field(default_factory=list)
     risk_score: float = 0.0
-    # evidence_graph_snapshot：EvidenceGraph.to_dict()；runtime_memory：失败路径/修复轨迹等
     evidence_graph_snapshot: Dict[str, Any] = field(default_factory=dict)
     runtime_memory: List[Dict[str, Any]] = field(default_factory=list)
     goal_state: Dict[str, Any] = field(default_factory=dict)
     risk_state: Dict[str, Any] = field(default_factory=dict)
+    node_states: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    event_cursor: int = 0
+    checkpoint_cursor: int = 0
+    last_checkpoint_id: str = ""
+    resume_from_run_id: str = ""
+    cancel_requested: bool = False
+    cancel_reason: str = ""
+    terminal_error: str = ""
+    public_event_count: int = 0
 
     @property
     def latency_budget(self) -> str:
@@ -100,12 +105,111 @@ class ExecutionState:
         d["runtime_cost"] = self.runtime_cost
         return d
 
+    def touch(self) -> None:
+        self.updated_at_ms = now_ts_ms()
+        if not self.started_at_ms:
+            self.started_at_ms = self.updated_at_ms
+
     def append_trace(self, kind: str, payload: Dict[str, Any]) -> None:
+        self.touch()
         self.trace.append({"kind": kind, **payload})
+
+    def set_phase(self, phase: str, **payload: Any) -> None:
+        ph = str(phase or "").strip().lower()
+        if not ph:
+            return
+        self.touch()
+        self.current_phase = ph
+        if ph not in self.completed_phases and ph != "intake":
+            self.completed_phases.append(ph)
+        row = {"phase": ph, "ts_ms": self.updated_at_ms}
+        if payload:
+            row.update(payload)
+        self.phase_history.append(row)
+
+    def note_capability(self, capability: str, *, reason: str = "") -> None:
+        cap = str(capability or "").strip().lower()
+        if not cap:
+            return
+        self.touch()
+        self.active_capabilities.add(cap)
+        tag = cap if not reason else f"{cap}({reason[:80]})"
+        self.capability_history.append(tag)
+
+    def note_repair_round(self, round_idx: int, **payload: Any) -> None:
+        idx = max(0, int(round_idx))
+        self.touch()
+        self.repair_round = idx
+        row = {"round": idx, "ts_ms": self.updated_at_ms}
+        if payload:
+            row.update(payload)
+        self.repair_history.append(row)
+
+    def _upsert_node_state(self, node_id: str, status: str, **payload: Any) -> None:
+        nid = str(node_id or "").strip()
+        if not nid:
+            return
+        self.touch()
+        row = dict(self.node_states.get(nid) or {})
+        row["node_id"] = nid
+        row["status"] = status
+        row["updated_at_ms"] = self.updated_at_ms
+        if payload:
+            row.update(payload)
+        self.node_states[nid] = row
+
+    def note_node_ready(self, node_id: str, **payload: Any) -> None:
+        self._upsert_node_state(node_id, NodeStatus.READY, **payload)
+
+    def note_node_started(self, node_id: str, **payload: Any) -> None:
+        row = dict(self.node_states.get(str(node_id or "")) or {})
+        payload.setdefault("started_at_ms", self.updated_at_ms or now_ts_ms())
+        payload.setdefault("attempt", int(row.get("attempt") or 0) + 1)
+        self._upsert_node_state(node_id, NodeStatus.RUNNING, **payload)
+
+    def note_node_succeeded(self, node_id: str, **payload: Any) -> None:
+        payload.setdefault("ended_at_ms", now_ts_ms())
+        self._upsert_node_state(node_id, NodeStatus.SUCCEEDED, **payload)
+
+    def note_node_failed(self, node_id: str, error: str, **payload: Any) -> None:
+        payload.setdefault("ended_at_ms", now_ts_ms())
+        payload["error"] = str(error or "")[:1200]
+        self.failed_attempts.append(f"{node_id}:{payload['error'][:160]}")
+        self._upsert_node_state(node_id, NodeStatus.FAILED, **payload)
+
+    def note_node_cancelled(self, node_id: str, reason: str = "", **payload: Any) -> None:
+        payload.setdefault("ended_at_ms", now_ts_ms())
+        if reason:
+            payload["error"] = str(reason)[:1200]
+        self._upsert_node_state(node_id, NodeStatus.CANCELLED, **payload)
+
+    def note_checkpoint(self, checkpoint_id: str, seq: int, **payload: Any) -> None:
+        self.touch()
+        self.last_checkpoint_id = str(checkpoint_id or "")
+        self.checkpoint_cursor = max(int(self.checkpoint_cursor or 0), int(seq or 0))
+        row = {"kind": "checkpoint", "checkpoint_id": self.last_checkpoint_id, "seq": self.checkpoint_cursor, "ts_ms": self.updated_at_ms}
+        if payload:
+            row.update(payload)
+        self.runtime_memory.append(row)
+
+    def note_public_event(self, seq: int) -> None:
+        self.touch()
+        self.event_cursor = max(int(self.event_cursor or 0), int(seq or 0))
+        self.public_event_count = max(int(self.public_event_count or 0), int(seq or 0))
+
+    def mark_run_terminal(self, status: str, *, error: str = "", cancel_reason: str = "") -> None:
+        self.touch()
+        self.run_status = str(status or self.run_status or RunStatus.FAILED)
+        self.ended_at_ms = self.updated_at_ms
+        if error:
+            self.terminal_error = str(error)[:2000]
+        if cancel_reason:
+            self.cancel_requested = True
+            self.cancel_reason = str(cancel_reason)[:500]
 
 
 @dataclass
-class AgentState:
+class GoalExecutionState:
     goals: List[str] = field(default_factory=list)
     solved_goals: List[str] = field(default_factory=list)
     unresolved_goals: List[str] = field(default_factory=list)
@@ -154,23 +258,19 @@ def append_search_evidence_rows(options: Dict[str, Any], rows: List[Dict[str, An
             st.search_results.append(r)
 
 
-def runtime_track(options: Dict[str, Any]) -> str:
+def runtime_phase(options: Dict[str, Any]) -> str:
     st = get_execution_state(options)
     if st:
-        return str(st.current_track or "dag").strip().lower()
-    return str(options.get("_runtime_track") or "dag").strip().lower()
+        return str(st.current_phase or "intake").strip().lower()
+    return str(options.get("_runtime_phase") or "intake").strip().lower()
 
 
-def set_runtime_track(options: Dict[str, Any], track: str) -> None:
-    """与 escalate 一致：仅允许单调升级，禁止降级写入。"""
-    t = str(track or "dag").strip().lower()
+def set_runtime_phase(options: Dict[str, Any], phase: str) -> None:
+    ph = str(phase or "intake").strip().lower()
+    options["_runtime_phase"] = ph
     st = get_execution_state(options)
-    cur = runtime_track(options)
-    if st and t != cur and not is_strict_track_upgrade(cur, t):
-        return
-    options["_runtime_track"] = t
     if st:
-        st.current_track = t
+        st.set_phase(ph)
 
 
 def sync_execution_search_budget(options: Dict[str, Any]) -> None:

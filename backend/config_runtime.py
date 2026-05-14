@@ -18,6 +18,37 @@ SECRET_EXACT: Set[str] = {
     "extra_headers",  # 可能含鉴权头
 }
 
+LEGACY_HARNESS_KEYS: Set[str] = {
+    "default_mode",
+    "default_runtime",
+    "routing_tuning",
+    "refine_chain_tuning",
+    "agent_tuning",
+    "agent",
+    "refine_chain",
+    "fast_answer_cache",
+}
+
+LEGACY_SEARCH_KEYS: Set[str] = {
+    "by_track",
+}
+
+LEGACY_RELEVANCE_FILTER_KEYS: Set[str] = {
+    "sync_tracks",
+}
+
+LEGACY_DAG_RUNTIME_KEYS: Set[str] = {
+    "agent_subgraph_enabled",
+}
+
+LEGACY_RUNTIME_ORCHESTRATOR_KEYS: Set[str] = {
+    "rollout_stages",
+    "fast_quality_gate",
+    "refine_pipeline",
+    "max_escalations",
+    "auto_initial_track_policy",
+}
+
 
 def _is_secret_key(name: str) -> bool:
     k = str(name or "").strip()
@@ -58,14 +89,45 @@ def strip_secrets_from_mapping(obj: Any) -> Any:
 
 
 def sanitize_harness_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
-    """写入前剔除客户端传入的密钥字段（防止误覆盖）；移除已废弃字段。"""
+    """写入前剔除客户端传入的密钥字段（防止误覆盖）；拒绝已废弃字段。"""
     out = strip_secrets_from_mapping(patch)  # type: ignore[assignment]
     if isinstance(out, dict):
-        ag = out.get("agent")
-        if isinstance(ag, dict) and "sync_non_stream_api" in ag:
-            ag2 = dict(ag)
-            ag2.pop("sync_non_stream_api", None)
-            out["agent"] = ag2
+        legacy = sorted(k for k in out.keys() if k in LEGACY_HARNESS_KEYS)
+        if legacy:
+            raise ValueError("runtime 配置不再接受旧字段: " + ", ".join(legacy))
+        dag_runtime = out.get("dag_runtime")
+        if isinstance(dag_runtime, dict):
+            bad_dag = sorted(k for k in dag_runtime.keys() if k in LEGACY_DAG_RUNTIME_KEYS)
+            if bad_dag:
+                raise ValueError("harness.dag_runtime 不再接受旧字段: " + ", ".join(bad_dag))
+        orch = out.get("runtime_orchestrator")
+        if isinstance(orch, dict):
+            bad_orch = sorted(k for k in orch.keys() if k in LEGACY_RUNTIME_ORCHESTRATOR_KEYS)
+            if bad_orch:
+                raise ValueError("harness.runtime_orchestrator 不再接受旧字段: " + ", ".join(bad_orch))
+        search = out.get("search")
+        if isinstance(search, dict):
+            bad_search = sorted(k for k in search.keys() if k in LEGACY_SEARCH_KEYS)
+            if bad_search:
+                raise ValueError("harness.search 不再接受旧字段: " + ", ".join(bad_search))
+            search2 = dict(search)
+            rf = search2.get("relevance_filter")
+            if isinstance(rf, dict):
+                bad_rf = sorted(k for k in rf.keys() if k in LEGACY_RELEVANCE_FILTER_KEYS)
+                if bad_rf:
+                    raise ValueError("harness.search.relevance_filter 不再接受旧字段: " + ", ".join(bad_rf))
+                sync_mode = str(rf.get("sync_default_mode") or "").strip().lower()
+                if sync_mode == "quality_tracks":
+                    raise ValueError("harness.search.relevance_filter.sync_default_mode 不再接受旧值: quality_tracks")
+            out["search"] = search2
+        templates = out.get("task_model_templates")
+        if isinstance(templates, dict):
+            for name, block in templates.items():
+                if isinstance(block, dict) and "refine_models" in block:
+                    raise ValueError(f"harness.task_model_templates.{name} 不再接受旧字段: refine_models")
+        complexity = out.get("complexity")
+        if isinstance(complexity, dict) and "manual_triggers" in complexity:
+            raise ValueError("harness.complexity 不再接受旧字段: manual_triggers")
     return out  # type: ignore[return-value]
 
 

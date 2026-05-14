@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from runtime.orchestrator.escalation import runtime_escalate_capability
-from runtime_state import get_execution_state
 
 
 class RuntimeHandle:
@@ -28,11 +27,12 @@ def enable_on_context(ctx: Any, capability: str, *, reason: str = "") -> None:
 
 
 def snapshot_capabilities(options: Dict[str, Any]) -> Dict[str, Any]:
-    st = get_execution_state(options)
-    if not st:
-        return {"active": [], "escalation_path": []}
+    st = options.get("_execution_state")
+    if st is None or not hasattr(st, "active_capabilities"):
+        return {"active": [], "history": []}
     caps = sorted(st.active_capabilities) if isinstance(st.active_capabilities, set) else []
-    return {"active": caps, "escalation_path": list(st.escalation_path or [])}
+    history = list(getattr(st, "capability_history", []) or [])
+    return {"active": caps, "history": history}
 
 
 __all__ = ["RuntimeHandle", "enable", "enable_on_context", "snapshot_capabilities"]

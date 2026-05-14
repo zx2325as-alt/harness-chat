@@ -1,5 +1,6 @@
 export const HISTORY_MAX_MESSAGES = 12;
 export const HISTORY_MAX_CHARS = 12000;
+export const DEFAULT_RUNTIME = "adaptive_dag_v3";
 
 export function createSessionId() {
   try {
@@ -59,19 +60,21 @@ export function getRunTitle(content) {
   return "新请求";
 }
 
-export function createStepRun(userMsg, documents = [], searchMode = "auto") {
+export function createStepRun(userMsg, documents = [], searchMode = "auto", runtime = DEFAULT_RUNTIME) {
   return {
     id: createRunId(),
     title: getRunTitle(userMsg.content),
     createdAt: new Date().toISOString(),
     traceId: "",
-    track: "",
+    runtime,
     status: "running",
     steps: [],
     documents: documents.map((d) => ({ name: d.name, status: d.status, meta: d.meta })),
     searchMode,
     phaseMessage: "",
     phase: "",
+    serverRunId: "",
+    lastEventSeq: 0,
   };
 }
 
@@ -135,10 +138,12 @@ export function createStreamContext() {
     receivedDone: false,
     streamFailed: false,
     finalContent: "",
-    finalMeta: { track: "", provider: "", model: "", success: true, latency_ms: 0, model_chain: "" },
+    finalMeta: { runtime: DEFAULT_RUNTIME, provider: "", model: "", success: true, latency_ms: 0, model_chain: "" },
     lastErrorEvent: null,
     modelErrors: [],
     contentResetCount: 0,
+    lastEventSeq: 0,
+    lastRunId: "",
   };
 }
 
@@ -155,27 +160,29 @@ export function buildStreamRequestPayload({
   sessionId,
   prompt,
   history,
-  mode,
+  runtime,
   documents,
   searchMode,
-  upgradeTrack,
   preferServerHistory,
   clientRunId,
   streamConnectAttempt,
+  runId,
+  afterSeq,
 }) {
   return JSON.stringify({
     session_id: sessionId,
     prompt,
     messages: history,
-    mode,
+    runtime,
     options: {
       documents,
       search_mode: searchMode,
       stream_slice_chars: 24,
-      upgrade_track: upgradeTrack,
       prefer_server_history: Boolean(preferServerHistory),
       client_run_id: clientRunId,
       stream_connect_attempt: streamConnectAttempt,
+      run_id: runId,
+      after_seq: Math.max(0, Number(afterSeq || 0)),
     },
   });
 }
@@ -239,12 +246,23 @@ export function isSendableComposerState({ draft, attachments, busy, hasParsingAt
 
 export function computeModelChain(run) {
   const labels = {
-    refine_layer1_draft: "初稿",
-    refine_layer2_review: "审查",
-    refine_quality_review: "结构化审查",
-    refine_layer3_polish: "润色",
-    agent_iteration: "Agent",
-    fast_route: "快轨",
+    dag_draft: "起草",
+    dag_parallel_critic: "评估",
+    dag_repair: "修复",
+    dag_verify: "验证",
+    dag_finalize: "终稿",
+    refine_layer1_draft: "起草",
+    refine_draft: "起草",
+    refine_runtime_generate: "起草",
+    refine_layer2_review: "评估",
+    refine_quality_review: "结构化评估",
+    refine_runtime_critic: "评估",
+    refine_runtime_repair: "修复",
+    refine_runtime_verify: "验证",
+    refine_layer3_polish: "终稿润色",
+    refine_finalize: "终稿",
+    refine_runtime_finalize: "终稿",
+    agent_iteration: "推理",
   };
   const parts = [];
   (run.steps || []).forEach((s) => {
@@ -270,7 +288,7 @@ export function buildStreamErrorDetail({ errorText, run, lastErrorEvent, modelEr
     `请求失败：${errorText}`,
     "",
     "排查信息：",
-    `- 轨道：${run.track || "未知"}`,
+    `- 运行时：${run.runtime || DEFAULT_RUNTIME}`,
     `- 阶段：${run.phaseMessage || run.phase || "未知"}`,
     `- Trace：${run.traceId || "无"}`,
     lastErrorEvent?.error_code ? `- 错误码：${lastErrorEvent.error_code}` : "",

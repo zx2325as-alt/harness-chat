@@ -8,7 +8,7 @@
       </span>
       <span class="think-badges">
         <span v-if="run.traceId" class="tb" :title="'trace: ' + run.traceId">#{{ shortId(run.traceId) }}</span>
-        <span v-if="run.track" class="tb track">{{ run.track }}</span>
+        <span v-if="run.runtime" class="tb runtime">{{ runtimeLabel(run.runtime) }}</span>
         <span v-if="run.status === 'running'" class="tb run">进行中</span>
         <span v-else class="tb ok">{{ items.length }} 条记录</span>
       </span>
@@ -189,6 +189,11 @@ export default {
     if (this._t) clearInterval(this._t);
   },
   methods: {
+    runtimeLabel(runtime) {
+      const value = String(runtime || "").trim().toLowerCase();
+      if (!value || value === "adaptive_dag_v3") return "Adaptive DAG Runtime";
+      return runtime;
+    },
     browseFollows(idx) {
       const next = this.items[idx + 1];
       return next && next.kind === "browse";
@@ -283,7 +288,7 @@ export default {
   background: #1e293b;
   color: #94a3b8;
 }
-.tb.track {
+.tb.runtime {
   color: #a5b4fc;
 }
 .tb.run {

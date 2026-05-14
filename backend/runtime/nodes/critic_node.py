@@ -7,7 +7,7 @@ from refine_shared import _pg
 from runtime.dag_common import user_status
 from runtime.kernel.runtime_context import DAGRuntimeContext
 from runtime.metrics_hooks import record_parallelism
-from runtime.quality.critic_engine import run_unified_with_layered_facets
+from runtime.quality.critic_engine import run_unified_with_parallel_facets
 from runtime.quality.hallucination_detector import hallucination_score_from_critics
 from runtime.quality.repair_engine import critic_issue_total
 from runtime_metrics import emit_product_metric
@@ -40,20 +40,20 @@ async def execute_round(
     else:
         merged = None
 
-    await ctx.emit(user_status(f"并行批评（第 {round_idx + 1}/{plan.repair_rounds_max} 轮）…", phase="critic"))
+    await ctx.emit(user_status(f"并行批评（第 {round_idx + 1}/{plan.repair_rounds_max} 轮）…", phase="evaluate"))
     await ctx.emit(
         {
             "event": "step",
             "step": {
                 "name": "dag_parallel_critic",
                 "status": "running",
-                "meta": _pg({"round": round_idx}, "review", "DAG：并行 Critic Nodes"),
+                "meta": _pg({"round": round_idx}, "evaluate", "DAG：并行 Critic Nodes"),
             },
         }
     )
 
     if merged is None:
-        merged = await run_unified_with_layered_facets(
+        merged = await run_unified_with_parallel_facets(
             h,
             ctx.prompt,
             draft,
@@ -62,8 +62,8 @@ async def execute_round(
             hcfg,
             ctx.review_cands,
             ev_text,
-            layered=plan.layered_critics,
-            legacy_parallel=plan.parallel_critics and not plan.layered_critics,
+            parallel_facets=plan.layered_critics,
+            paired_parallel=plan.parallel_critics and not plan.layered_critics,
         )
         if ctx.caches:
             ctx.caches.critic.put(crit_key, merged)
@@ -101,10 +101,10 @@ async def execute_round(
                     {
                         "issue_total": critic_issue_total(merged),
                         "layered_critics": plan.layered_critics,
-                        "legacy_parallel": plan.parallel_critics and not plan.layered_critics,
+                        "paired_parallel": plan.parallel_critics and not plan.layered_critics,
                         "facets": ["coverage", "logic", "evidence", "hallucination", "policy"],
                     },
-                    "review",
+                    "evaluate",
                     "并行批评完成。",
                 ),
             },

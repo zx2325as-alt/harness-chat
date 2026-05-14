@@ -1,67 +1,49 @@
 harness:
-  default_mode: auto
+  runtime: "adaptive_dag_v3"
   stream_slice_chars: 72
   web_search:
     globally_disabled: true
-  features:
-    analyzer_json_repair: true
+
+  dag_runtime:
+    parallel_search_queries: 2
+    parallel_critics: true
+    layered_critics: true
+    parallel_drafts: true
+    hedge_draft_delay_ms: 0
+    max_repair_rounds: 2
+    goal_subgraph_enabled: false
+    tool_capability_gate_enabled: true
+    semantic_cache_short_circuit: false
+
   runtime_orchestrator:
     enabled: true
-    max_escalations: 2
-    auto_initial_track_policy: dag_only
-    rollout_stages:
-      unified_critic: true
-    fast_quality_gate:
-      enabled: true
-      min_draft_chars: 48
-      score_threshold: 7.5
-      hallucination_risk_threshold: 0.4
-      completeness_threshold: 0.7
-      disable_cache_on_high_risk: true
     search_budget_per_request: 24
-    refine_pipeline:
-      mode: critic_runtime
-      critic_model_key: ""
+    unified_critic:
+      enabled: true
+      model_key: ""
+    search_sufficiency:
+      enabled: true
+      model_key: ""
     observability:
       metrics_jsonl_path: ""
       metrics_sqlite_path: data/runtime_metrics.sqlite
-  routing_tuning:
-    confidence_track_guard_threshold: 0.52
-    confidence_track_guard_min_prompt_chars: 150
-    low_confidence_suggested_track_threshold: 0.5
-  refine_chain_tuning:
-    max_review_web_rounds: 3
+
   stream_tuning:
     smart_chunk_boundary: true
     emit_content_reset: true
-  agent_tuning:
-    progress_eval:
-      enabled: true
-      every_n_iterations: 2
-      max_calls_per_request: 4
-      low_progress_abort_after: 2
-      min_progress_score: 0.22
-      min_delta_vs_previous: 0.1
-      progress_score_delta_threshold: 0.05
-      progress_delta_low_abort_after: 2
-      goal_resolve_progress_threshold: 0.55
-      goal_resolve_delta_threshold: 0.2
-      model_key: ""
+
   search:
     provider: tavily
     fallback: duckduckgo
     query_enrich: false
     search_depth: basic
     max_results: 8
-    by_track:
-      fast:
-        max_results: 5
+    by_intent:
+      search:
+        max_results: 8
         search_depth: basic
-      refine:
+      dag:
         max_results: 12
-        search_depth: advanced
-      agent:
-        max_results: 10
         search_depth: advanced
     topic: general
     timeout_s: 15
@@ -70,27 +52,25 @@ harness:
     relevance_filter:
       enabled: true
       model: claude-sonnet-4-6
-      sync_default_mode: quality_tracks
-      sync_tracks:
-      - refine
-      - agent
+      sync_default_mode: runtime_phases
     session_cache_ttl_s: 1800
     session_cache_ttl_freshness_s: 180
     session_cache_ttl_required_s: 900
     session_cache_ttl_explicit_s: 1800
     speculative_markers:
-    - 联网
-    - 搜索
-    - 查证
-    - 最新
-    - 今天
-    - 实时
-    - weather
-    - news
-    - stock
-    - 行情
-    - 汇率
-    - 政策
+      - 联网
+      - 搜索
+      - 查证
+      - 最新
+      - 今天
+      - 实时
+      - weather
+      - news
+      - stock
+      - 行情
+      - 汇率
+      - 政策
+
   documents:
     bm25_weight: 0.55
     embedding_weight: 0.45
@@ -113,183 +93,146 @@ harness:
       model: bge-reranker-v2-m3
       max_items: 12
       top_k: 8
-  fast_answer_cache:
-    enabled: false
-    key_prefix: 'harness:fast:v1:'
-    ttl_sec: 86400
-    similarity_threshold: 0.92
-    max_scan_keys: 400
-    cheap_ngram_overlap_min: 0.06
+
   task_model_templates:
     reasoning:
       selected_model: claude-sonnet-4-6-thinking
       fallback_models:
-      - grok-4-20-reasoning
-      - gpt-5.5
-      - deepseek-v4-flash
-      refine_models:
-        draft:
-        - claude-sonnet-4-6-thinking
         - grok-4-20-reasoning
+        - gpt-5.5
+        - deepseek-v4-flash
+      quality_models:
+        draft:
+          - claude-sonnet-4-6-thinking
+          - grok-4-20-reasoning
         review:
-        - gpt-5.5
-        - claude-sonnet-4-6
+          - gpt-5.5
+          - claude-sonnet-4-6
         polish:
-        - claude-opus-4-7
-        - gpt-5.5
+          - claude-opus-4-7
+          - gpt-5.5
     generation:
       selected_model: claude-opus-4-7
       fallback_models:
-      - deepseek-v4-pro
-      - gpt-5.5
-      refine_models:
-        draft:
         - deepseek-v4-pro
         - gpt-5.5
+      quality_models:
+        draft:
+          - deepseek-v4-pro
+          - gpt-5.5
         review:
-        - gpt-5.5
-        - claude-sonnet-4-6
+          - gpt-5.5
+          - claude-sonnet-4-6
         polish:
-        - claude-opus-4-7
-        - gpt-5.5
+          - claude-opus-4-7
+          - gpt-5.5
     code:
       selected_model: claude-sonnet-4-6
       fallback_models:
-      - deepseek-v4-flash
-      - gpt-5.5
-      refine_models:
-        draft:
         - deepseek-v4-flash
-        - claude-sonnet-4-6
+        - gpt-5.5
+      quality_models:
+        draft:
+          - deepseek-v4-flash
+          - claude-sonnet-4-6
         review:
-        - gpt-5.5
-        - claude-sonnet-4-6-thinking
+          - gpt-5.5
+          - claude-sonnet-4-6-thinking
         polish:
-        - claude-opus-4-7
-        - gpt-5.5
+          - claude-opus-4-7
+          - gpt-5.5
     conversation:
       selected_model: claude-sonnet-4-6
       fallback_models:
-      - deepseek-v4-flash
-      - grok-4.2
+        - deepseek-v4-flash
+        - grok-4.2
+
   complexity:
     analyzer_request_timeout_s: 18
     analyzer_max_retries: 2
     analyzer_total_timeout_s: 60
     analysis_cache_ttl_s: 300
-    agent_self_check_model: ''
-    self_check_reasoning_models:
-    - claude-sonnet-4-6-thinking
-    - grok-4-20-reasoning
-    - deepseek-v4-pro
     use_llm_analyzer: true
     analyzer_model: claude-sonnet-4-6
-    analyzer_prompt: "你是一个高级的大模型路由调度中枢。请分析以下用户输入的复杂度和意图，并从可用模型池中为用户自主选择最合适的大模型。\n\n\
-      【可用模型池及其特长】\n- claude-sonnet-4-6: 极其擅长代码编写、架构设计、逻辑分析。\n- claude-sonnet-4-6-thinking:\
-      \ 擅长深度数学证明、复杂逻辑推导。\n- claude-opus-4-7: 擅长长文写作、极致的语言润色、高难度综合任务。\n- gpt-5.5 /\
-      \ gpt-5.4-high: 速度极快，综合能力极强，适合日常通用问答、联网搜索总结。\n- grok-4-20-reasoning / grok-4.2:\
-      \ 擅长数理逻辑、硬核推理。\n- deepseek-v4-pro / deepseek-v4-flash: flash速度快适合通用与代码，pro适合深度专业问题。\n\
-      - gemini-3.1-pro-preview: 适合长上下文、多模态或泛用型搜索。\n# - ollama-llama3: 本地模型，必须用于处理包含隐私、密码、内部数据的极度敏感请求。\n\
-      \n请返回一段合法的 JSON，格式如下：\n{\n  \"complexity\": \"low | medium | high\",\n  \"decision\"\
-      : \"fast 或 refine\",\n  \"task_type\": \"conversation | generation | reasoning\
-      \ | code\",\n  \"type\": \"general | web_search | document_qa | code | math_logic\
-      \ | writing\",\n  \"freshness_hint\": \"如问题隐含强时效（今天/本周/2026-05/最新版本号等），给出简短提示；否则为空字符串\"\
-      ,\n  \"search_required\": true 或 false,\n  \"search_query\": \"若需要联网搜索，给出最适合搜索引擎的短查询词；否则为空字符串\"\
-      ,\n  \"confidence\": 0.85,\n  \"suggested_track\": \"fast\",\n  \"selected_model\"\
-      : \"低复杂度时主力模型名称\",\n  \"fallback_models\": [\"备选1\", \"备选2\"],\n  \"refine_models\"\
-      : {\n    \"draft\": [\"初稿层模型池\"],\n    \"review\": [\"审查层模型池\"],\n    \"polish\"\
-      : [\"润色层模型池\"]\n  },\n  \"reason\": \"简短判定理由\"\n}\n\nconfidence 必须为 0.0～1.0\
-      \ 的数字（对小数点一位即可），表示你对上述分类的综合把握。\nsuggested_track 必须为 fast、refine、agent 三者之一；当用户同时要求「简短」与「深入分析」等冲突时，根据整句语义选一个轨道。\n\
-      \ntask_type 含义（用于三轨路由）：\n- conversation：闲聊、简单问答、翻译 → 通常配合 low → Fast 轨\n- generation：长文、方案、写作、润色类\
-      \ → 通常配合 medium/high → Refine 轨\n- reasoning：多步推理、工具链、数学证明、复杂逻辑 → Agent 轨（思考-行动-观察）\n\
-      - code：代码编写、调试、架构设计、配置审查、性能优化 → 通常 Agent 轨并选用代码向模型池\n\ncomplexity 档位：\n- low：简单问答、翻译、信息检索\n\
-      - medium：中等分析、少量查证、短链路推理\n- high：复杂推理、长文写作、多源查证、代码审查\n\n判断标准：\n- complexity:\
-      \ 根据上述 low/medium/high 定义选择；不确定时宁可填 medium。\n- decision: high/medium 倾向 refine，low\
-      \ 倾向 fast（可被用户模式覆盖）。\n- search_required: 涉及实时信息、新闻、股价、天气、版本更新等填 true。\n- type:\
-      \ 需要实时外部信息填 web_search。\n- task_type 为 reasoning 时：数学推导、多约束决策、需多次查资料或验证的任务优先。\n\
-      - task_type 为 code 时：明确编程/脚本/配置/调试需求优先。\n\n用户输入如下：\n"
-    manual_triggers:
-    - /refine
-    - 强制精化
-    - 精化轨
-  agent:
+    analyzer_prompt: |
+      你是一个 Runtime Intent Analyzer。请分析用户输入，并只输出一个合法 JSON 对象。
+
+      【目标】
+      - 识别任务复杂度、任务类型与是否需要实时/外部信息。
+      - 为统一 Adaptive Self-Correcting Async DAG Runtime 选择合适模型池。
+      - 不要输出任何 fast/refine/agent、track、decision、suggested_track 之类旧路由字段。
+
+      【可用模型池及其特长】
+      - claude-sonnet-4-6: 极其擅长代码编写、架构设计、逻辑分析。
+      - claude-sonnet-4-6-thinking: 擅长深度数学证明、复杂逻辑推导。
+      - claude-opus-4-7: 擅长长文写作、极致语言润色、高难度综合任务。
+      - gpt-5.5 / gpt-5.4-high: 速度快，适合通用问答、联网搜索总结。
+      - grok-4-20-reasoning / grok-4.2: 擅长数理逻辑、硬核推理。
+      - deepseek-v4-pro / deepseek-v4-flash: flash 适合通用与代码，pro 适合深度专业问题。
+      - gemini-3.1-pro-preview: 适合长上下文、多模态或泛用型搜索。
+
+      请输出如下 JSON：
+      {
+        "complexity": "low | medium | high",
+        "task_type": "conversation | generation | reasoning | code",
+        "type": "general | web_search | document_qa | code | math_logic | writing",
+        "search_required": true,
+        "search_query": "适合搜索引擎的短查询；不需要时为空字符串",
+        "search_queries": ["可选的并行检索查询"],
+        "freshness_hint": "若问题隐含强时效，给出简短提示；否则为空字符串",
+        "confidence": 0.85,
+        "selected_model": "首选模型名称",
+        "fallback_models": ["备选1", "备选2"],
+        "quality_models": {
+          "draft": ["初稿模型池"],
+          "review": ["审查模型池"],
+          "polish": ["润色模型池"]
+        },
+        "reason": "简短判定理由"
+      }
+
+      规则：
+      - complexity 不确定时优先给 medium。
+      - search_required 仅在需要实时、最新、外部事实核验时给 true。
+      - type 为 web_search 时，search_query 应尽量短且具体。
+      - task_type 为 code 时优先代码向模型池；为 reasoning 时优先推理向模型池。
+      - confidence 必须为 0.0 到 1.0 的数字。
+
+      用户输入如下：
+
+  quality_pipeline:
     enabled: true
-    model: claude-sonnet-4-6
-    model_by_task_type:
-      code: claude-sonnet-4-6
-      reasoning: claude-sonnet-4-6-thinking
-    max_iterations: 5
-    max_iterations_by_complexity:
-      low: 3
-      medium: 5
-      high: 8
-    system_prompt: '你是严谨的推理智能体。每一步先简短说明推理意图，再决定是否需要工具。
-
-      工具调用必须使用指定单行格式，勿编造工具结果。
-
-      若本轮曾成功执行 web_search，最终答案文末必须用「## 引用来源」列出实际用到的来源标题与 URL，与摘要序号对应；不得虚构未出现的链接。
-
-      若用户问题涉及医疗、法律或个性化投资建议，须在答案开头用一两句给出「非专业意见、不可替代执业者」类免责声明。
-
-      '
-  routing:
-    default_model: claude-sonnet-4-6
-    default_models:
-    - claude-sonnet-4-6
-    - gpt-5.5
-    - gemini-3.1-pro-preview
-    - grok-4.2
-  refine_chain:
-    enabled: true
-    repair:
-      temperature: 0.15
     layer1:
       name: draft
       temperature: 0.2
-      instruction: '你是“初稿层”。目标：覆盖全面，不求极致精确。请输出：
-
+      instruction: |
+        你是“初稿层”。目标：覆盖全面，不求极致精确。请输出：
         1) 关键点列表
-
         2) 初步答案（可包含不确定性提示）
-
         3) 你认为需要进一步核查的点（如果有）
-
-        '
+    repair:
+      temperature: 0.15
     layer2:
       name: review
       temperature: 0.1
-      instruction: '你是“审查层”。输入包含：原始问题 + 初稿答案。
-
+      instruction: |
+        你是“审查层”。输入包含：原始问题 + 初稿答案。
         目标：找错误、补漏洞、加深度；指出不确定之处并给出修正建议。
-
         请输出：
-
         1) 初稿问题清单（要点化）
-
         2) 修正版答案（尽量严谨，必须用下列分隔符包裹正文，便于服务器稳定提取）
-
         3) 仍不确定处与需要补充信息
 
-
         【关键格式约束】修正版答案必须严格按如下格式输出（分隔符独占一行）：
-
         <<<FINAL_ANSWER>>>
-
         <这里是给用户看的完整修正版答案正文>
-
         <<<END_FINAL_ANSWER>>>
 
-
-        如需补充检索，仅在审查结论中非 FINAL 区域输出单行 JSON：{"action":"web_search","query":"查询词","reason":"为何检索","priority":"high"}
-
-        '
+        补充证据由运行时统一调度检索；不要输出 JSON action、工具协议或控制指令。
     layer3:
       name: polish
       temperature: 0.3
-      instruction: '你是“润色层”。输入包含：原始问题 + 审查层答案。
-
+      instruction: |
+        你是“润色层”。输入包含：原始问题 + 审查层答案。
         目标：输出最终答案，结构清晰、语言流畅、逻辑自洽。
-
         请避免夸大不确定内容；如有前提条件请明确写出。
-
-        '

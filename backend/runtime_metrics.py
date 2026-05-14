@@ -1,10 +1,8 @@
-"""轻量运行时指标（文档第十六章）：默认 SQLite 持久化；可选 JSONL 副本。
+"""轻量运行时指标：默认 SQLite 持久化；可选 JSONL 副本。
 
-常用 metric（emit_product_metric）：fast_escalation_rate、critic_reject_rate、agent_stuck_rate、
-search_sufficiency_fail、search_contradiction_rate、refine_success_rate、refine_quality_delta、
-refine_improved_score、refine_regression_rate。
+常用 metric（emit_product_metric）：critic_trigger_rate、search_sufficiency_fail、search_sufficiency_rate、
+draft_generation_fail、dag_parallelism、hallucination_rate、repair_trigger_rate、repair_success_rate、verify_repair_rate。
 用户侧 thumb_down_rate / retry_rate / followup_rate / conversation_abandon_rate 由 POST /api/feedback 映射写入。
-补充：fast_search_more（快轨 critic 要求补充检索）。
 """
 from __future__ import annotations
 

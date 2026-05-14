@@ -28,7 +28,7 @@ from runtime.state.semantic_memory import remember_runtime_turn
 from runtime_metrics import emit_product_metric, log_runtime_event
 from runtime_state import need_search_allowed
 from search_evidence import evaluate_search_sufficiency, evidence_bundle_text, search_result_to_evidence
-from unified_critic import evaluate_structured_refine_critic, evaluate_unified_critic
+from unified_critic import evaluate_structured_quality_critic, evaluate_unified_critic
 
 
 def _minimal_budget_abort_critic_merged() -> Dict[str, Any]:
@@ -196,11 +196,11 @@ async def _publish_critic_merge_metadata(ctx: DAGRuntimeContext, round_idx: int,
                     {
                         "issue_total": critic_issue_total(merged),
                         "layered_critics": plan.layered_critics,
-                        "legacy_parallel": plan.parallel_critics and not plan.layered_critics,
+                        "paired_parallel": plan.parallel_critics and not plan.layered_critics,
                         "facets": ["coverage", "logic", "evidence", "hallucination", "policy"],
                         "scheduler_gather_nodes": True,
                     },
-                    "review",
+                    "evaluate",
                     "并行批评完成（DAG 多节点 gather）。",
                 ),
             },
@@ -307,18 +307,18 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
     messages = ctx.messages
 
     ctx.prompt_disc = h._prepend_runtime_disclaimer(h._attach_documents_to_prompt(ctx.prompt, opt), opt)
-    ctx.refine_ctx = h._resolve_refine_context(ctx.analysis, hcfg)
-    ctx.chain_on = bool(ctx.refine_ctx["chain"].get("enabled", True))
-    ctx.default_model = ctx.refine_ctx["default_model"]
-    ctx.refine_models = ctx.refine_ctx["refine_models"]
-    ctx.review_cands = ctx.refine_models.get("review") or [ctx.default_model]
-    ctx.repair_pool = ctx.refine_models.get("draft") or ctx.review_cands
+    ctx.quality_ctx = h._resolve_quality_context(ctx.analysis, hcfg)
+    ctx.chain_on = bool(ctx.quality_ctx["chain"].get("enabled", True))
+    ctx.default_model = ctx.quality_ctx["default_model"]
+    ctx.quality_models = ctx.quality_ctx["quality_models"]
+    ctx.review_cands = ctx.quality_models.get("review") or [ctx.default_model]
+    ctx.repair_pool = ctx.quality_models.get("draft") or ctx.review_cands
     ctx.history_chars = _int_budget(opt, "history_context_chars", 4000, minimum=800, maximum=12000)
 
-    ctx.use_refine = ctx.chain_on and intent.quality_requirement == "high"
-    if ctx.use_refine:
-        l1 = ctx.refine_ctx["l1"]
-        ctx.base_prompt = h._build_refine_layer1_prompt(
+    ctx.use_quality_layers = ctx.chain_on and intent.quality_requirement == "high"
+    if ctx.use_quality_layers:
+        l1 = ctx.quality_ctx["l1"]
+        ctx.base_prompt = h._build_quality_layer1_prompt(
             ctx.prompt,
             l1.get("instruction", ""),
             ctx.ev_text[:6000],
@@ -326,13 +326,13 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
             max_history_chars=ctx.history_chars,
             options=opt,
         )
-        ctx.draft_candidates = ctx.refine_models.get("draft") or [ctx.default_model]
+        ctx.draft_candidates = ctx.quality_models.get("draft") or [ctx.default_model]
         if opt.get("_dag_cost_efficient") and isinstance(ctx.draft_candidates, list) and len(ctx.draft_candidates) > 1:
             ctx.draft_candidates = ctx.draft_candidates[:1]
         ctx.draft_messages = None
     else:
         ctx.base_prompt = ctx.prompt_disc
-        route_fm = h.route_fast_model(ctx.prompt, ctx.analysis)
+        route_fm = h.resolve_model_route(ctx.prompt, ctx.analysis)
         ctx.draft_candidates = route_fm.get("candidates") or [route_fm.get("selected")]
         if opt.get("_dag_cost_efficient") and isinstance(ctx.draft_candidates, list) and len(ctx.draft_candidates) > 1:
             ctx.draft_candidates = ctx.draft_candidates[:1]
@@ -340,7 +340,7 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
 
     await ctx.emit(user_status("并行起草生成…", phase="draft"))
     await ctx.emit(
-        {"event": "stream_start", "track": "dag", "trace_id": trace_id, "meta": {"stream_phase": "dag_draft"}}
+        {"event": "stream_start", "runtime": "adaptive_dag_v3", "phase": "draft", "trace_id": trace_id, "meta": {"stream_phase": "dag_draft", "runtime": "adaptive_dag_v3", "phase": "draft"}}
     )
     await ctx.emit(
         {
@@ -409,7 +409,7 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
             return
 
     cost_skip_parallel = ctx.budget.cost_pause_parallel_draft(intent.latency_budget, intent.quality_requirement)
-    if plan.parallel_drafts and ctx.use_refine and not cost_skip_parallel:
+    if plan.parallel_drafts and ctx.use_quality_layers and not cost_skip_parallel:
         opts_pd = h._layer_opts(hcfg, "layer1", opt)
 
         async def _pd(px: str):
@@ -430,11 +430,11 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
         l1_stream_meta["latency_ms"] = int(getattr(pick, "latency_ms", 0) or 0) if pick else 0
     elif plan.hedge_draft_delay_ms > 0:
         opts_hd = h._layer_opts(hcfg, "layer1", opt)
-        route_a = h.route_fast_model(ctx.prompt, ctx.analysis)
+        route_a = h.resolve_model_route(ctx.prompt, ctx.analysis)
         pri = route_a.get("candidates") or [route_a.get("selected")]
         if opt.get("_dag_cost_efficient") and isinstance(pri, list) and len(pri) > 1:
             pri = pri[:1]
-        sec = ctx.refine_models.get("draft") or pri
+        sec = ctx.quality_models.get("draft") or pri
         if sec == pri:
             sec = pri
 
@@ -491,7 +491,7 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
         }
     )
     if not draft:
-        emit_product_metric(hcfg, "fast_fail_rate", trace_id=trace_id, phase="dag_draft_empty")
+        emit_product_metric(hcfg, "draft_generation_fail", trace_id=trace_id, phase="dag_draft_empty")
         if st:
             st.failed_attempts.append("dag_draft_empty")
             st.runtime_memory.append({"phase": "draft", "ok": False})
@@ -533,8 +533,8 @@ async def node_tool_capability_gate(ctx: DAGRuntimeContext) -> None:
     await tool_node.execute_tool_gate(ctx)
 
 
-async def node_agent_goal_gate(ctx: DAGRuntimeContext) -> None:
-    """Planner 启用 agent_subgraph 时插入：目标门控（非 max_iter ReAct）。"""
+async def node_goal_capability_gate(ctx: DAGRuntimeContext) -> None:
+    """Planner 启用 goal_subgraph 时插入：目标门控。"""
     from runtime.nodes import agent_node
 
     await agent_node.execute_optional(ctx)
@@ -644,14 +644,14 @@ async def node_critic_merge_layered(ctx: DAGRuntimeContext, round_idx: int) -> N
     hcfg = ctx.hcfg
     trace_id = ctx.trace_id
     emit_product_metric(hcfg, "critic_trigger_rate", trace_id=trace_id, round=round_idx, dag=True)
-    await ctx.emit(user_status(f"并行批评（第 {round_idx + 1}/{plan.repair_rounds_max} 轮）…", phase="critic"))
+    await ctx.emit(user_status(f"并行批评（第 {round_idx + 1}/{plan.repair_rounds_max} 轮）…", phase="evaluate"))
     await ctx.emit(
         {
             "event": "step",
             "step": {
                 "name": "dag_parallel_critic",
                 "status": "running",
-                "meta": _pg({"round": round_idx, "gather_mode": "layered_unified_plus_5_facets"}, "review", "DAG：layered critic gather"),
+                "meta": _pg({"round": round_idx, "gather_mode": "layered_unified_plus_5_facets"}, "evaluate", "DAG：layered critic gather"),
             },
         }
     )
@@ -669,7 +669,7 @@ async def node_critic_merge_layered(ctx: DAGRuntimeContext, round_idx: int) -> N
     await _publish_critic_merge_metadata(ctx, round_idx, merged)
 
 
-async def node_critic_legacy_uni(ctx: DAGRuntimeContext, round_idx: int) -> None:
+async def node_critic_paired_unified(ctx: DAGRuntimeContext, round_idx: int) -> None:
     if ctx.should_stop or getattr(ctx, "_quality_done", False) or ctx._skip_critic_wave.get(round_idx):
         return
     h, opt, hcfg = ctx.harness, ctx.options, ctx.hcfg
@@ -686,28 +686,28 @@ async def node_critic_legacy_uni(ctx: DAGRuntimeContext, round_idx: int) -> None
     ctx._critic_unified_by_round[round_idx] = uni
 
 
-async def node_critic_legacy_struct(ctx: DAGRuntimeContext, round_idx: int) -> None:
+async def node_critic_paired_structured(ctx: DAGRuntimeContext, round_idx: int) -> None:
     if ctx.should_stop or getattr(ctx, "_quality_done", False) or ctx._skip_critic_wave.get(round_idx):
         return
-    struct = await evaluate_structured_refine_critic(ctx.harness, ctx.prompt, ctx.draft, ctx.options, ctx.hcfg, ctx.review_cands)
+    struct = await evaluate_structured_quality_critic(ctx.harness, ctx.prompt, ctx.draft, ctx.options, ctx.hcfg, ctx.review_cands)
     ctx._critic_struct_by_round[round_idx] = struct
 
 
-async def node_critic_merge_legacy(ctx: DAGRuntimeContext, round_idx: int) -> None:
+async def node_critic_merge_paired(ctx: DAGRuntimeContext, round_idx: int) -> None:
     if ctx.should_stop or getattr(ctx, "_quality_done", False):
         return
     plan = ctx.plan
     hcfg = ctx.hcfg
     trace_id = ctx.trace_id
     emit_product_metric(hcfg, "critic_trigger_rate", trace_id=trace_id, round=round_idx, dag=True)
-    await ctx.emit(user_status(f"并行批评（第 {round_idx + 1}/{plan.repair_rounds_max} 轮）…", phase="critic"))
+    await ctx.emit(user_status(f"并行批评（第 {round_idx + 1}/{plan.repair_rounds_max} 轮）…", phase="evaluate"))
     await ctx.emit(
         {
             "event": "step",
             "step": {
                 "name": "dag_parallel_critic",
                 "status": "running",
-                "meta": _pg({"round": round_idx, "gather_mode": "legacy_uni_plus_struct"}, "review", "DAG：dual critic gather"),
+                "meta": _pg({"round": round_idx, "gather_mode": "paired_unified_plus_structured"}, "evaluate", "DAG：paired critic gather"),
             },
         }
     )
@@ -726,6 +726,8 @@ async def node_critic_merge_legacy(ctx: DAGRuntimeContext, round_idx: int) -> No
 async def node_search_followup_dag(ctx: DAGRuntimeContext, round_idx: int) -> None:
     if ctx.should_stop or getattr(ctx, "_quality_done", False):
         return
+    if ctx.st:
+        ctx.st.set_phase("search", node=f"search_followup_{round_idx}", round=round_idx)
     merged = ctx._critic_merged_by_round.get(round_idx)
     if not merged:
         return
@@ -735,6 +737,9 @@ async def node_search_followup_dag(ctx: DAGRuntimeContext, round_idx: int) -> No
 async def node_repair_round_dag(ctx: DAGRuntimeContext, round_idx: int) -> None:
     if ctx.should_stop or getattr(ctx, "_quality_done", False):
         return
+    if ctx.st:
+        ctx.st.set_phase("repair", node=f"repair_round_{round_idx}", round=round_idx)
+        ctx.st.note_repair_round(round_idx, node=f"repair_round_{round_idx}", status="running")
     merged = ctx._critic_merged_by_round.get(round_idx)
     if not merged:
         return
@@ -745,6 +750,8 @@ async def node_repair_round_dag(ctx: DAGRuntimeContext, round_idx: int) -> None:
 async def node_verify_round_dag(ctx: DAGRuntimeContext, round_idx: int) -> None:
     if ctx.should_stop or getattr(ctx, "_quality_done", False):
         return
+    if ctx.st:
+        ctx.st.set_phase("verify", node=f"verify_round_{round_idx}", round=round_idx)
     uc = await verify_node.execute_round(ctx, ctx.draft, ctx.ev_text, round_idx)
     await _apply_verify_round_outcome(ctx, round_idx, ctx.draft, uc)
 
@@ -781,27 +788,27 @@ def make_critic_merge_layered_runner(round_idx: int):
     return _run
 
 
-def make_legacy_uni_runner(round_idx: int):
+def make_critic_paired_unified_runner(round_idx: int):
     async def _run(ctx: DAGRuntimeContext) -> None:
-        await node_critic_legacy_uni(ctx, round_idx)
+        await node_critic_paired_unified(ctx, round_idx)
 
-    _run.__name__ = f"critic_legacy_uni_{round_idx}"
+    _run.__name__ = f"critic_unified_{round_idx}"
     return _run
 
 
-def make_legacy_struct_runner(round_idx: int):
+def make_critic_paired_structured_runner(round_idx: int):
     async def _run(ctx: DAGRuntimeContext) -> None:
-        await node_critic_legacy_struct(ctx, round_idx)
+        await node_critic_paired_structured(ctx, round_idx)
 
-    _run.__name__ = f"critic_legacy_struct_{round_idx}"
+    _run.__name__ = f"critic_structured_{round_idx}"
     return _run
 
 
-def make_critic_merge_legacy_runner(round_idx: int):
+def make_critic_merge_paired_runner(round_idx: int):
     async def _run(ctx: DAGRuntimeContext) -> None:
-        await node_critic_merge_legacy(ctx, round_idx)
+        await node_critic_merge_paired(ctx, round_idx)
 
-    _run.__name__ = f"critic_merge_legacy_{round_idx}"
+    _run.__name__ = f"critic_merge_{round_idx}"
     return _run
 
 
@@ -870,8 +877,10 @@ async def node_finalize_output(ctx: DAGRuntimeContext) -> None:
     )
 
     await ctx.emit(user_status("输出终稿…", phase="finalize"))
+    if st:
+        st.set_phase("finalize", node="finalize_output")
     await ctx.emit(
-        {"event": "stream_start", "track": "dag", "trace_id": trace_id, "meta": {"stream_phase": "dag_finalize"}}
+        {"event": "stream_start", "runtime": "adaptive_dag_v3", "phase": "finalize", "trace_id": trace_id, "meta": {"stream_phase": "dag_finalize", "runtime": "adaptive_dag_v3", "phase": "finalize"}}
     )
     await ctx.emit(
         {
@@ -879,7 +888,7 @@ async def node_finalize_output(ctx: DAGRuntimeContext) -> None:
             "step": {
                 "name": "dag_finalize",
                 "status": "running",
-                "meta": _pg({"mode": "deterministic"}, "polishing", "确定性 Finalize（无模型）"),
+                "meta": _pg({"mode": "deterministic"}, "finalize", "确定性 Finalize（无模型）"),
             },
         }
     )
@@ -891,7 +900,7 @@ async def node_finalize_output(ctx: DAGRuntimeContext) -> None:
             "step": {
                 "name": "dag_finalize",
                 "status": "ok",
-                "meta": _pg({"chars": len(final_text)}, "polishing", "Adaptive DAG Runtime 完成。"),
+                "meta": _pg({"chars": len(final_text)}, "finalize", "Adaptive DAG Runtime 完成。"),
             },
         }
     )

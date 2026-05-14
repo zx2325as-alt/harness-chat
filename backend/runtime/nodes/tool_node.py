@@ -3,16 +3,16 @@ from __future__ import annotations
 
 from refine_shared import _pg
 from runtime.kernel.runtime_context import DAGRuntimeContext
-from runtime_state import AgentState
+from runtime_state import GoalExecutionState
 
 
 async def execute_tool_gate(ctx: DAGRuntimeContext) -> None:
     ctx.runtime.enable("tool_use", reason="runtime_planner_tool_gate")
     gate = {"enabled": True, "mode": "dag_capability"}
     ctx.options["_tool_runtime_gate"] = gate
-    ag = ctx.options.get("_agent_state")
-    if isinstance(ag, AgentState):
-        ag.tool_results["tool_gate"] = gate
+    goal_exec = ctx.options.get("_goal_execution_state")
+    if isinstance(goal_exec, GoalExecutionState):
+        goal_exec.tool_results["tool_gate"] = gate
     await ctx.emit(
         {
             "event": "step",

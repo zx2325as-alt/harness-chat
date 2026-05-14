@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from chunk_channels import chunk_writes_history
 from model_adapters import AskResult
-from runtime_state import runtime_track
+from runtime_state import runtime_phase
 from sse_public import normalize_step_for_client
 
 
@@ -16,7 +16,7 @@ async def execute_runtime(
     options: Optional[Dict[str, Any]],
     messages: Optional[List[Dict[str, Any]]],
 ):
-    """统一 Runtime 迭代入口：委托 ``DualTrackHarness.run_stream``（HTTP SSE 与同步 REST 共用同一事件序列）。"""
+    """统一 Runtime 迭代入口：委托 ``RuntimeHarness.run_stream``（HTTP SSE 与同步 REST 共用同一事件序列）。"""
     async for ev in harness.run_stream(prompt, mode=mode, options=options or {}, messages=messages):
         yield ev
 
@@ -65,16 +65,18 @@ async def collect_sync_response_from_stream(
                 last_provider = str(ev.get("provider"))
 
     text = "".join(buf)
-    track = runtime_track(opts)
+    phase = runtime_phase(opts)
     sync_meta: Dict[str, Any] = {
         "protocol_version": 1,
         "api_schema": "harness-sync-v1",
         "unified_stream_runtime": True,
+        "runtime": "adaptive_dag_v3",
+        "phase": phase,
     }
-    if opts.get("_fast_did_escalate_refine"):
-        sync_meta["sync_escalated_from_fast"] = True
-    if opts.get("_fast_did_escalate_agent"):
-        sync_meta["sync_escalated_from_fast_agent"] = True
+    if opts.get("_runtime_repair_triggered"):
+        sync_meta["sync_used_repair_loop"] = True
+    if opts.get("_goal_capability_gate"):
+        sync_meta["goal_capability_gate"] = True
     if any(isinstance(s, dict) and s.get("name") == "agent_iteration" for s in steps_out):
         sync_meta["sync_agent"] = True
 
@@ -92,7 +94,6 @@ async def collect_sync_response_from_stream(
 
     return {
         "trace_id": trace_out or opts.get("trace_id"),
-        "track": track,
         "final": final,
         "steps": steps_out,
         "meta": sync_meta,
