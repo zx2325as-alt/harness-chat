@@ -54,6 +54,12 @@
           <label class="row-check"><input v-model="dagRuntime.goal_subgraph_enabled" type="checkbox" /><span>goal_subgraph_enabled</span></label>
           <label class="row-check"><input v-model="dagRuntime.tool_capability_gate_enabled" type="checkbox" /><span>tool_capability_gate_enabled</span></label>
           <label class="row-check"><input v-model="dagRuntime.semantic_cache_short_circuit" type="checkbox" /><span>semantic_cache_short_circuit</span></label>
+          <label class="row-check"><input v-model="dagRuntime.llm_query_rewrite" type="checkbox" /><span>llm_query_rewrite（LLM 改写检索查询）</span></label>
+          <div class="sep" />
+          <label class="row-check max-quality">
+            <input v-model="dagRuntime.max_quality_mode" type="checkbox" />
+            <span><strong>max_quality_mode</strong>：最大质量模式（3轮修复 + synthesis合并草稿 + 放宽延迟预算）</span>
+          </label>
         </article>
 
         <article class="card">
@@ -341,6 +347,8 @@ export default {
       if (typeof h.dag_runtime.goal_subgraph_enabled !== "boolean") h.dag_runtime.goal_subgraph_enabled = false;
       if (typeof h.dag_runtime.tool_capability_gate_enabled !== "boolean") h.dag_runtime.tool_capability_gate_enabled = true;
       if (typeof h.dag_runtime.semantic_cache_short_circuit !== "boolean") h.dag_runtime.semantic_cache_short_circuit = false;
+      if (typeof h.dag_runtime.llm_query_rewrite !== "boolean") h.dag_runtime.llm_query_rewrite = true;
+      if (typeof h.dag_runtime.max_quality_mode !== "boolean") h.dag_runtime.max_quality_mode = false;
 
       h.runtime_orchestrator = h.runtime_orchestrator || {};
       if (typeof h.runtime_orchestrator.enabled !== "boolean") h.runtime_orchestrator.enabled = true;
@@ -710,6 +718,20 @@ export default {
 .json-panel-hint {
   font-size: 11px;
   color: #64748b;
+}
+.sep {
+  height: 1px;
+  background: rgba(71, 85, 105, 0.4);
+  margin: 10px 0;
+}
+.max-quality {
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(99, 102, 241, 0.08);
+  border: 1px solid rgba(129, 140, 248, 0.22);
+}
+.max-quality strong {
+  color: #a5b4fc;
 }
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;

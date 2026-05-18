@@ -18,9 +18,41 @@ from runtime.orchestrator.runtime_orchestrator import RuntimeOrchestrator
 from runtime.models.planner_model import describe_dynamic_plan
 from runtime.streaming.progressive_stream import ProgressiveStreamRouter
 from runtime.state.goal_risk import GoalState, RiskState
+from runtime.state.semantic_memory import SemanticMemory
 from runtime_state import GoalExecutionState, get_execution_state
 
 from harness import SSE_PROTOCOL_META, _analyze_step_summary
+
+
+def _apply_memory_hints(plan: Any, options: Dict[str, Any]) -> None:
+    """读取 SemanticMemory 历史，根据成功/失败模式微调当前 plan。"""
+    sm = options.get("_dag_semantic_memory")
+    if not isinstance(sm, SemanticMemory) or not sm.entries:
+        return
+    turns = [e for e in sm.entries if e.get("kind") == "turn"]
+    if not turns:
+        return
+    recent = turns[-8:]  # 最近 8 轮
+    fail_count = sum(1 for t in recent if not t.get("ok", True))
+    ok_count = sum(1 for t in recent if t.get("ok", True))
+    total = max(len(recent), 1)
+    fail_rate = fail_count / total
+
+    # 高失败率 → 增加 repair 轮次（上限 3）
+    if fail_rate >= 0.5 and plan.repair_rounds_max < 3:
+        plan.repair_rounds_max = min(3, plan.repair_rounds_max + 1)
+
+    # 历史多轮 ok 且均无 search → 降低 parallel_searches
+    search_scores = [float((t.get("intent") or {}).get("search_score") or 0) for t in recent if t.get("ok")]
+    avg_search = sum(search_scores) / max(len(search_scores), 1) if search_scores else 0.0
+    if ok_count >= 3 and avg_search < 0.25 and plan.parallel_searches > 1:
+        plan.parallel_searches = max(1, plan.parallel_searches - 1)
+
+    # 历史失败轮次 search_score 高 → 提升检索
+    fail_search = [float((t.get("intent") or {}).get("search_score") or 0) for t in recent if not t.get("ok")]
+    avg_fail_search = sum(fail_search) / max(len(fail_search), 1) if fail_search else 0.0
+    if fail_rate >= 0.4 and avg_fail_search > 0.5 and plan.parallel_searches < 4:
+        plan.parallel_searches = min(4, plan.parallel_searches + 1)
 
 
 def _analysis_payload_for_dag_sse(analysis: Dict[str, Any]) -> Dict[str, Any]:
@@ -46,6 +78,23 @@ async def run_dag_runtime_stream(
     orch = RuntimeOrchestrator(hcfg)
     intent = orch.intent_from_analysis(analysis)
     plan = orch.plan(intent)
+    # SemanticMemory：用历史成功/失败模式微调 plan
+    _apply_memory_hints(plan, options)
+    # max_quality_mode：强制最大质量参数，覆盖 planner 决策
+    _dgc_cfg = hcfg.get("dag_runtime") if isinstance(hcfg.get("dag_runtime"), dict) else {}
+    if bool(_dgc_cfg.get("max_quality_mode")):
+        plan.repair_rounds_max = max(plan.repair_rounds_max, 3)
+        plan.layered_critics = True
+        plan.parallel_critics = True
+        plan.parallel_drafts = True
+        plan.hedge_draft_delay_ms = 0   # synthesis 替代 hedge
+        options["_dag_cost_efficient"] = False
+        # 放宽 latency_budget 至 high，让 BudgetManager 阈值最宽
+        try:
+            intent.latency_budget = "high"
+            intent.quality_requirement = "high"
+        except Exception:
+            pass
     intent_dict = intent.to_dict()
     options["_analysis_full"] = dict(analysis)
     analysis_projected = project_analysis_for_dag_runtime(analysis)

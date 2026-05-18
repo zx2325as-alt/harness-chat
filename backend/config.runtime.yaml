@@ -1,9 +1,8 @@
 harness:
-  runtime: "adaptive_dag_v3"
+  runtime: adaptive_dag_v3
   stream_slice_chars: 72
   web_search:
-    globally_disabled: true
-
+    globally_disabled: false
   dag_runtime:
     parallel_search_queries: 2
     parallel_critics: true
@@ -14,24 +13,23 @@ harness:
     goal_subgraph_enabled: false
     tool_capability_gate_enabled: true
     semantic_cache_short_circuit: false
-
+    llm_query_rewrite: true
+    max_quality_mode: false
   runtime_orchestrator:
     enabled: true
     search_budget_per_request: 24
     unified_critic:
       enabled: true
-      model_key: ""
+      model_key: ''
     search_sufficiency:
       enabled: true
-      model_key: ""
+      model_key: ''
     observability:
-      metrics_jsonl_path: ""
+      metrics_jsonl_path: ''
       metrics_sqlite_path: data/runtime_metrics.sqlite
-
   stream_tuning:
     smart_chunk_boundary: true
     emit_content_reset: true
-
   search:
     provider: tavily
     fallback: duckduckgo
@@ -58,19 +56,22 @@ harness:
     session_cache_ttl_required_s: 900
     session_cache_ttl_explicit_s: 1800
     speculative_markers:
-      - 联网
-      - 搜索
-      - 查证
-      - 最新
-      - 今天
-      - 实时
-      - weather
-      - news
-      - stock
-      - 行情
-      - 汇率
-      - 政策
-
+    - 联网
+    - 搜索
+    - 查证
+    - 最新
+    - 今天
+    - 实时
+    - weather
+    - news
+    - stock
+    - 行情
+    - 汇率
+    - 政策
+    authority:
+      enabled: true
+      rank_blend: 0.42
+      extra_domain_hints: []
   documents:
     bm25_weight: 0.55
     embedding_weight: 0.45
@@ -93,60 +94,58 @@ harness:
       model: bge-reranker-v2-m3
       max_items: 12
       top_k: 8
-
   task_model_templates:
     reasoning:
       selected_model: claude-sonnet-4-6-thinking
       fallback_models:
-        - grok-4-20-reasoning
-        - gpt-5.5
-        - deepseek-v4-flash
+      - grok-4-20-reasoning
+      - gpt-5.5
+      - deepseek-v4-flash
       quality_models:
         draft:
-          - claude-sonnet-4-6-thinking
-          - grok-4-20-reasoning
+        - claude-sonnet-4-6-thinking
+        - grok-4-20-reasoning
         review:
-          - gpt-5.5
-          - claude-sonnet-4-6
+        - gpt-5.5
+        - claude-sonnet-4-6
         polish:
-          - claude-opus-4-7
-          - gpt-5.5
+        - claude-opus-4-7
+        - gpt-5.5
     generation:
       selected_model: claude-opus-4-7
       fallback_models:
-        - deepseek-v4-pro
-        - gpt-5.5
+      - deepseek-v4-pro
+      - gpt-5.5
       quality_models:
         draft:
-          - deepseek-v4-pro
-          - gpt-5.5
+        - deepseek-v4-pro
+        - gpt-5.5
         review:
-          - gpt-5.5
-          - claude-sonnet-4-6
+        - gpt-5.5
+        - claude-sonnet-4-6
         polish:
-          - claude-opus-4-7
-          - gpt-5.5
+        - claude-opus-4-7
+        - gpt-5.5
     code:
       selected_model: claude-sonnet-4-6
       fallback_models:
-        - deepseek-v4-flash
-        - gpt-5.5
+      - deepseek-v4-flash
+      - gpt-5.5
       quality_models:
         draft:
-          - deepseek-v4-flash
-          - claude-sonnet-4-6
+        - deepseek-v4-flash
+        - claude-sonnet-4-6
         review:
-          - gpt-5.5
-          - claude-sonnet-4-6-thinking
+        - gpt-5.5
+        - claude-sonnet-4-6-thinking
         polish:
-          - claude-opus-4-7
-          - gpt-5.5
+        - claude-opus-4-7
+        - gpt-5.5
     conversation:
       selected_model: claude-sonnet-4-6
       fallback_models:
-        - deepseek-v4-flash
-        - grok-4.2
-
+      - deepseek-v4-flash
+      - grok-4.2
   complexity:
     analyzer_request_timeout_s: 18
     analyzer_max_retries: 2
@@ -154,85 +153,77 @@ harness:
     analysis_cache_ttl_s: 300
     use_llm_analyzer: true
     analyzer_model: claude-sonnet-4-6
-    analyzer_prompt: |
-      你是一个 Runtime Intent Analyzer。请分析用户输入，并只输出一个合法 JSON 对象。
-
-      【目标】
-      - 识别任务复杂度、任务类型与是否需要实时/外部信息。
-      - 为统一 Adaptive Self-Correcting Async DAG Runtime 选择合适模型池。
-      - 不要输出任何 fast/refine/agent、track、decision、suggested_track 之类旧路由字段。
-
-      【可用模型池及其特长】
-      - claude-sonnet-4-6: 极其擅长代码编写、架构设计、逻辑分析。
-      - claude-sonnet-4-6-thinking: 擅长深度数学证明、复杂逻辑推导。
-      - claude-opus-4-7: 擅长长文写作、极致语言润色、高难度综合任务。
-      - gpt-5.5 / gpt-5.4-high: 速度快，适合通用问答、联网搜索总结。
-      - grok-4-20-reasoning / grok-4.2: 擅长数理逻辑、硬核推理。
-      - deepseek-v4-pro / deepseek-v4-flash: flash 适合通用与代码，pro 适合深度专业问题。
-      - gemini-3.1-pro-preview: 适合长上下文、多模态或泛用型搜索。
-
-      请输出如下 JSON：
-      {
-        "complexity": "low | medium | high",
-        "task_type": "conversation | generation | reasoning | code",
-        "type": "general | web_search | document_qa | code | math_logic | writing",
-        "search_required": true,
-        "search_query": "适合搜索引擎的短查询；不需要时为空字符串",
-        "search_queries": ["可选的并行检索查询"],
-        "freshness_hint": "若问题隐含强时效，给出简短提示；否则为空字符串",
-        "confidence": 0.85,
-        "selected_model": "首选模型名称",
-        "fallback_models": ["备选1", "备选2"],
-        "quality_models": {
-          "draft": ["初稿模型池"],
-          "review": ["审查模型池"],
-          "polish": ["润色模型池"]
-        },
-        "reason": "简短判定理由"
-      }
-
-      规则：
-      - complexity 不确定时优先给 medium。
-      - search_required 仅在需要实时、最新、外部事实核验时给 true。
-      - type 为 web_search 时，search_query 应尽量短且具体。
-      - task_type 为 code 时优先代码向模型池；为 reasoning 时优先推理向模型池。
-      - confidence 必须为 0.0 到 1.0 的数字。
-
-      用户输入如下：
-
+    analyzer_prompt: "你是一个 Runtime Intent Analyzer。请分析用户输入，并只输出一个合法 JSON 对象。\n\n【目标】\n\
+      - 识别任务复杂度、任务类型与是否需要实时/外部信息。\n- 为统一 Adaptive Self-Correcting Async DAG Runtime\
+      \ 选择合适模型池。\n- 不要输出任何 fast/refine/agent、track、decision、suggested_track 之类旧路由字段。\n\
+      \n【可用模型池及其特长】\n- claude-sonnet-4-6: 极其擅长代码编写、架构设计、逻辑分析。\n- claude-sonnet-4-6-thinking:\
+      \ 擅长深度数学证明、复杂逻辑推导。\n- claude-opus-4-7: 擅长长文写作、极致语言润色、高难度综合任务。\n- gpt-5.5 / gpt-5.4-high:\
+      \ 速度快，适合通用问答、联网搜索总结。\n- grok-4-20-reasoning / grok-4.2: 擅长数理逻辑、硬核推理。\n- deepseek-v4-pro\
+      \ / deepseek-v4-flash: flash 适合通用与代码，pro 适合深度专业问题。\n- gemini-3.1-pro-preview:\
+      \ 适合长上下文、多模态或泛用型搜索。\n\n请输出如下 JSON：\n{\n  \"complexity\": \"low | medium | high\"\
+      ,\n  \"task_type\": \"conversation | generation | reasoning | code\",\n  \"\
+      type\": \"general | web_search | document_qa | code | math_logic | writing\"\
+      ,\n  \"search_required\": true,\n  \"search_query\": \"适合搜索引擎的短查询；不需要时为空字符串\"\
+      ,\n  \"search_queries\": [\"可选的并行检索查询\"],\n  \"freshness_hint\": \"若问题隐含强时效，给出简短提示；否则为空字符串\"\
+      ,\n  \"confidence\": 0.85,\n  \"selected_model\": \"首选模型名称\",\n  \"fallback_models\"\
+      : [\"备选1\", \"备选2\"],\n  \"quality_models\": {\n    \"draft\": [\"初稿模型池\"],\n\
+      \    \"review\": [\"审查模型池\"],\n    \"polish\": [\"润色模型池\"]\n  },\n  \"reason\"\
+      : \"简短判定理由\"\n}\n\n规则：\n- complexity 不确定时优先给 medium。\n- search_required 仅在需要实时、最新、外部事实核验时给\
+      \ true。\n- type 为 web_search 时，search_query 应尽量短且具体。\n- task_type 为 code 时优先代码向模型池；为\
+      \ reasoning 时优先推理向模型池。\n- confidence 必须为 0.0 到 1.0 的数字。\n\n用户输入如下：\n"
   quality_pipeline:
     enabled: true
     layer1:
       name: draft
       temperature: 0.2
-      instruction: |
-        你是“初稿层”。目标：覆盖全面，不求极致精确。请输出：
+      instruction: '你是“初稿层”。目标：覆盖全面，不求极致精确。请输出：
+
         1) 关键点列表
+
         2) 初步答案（可包含不确定性提示）
+
         3) 你认为需要进一步核查的点（如果有）
+
+        '
     repair:
       temperature: 0.15
     layer2:
       name: review
       temperature: 0.1
-      instruction: |
-        你是“审查层”。输入包含：原始问题 + 初稿答案。
+      instruction: '你是“审查层”。输入包含：原始问题 + 初稿答案。
+
         目标：找错误、补漏洞、加深度；指出不确定之处并给出修正建议。
+
         请输出：
+
         1) 初稿问题清单（要点化）
+
         2) 修正版答案（尽量严谨，必须用下列分隔符包裹正文，便于服务器稳定提取）
+
         3) 仍不确定处与需要补充信息
 
+
         【关键格式约束】修正版答案必须严格按如下格式输出（分隔符独占一行）：
+
         <<<FINAL_ANSWER>>>
+
         <这里是给用户看的完整修正版答案正文>
+
         <<<END_FINAL_ANSWER>>>
 
+
         补充证据由运行时统一调度检索；不要输出 JSON action、工具协议或控制指令。
+
+        '
     layer3:
       name: polish
       temperature: 0.3
-      instruction: |
-        你是“润色层”。输入包含：原始问题 + 审查层答案。
+      instruction: '你是“润色层”。输入包含：原始问题 + 审查层答案。
+
         目标：输出最终答案，结构清晰、语言流畅、逻辑自洽。
+
         请避免夸大不确定内容；如有前提条件请明确写出。
+
+        '
+  features:
+    analyzer_json_repair: true

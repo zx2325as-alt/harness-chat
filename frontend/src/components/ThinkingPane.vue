@@ -32,6 +32,7 @@
                 <div v-if="it.subline" class="tl-subtle">{{ it.subline }}</div>
                 <div v-if="it.query" class="tl-sub">检索查询：{{ it.query }}</div>
                 <div v-if="it.provider" class="tl-sub">提供方：{{ it.provider }}</div>
+                <div v-for="(line, ei) in (it.extra || [])" :key="'ex'+ei" class="tl-sub">{{ line }}</div>
                 <div class="tl-sub row">
                   <span v-if="it.latency_ms != null">{{ it.latency_ms }}ms</span>
                 </div>
@@ -81,9 +82,9 @@
 
           <template v-else-if="it.kind === 'bullets'">
             <div class="tl-bullets">
-              <span class="tl-dot" aria-hidden="true">•</span>
+              <span class="tl-dot" aria-hidden="true">{{ it.icon || "•" }}</span>
               <div class="bullets-inner">
-                <div class="tl-h">{{ it.title }}</div>
+                <div class="tl-h" :class="it.colorClass">{{ it.title }}</div>
                 <ul class="bullet-ul">
                   <li v-for="(line, bi) in it.lines" :key="bi" class="bullet-li">{{ line }}</li>
                 </ul>
@@ -304,7 +305,7 @@ export default {
 }
 .think-body {
   padding: 0 12px 14px 14px;
-  max-height: min(50vh, 400px);
+  max-height: min(70vh, 720px);
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -363,6 +364,15 @@ export default {
   font-size: 13px;
   font-weight: 600;
   color: #e2e8f0;
+}
+.tl-h.ok {
+  color: #86efac;
+}
+.tl-h.warn {
+  color: #fde68a;
+}
+.tl-h.err {
+  color: #fca5a5;
 }
 .tl-subtle {
   font-size: 11px;

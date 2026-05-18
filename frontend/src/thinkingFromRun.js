@@ -111,6 +111,21 @@ export function displayStepsForRun(run) {
   return Array.isArray(run?.steps) ? run.steps.slice() : [];
 }
 
+// ── per-step line extractors ────────────────────────────────────────────────
+
+function runtimeIntentLines(meta) {
+  const lines = [];
+  const ri = meta.runtime_intent;
+  if (!ri || typeof ri !== "object") return lines;
+  if (ri.reasoning_score != null) maybePush(lines, "推理强度", `${(ri.reasoning_score * 100).toFixed(0)}%`);
+  if (ri.search_score != null) maybePush(lines, "检索需求", `${(ri.search_score * 100).toFixed(0)}%`);
+  if (ri.risk_score != null) maybePush(lines, "风险评分", `${(ri.risk_score * 100).toFixed(0)}%`);
+  if (ri.ambiguity_score != null) maybePush(lines, "歧义度", `${(ri.ambiguity_score * 100).toFixed(0)}%`);
+  if (ri.latency_budget) maybePush(lines, "延迟预算", ri.latency_budget);
+  if (ri.quality_requirement) maybePush(lines, "质量要求", ri.quality_requirement);
+  return lines;
+}
+
 function complexityLines(meta) {
   const lines = [];
   if (meta.reason) maybePush(lines, "判定摘要", clip(meta.reason, 360));
@@ -149,13 +164,154 @@ function planLines(meta) {
     maybePush(lines, "工具能力门", boolText(plan.tool_capability_gate));
     maybePush(lines, "目标子图", boolText(plan.goal_subgraph));
     if (Array.isArray(plan.planned_nodes) && plan.planned_nodes.length) {
-      maybePush(lines, "计划节点", `${plan.planned_nodes.length} 个`);
+      lines.push(`计划节点（${plan.planned_nodes.length}）：${plan.planned_nodes.join(" → ")}`);
     }
   }
   const dynamicPlan = meta.dynamic_plan;
-  if (dynamicPlan && typeof dynamicPlan === "object") {
-    maybePush(lines, "执行摘要", clip(JSON.stringify(dynamicPlan), 360));
+  if (dynamicPlan && typeof dynamicPlan === "object" && dynamicPlan.summary) {
+    maybePush(lines, "执行摘要", clip(dynamicPlan.summary, 240));
   }
+  return lines;
+}
+
+function draftLines(meta) {
+  const lines = [];
+  maybePush(lines, "起草模型", meta.model || meta.provider);
+  if (meta.tokens_in != null || meta.tokens_out != null) {
+    lines.push(`Token：输入 ${meta.tokens_in ?? "?"} / 输出 ${meta.tokens_out ?? "?"}`);
+  }
+  if (meta.draft_quality_score != null) {
+    maybePush(lines, "草稿质量分", Number(meta.draft_quality_score).toFixed(3));
+  }
+  if (meta.parallel_mode === true) maybePush(lines, "并行起草", "是");
+  if (meta.synthesized === true) maybePush(lines, "草稿合并", "是（synthesis）");
+  if (meta.draft_len != null) maybePush(lines, "草稿长度", `${meta.draft_len} 字`);
+  if (meta.event_summary) maybePush(lines, "摘要", clip(meta.event_summary, 280));
+  return lines;
+}
+
+function criticLines(meta) {
+  const lines = [];
+  if (meta.round != null) maybePush(lines, "评估轮次", `第 ${meta.round} 轮`);
+  if (meta.issue_total != null) maybePush(lines, "发现问题", `${meta.issue_total} 条`);
+  maybePush(lines, "触发修复", boolText(meta.needs_repair));
+  const facets = meta.facets && typeof meta.facets === "object" ? meta.facets : {};
+  const faceMap = {
+    coverage_ok: "覆盖",
+    logic_ok: "逻辑",
+    evidence_ok: "证据",
+    hallucination_ok: "幻觉",
+    policy_ok: "合规",
+    style_ok: "风格",
+  };
+  const faceResults = [];
+  for (const [k, label] of Object.entries(faceMap)) {
+    if (facets[k] != null) {
+      faceResults.push(`${label}${facets[k] ? "✓" : "✗"}`);
+    }
+  }
+  if (faceResults.length) lines.push(`各维度：${faceResults.join("  ")}`);
+  if (Array.isArray(meta.missing_points) && meta.missing_points.length) {
+    lines.push(`缺失要点：${meta.missing_points.slice(0, 3).map((x) => clip(x, 80)).join("；")}`);
+  }
+  if (Array.isArray(meta.logic_issues) && meta.logic_issues.length) {
+    lines.push(`逻辑问题：${meta.logic_issues.slice(0, 2).map((x) => clip(x, 80)).join("；")}`);
+  }
+  if (Array.isArray(meta.fact_risks) && meta.fact_risks.length) {
+    lines.push(`事实风险：${meta.fact_risks.slice(0, 2).map((x) => clip(x, 80)).join("；")}`);
+  }
+  if (Array.isArray(meta.unsupported_claims) && meta.unsupported_claims.length) {
+    lines.push(`待支撑断言：${meta.unsupported_claims.slice(0, 2).map((x) => clip(x, 80)).join("；")}`);
+  }
+  if (meta.event_summary) maybePush(lines, "摘要", clip(meta.event_summary, 280));
+  return lines;
+}
+
+function repairLines(meta) {
+  const lines = [];
+  if (meta.round != null) maybePush(lines, "修复轮次", `第 ${meta.round} 轮`);
+  if (meta.guard_reverted === true) lines.push("守卫回退：修复幅度过大已还原原稿");
+  maybePush(lines, "修复模型", meta.model || meta.provider);
+  if (Array.isArray(meta.fix_claims) && meta.fix_claims.length) {
+    lines.push(`修复断言（${meta.fix_claims.length}）：${meta.fix_claims.slice(0, 3).map((x) => clip(x, 80)).join("；")}`);
+  }
+  if (Array.isArray(meta.add_evidence) && meta.add_evidence.length) {
+    lines.push(`补充证据（${meta.add_evidence.length}）：${meta.add_evidence.slice(0, 2).map((x) => clip(x, 80)).join("；")}`);
+  }
+  if (Array.isArray(meta.remove_hallucinations) && meta.remove_hallucinations.length) {
+    lines.push(`删除臆测（${meta.remove_hallucinations.length}）：${meta.remove_hallucinations.slice(0, 2).map((x) => clip(x, 80)).join("；")}`);
+  }
+  if (meta.tokens_in != null || meta.tokens_out != null) {
+    lines.push(`Token：输入 ${meta.tokens_in ?? "?"} / 输出 ${meta.tokens_out ?? "?"}`);
+  }
+  if (meta.event_summary) maybePush(lines, "摘要", clip(meta.event_summary, 280));
+  return lines;
+}
+
+function verifyLines(meta) {
+  const lines = [];
+  if (meta.score != null) {
+    const pct = (Number(meta.score) * 100).toFixed(0);
+    maybePush(lines, "验证评分", `${pct}%`);
+  }
+  if (meta.claims_count != null) maybePush(lines, "提取断言", `${meta.claims_count} 条`);
+  if (meta.mapping_method) {
+    const m = meta.mapping_method;
+    maybePush(lines, "映射方式", m === "dense" ? "稠密向量" : m === "ngram" ? "N-gram" : m === "mixed" ? "混合" : m);
+  }
+  const contra = meta.contradiction_heuristic;
+  if (contra?.hit === true) {
+    const sigs = Array.isArray(contra.signals) ? contra.signals.slice(0, 2).join("；") : "";
+    lines.push(`矛盾检测：发现矛盾${sigs ? `（${sigs}）` : ""}`);
+  }
+  if (meta.unsupported_count != null) maybePush(lines, "不支持断言", `${meta.unsupported_count} 条`);
+  if (Array.isArray(meta.unsupported_claims_heuristic) && meta.unsupported_claims_heuristic.length) {
+    lines.push(`无据断言：${meta.unsupported_claims_heuristic.slice(0, 2).map((x) => clip(x, 80)).join("；")}`);
+  }
+  if (meta.recommended_action) maybePush(lines, "建议动作", meta.recommended_action);
+  if (meta.event_summary) maybePush(lines, "摘要", clip(meta.event_summary, 280));
+  return lines;
+}
+
+function gateLines(meta) {
+  const lines = [];
+  if (meta.completion_score != null) {
+    maybePush(lines, "完成度", `${(Number(meta.completion_score) * 100).toFixed(0)}%`);
+  }
+  if (Array.isArray(meta.subgoals) && meta.subgoals.length) {
+    lines.push(`子目标（${meta.subgoals.length}）：${meta.subgoals.slice(0, 4).map((x) => clip(x, 60)).join("；")}`);
+  }
+  if (Array.isArray(meta.resolved_goals) && meta.resolved_goals.length) {
+    lines.push(`已解决：${meta.resolved_goals.slice(0, 3).map((x) => clip(x, 60)).join("；")}`);
+  }
+  if (Array.isArray(meta.queries_executed) && meta.queries_executed.length) {
+    maybePush(lines, "执行查询", `${meta.queries_executed.length} 条`);
+  }
+  if (meta.confident === true) maybePush(lines, "置信", "是");
+  if (meta.event_summary) maybePush(lines, "摘要", clip(meta.event_summary, 280));
+  return lines;
+}
+
+function finalizeLines(meta) {
+  const lines = [];
+  maybePush(lines, "终稿模型", meta.model || meta.provider);
+  if (meta.tokens_in != null || meta.tokens_out != null) {
+    lines.push(`Token：输入 ${meta.tokens_in ?? "?"} / 输出 ${meta.tokens_out ?? "?"}`);
+  }
+  if (meta.final_len != null) maybePush(lines, "终稿长度", `${meta.final_len} 字`);
+  if (meta.total_repair_rounds != null) maybePush(lines, "总修复轮次", `${meta.total_repair_rounds} 轮`);
+  if (meta.event_summary) maybePush(lines, "摘要", clip(meta.event_summary, 280));
+  return lines;
+}
+
+function searchExtraLines(meta) {
+  const lines = [];
+  if (Array.isArray(meta.queries) && meta.queries.length > 1) {
+    lines.push(`并行查询（${meta.queries.length}）：${meta.queries.slice(0, 4).map((q) => clip(q, 80)).join("；")}`);
+  }
+  if (meta.evidence_count != null) maybePush(lines, "证据节点", `${meta.evidence_count} 条`);
+  if (meta.cached === true) maybePush(lines, "缓存命中", "是");
+  if (meta.authority_enabled === true) maybePush(lines, "权威度排序", "已启用");
   return lines;
 }
 
@@ -174,12 +330,15 @@ export function buildThinkingTimeline(run) {
       items.push({ kind: "phase", id: `phase-${phase}-${idx}`, label: PHASE_LABELS[phase] || phase });
     }
 
+    // ── intake ────────────────────────────────────────────────────────────
     if (step.name === "complexity_analyze") {
+      const lines = [...complexityLines(meta), ...runtimeIntentLines(meta)];
       items.push({
         kind: "bullets",
         id: `complexity-${idx}`,
+        icon: "🧩",
         title: humanStepName(step.name, meta),
-        lines: complexityLines(meta),
+        lines,
         status: step.status,
         latency_ms: step.latency_ms,
       });
@@ -187,20 +346,24 @@ export function buildThinkingTimeline(run) {
     }
 
     if (step.name === "dag_runtime_plan") {
+      const lines = [...planLines(meta), ...runtimeIntentLines(meta)];
       items.push({
         kind: "bullets",
         id: `plan-${idx}`,
+        icon: "🗺",
         title: humanStepName(step.name, meta),
-        lines: planLines(meta),
+        lines,
         status: step.status,
         latency_ms: step.latency_ms,
       });
       return;
     }
 
+    // ── search ────────────────────────────────────────────────────────────
     if (step.name === "web_search" || step.name === "dag_parallel_search") {
       const sources = Array.isArray(meta.sources) ? meta.sources : [];
       const count = meta.result_count != null ? meta.result_count : sources.length;
+      const extra = searchExtraLines(meta);
       items.push({
         kind: "search",
         id: `search-${idx}`,
@@ -210,6 +373,7 @@ export function buildThinkingTimeline(run) {
         provider: meta.provider_used || meta.provider || step.provider || "",
         status: step.status,
         sources,
+        extra,
         summary: meta.event_summary || "",
         latency_ms: step.latency_ms,
       });
@@ -225,6 +389,107 @@ export function buildThinkingTimeline(run) {
       return;
     }
 
+    // ── reasoning / gate ─────────────────────────────────────────────────
+    if (step.name === "dag_tool_capability_gate" || step.name === "goal_capability_gate") {
+      const gateMeta = { model: step.model, provider: step.provider, ...meta };
+      items.push({
+        kind: "bullets",
+        id: `gate-${idx}`,
+        icon: "🎯",
+        title: humanStepName(step.name, meta),
+        lines: gateLines(gateMeta),
+        status: step.status,
+        latency_ms: step.latency_ms,
+      });
+      return;
+    }
+
+    // ── draft ─────────────────────────────────────────────────────────────
+    if (step.name === "dag_draft" || step.name === "refine_layer1_draft" ||
+        step.name === "refine_draft" || step.name === "refine_runtime_generate") {
+      // backend may emit model/provider as top-level step fields; merge as fallback
+      const draftMeta = { model: step.model, provider: step.provider, ...meta };
+      items.push({
+        kind: "bullets",
+        id: `draft-${idx}`,
+        icon: "✍️",
+        title: humanStepName(step.name, meta),
+        lines: draftLines(draftMeta),
+        status: step.status,
+        latency_ms: step.latency_ms,
+      });
+      return;
+    }
+
+    // ── evaluate ──────────────────────────────────────────────────────────
+    if (step.name === "dag_parallel_critic" || step.name === "refine_layer2_review" ||
+        step.name === "refine_quality_review" || step.name === "refine_runtime_critic") {
+      const lines = criticLines(meta);
+      const colorClass = meta.needs_repair === true ? "warn" : meta.needs_repair === false ? "ok" : "";
+      items.push({
+        kind: "bullets",
+        id: `critic-${idx}`,
+        icon: "🔎",
+        title: humanStepName(step.name, meta),
+        lines,
+        colorClass,
+        status: step.status,
+        latency_ms: step.latency_ms,
+      });
+      return;
+    }
+
+    // ── repair ────────────────────────────────────────────────────────────
+    if (step.name === "dag_repair" || step.name === "refine_runtime_repair") {
+      const repairMeta = { model: step.model, provider: step.provider, ...meta };
+      items.push({
+        kind: "bullets",
+        id: `repair-${idx}`,
+        icon: "🔧",
+        title: humanStepName(step.name, meta),
+        lines: repairLines(repairMeta),
+        colorClass: meta.guard_reverted ? "warn" : "",
+        status: step.status,
+        latency_ms: step.latency_ms,
+      });
+      return;
+    }
+
+    // ── verify ────────────────────────────────────────────────────────────
+    if (step.name === "dag_verify" || step.name === "refine_runtime_verify") {
+      const score = meta.score != null ? Number(meta.score) : null;
+      const colorClass = score != null ? (score >= 0.7 ? "ok" : score >= 0.4 ? "warn" : "err") : "";
+      items.push({
+        kind: "bullets",
+        id: `verify-${idx}`,
+        icon: "✅",
+        title: humanStepName(step.name, meta),
+        lines: verifyLines(meta),
+        colorClass,
+        status: step.status,
+        latency_ms: step.latency_ms,
+      });
+      return;
+    }
+
+    // ── finalize ──────────────────────────────────────────────────────────
+    if (step.name === "dag_finalize" || step.name === "refine_layer3_polish" ||
+        step.name === "refine_finalize" || step.name === "refine_runtime_finalize") {
+      const finMeta = { model: step.model, provider: step.provider, ...meta };
+      items.push({
+        kind: "bullets",
+        id: `finalize-${idx}`,
+        icon: "🏁",
+        title: humanStepName(step.name, meta),
+        lines: finalizeLines(finMeta),
+        colorClass: "ok",
+        status: step.status,
+        latency_ms: step.latency_ms,
+      });
+      return;
+    }
+
+    // ── fallback: reason or generic step ─────────────────────────────────
     if (meta.event_summary) {
       items.push({
         kind: "reason",

@@ -12,7 +12,7 @@ from runtime.dag_common import build_search_queries, user_status
 from runtime.kernel.runtime_context import DAGRuntimeContext
 from runtime.metrics_hooks import record_parallelism
 from runtime.nodes import critic_node, repair_node, verify_node
-from runtime.nodes.search_pipeline import prepare_parallel_queries, rerank_search_evidence
+from runtime.nodes.search_pipeline import prepare_parallel_queries, prepare_parallel_queries_llm, rerank_search_evidence
 from runtime.quality.critic_engine import (
     FACET_LAYER_DEFS,
     facets_bundle_to_structured,
@@ -29,6 +29,68 @@ from runtime_metrics import emit_product_metric, log_runtime_event
 from runtime_state import need_search_allowed
 from search_evidence import evaluate_search_sufficiency, evidence_bundle_text, search_result_to_evidence
 from unified_critic import evaluate_structured_quality_critic, evaluate_unified_critic
+
+
+_SYNTHESIS_PROMPT = """\
+你是一位专业编辑，收到了对同一问题的两个并行草稿（A 稿和 B 稿）。
+请从两稿中提取最佳内容，合并为一份完整、准确、结构清晰的终稿。
+规则：
+1. 保留两稿中质量更高的段落/论据；
+2. 消除重复内容；
+3. 修正逻辑断层；
+4. 保持与原问题相同的语言；
+5. 直接输出终稿正文，不要加任何说明文字。
+
+【用户问题】
+{prompt}
+
+【A 稿】
+{draft_a}
+
+【B 稿】
+{draft_b}
+
+【合并终稿】
+"""
+
+
+async def _synthesize_drafts(
+    harness: Any,
+    prompt: str,
+    da: str,
+    db: str,
+    opts: Dict[str, Any],
+    models: List[str],
+) -> str:
+    """调用 LLM 将 A/B 两稿合并为最优终稿。失败则返回质量分更高的那个。"""
+    syn_prompt = _SYNTHESIS_PROMPT.format(
+        prompt=prompt[:800],
+        draft_a=da[:5000],
+        draft_b=db[:5000],
+    )
+    try:
+        r, _ = await harness._ask_with_fallback(models, syn_prompt, opts, messages=None)
+        if r and r.success and r.content and len(r.content.strip()) > 80:
+            return r.content.strip()
+    except Exception:
+        pass
+    return da if _draft_quality_score(da) >= _draft_quality_score(db) else db
+
+
+def _draft_quality_score(text: str) -> float:
+    """并行草稿选优：结构丰富度（标题/列表/代码块）+ 归一化长度，替代纯字符长度代理。"""
+    if not text:
+        return 0.0
+    t = str(text)
+    headers = len(re.findall(r"^#{1,4}\s", t, re.MULTILINE))
+    bullets = len(re.findall(r"^[\-\*\+]\s", t, re.MULTILINE))
+    numbered = len(re.findall(r"^\d+\.\s", t, re.MULTILINE))
+    code = len(re.findall(r"```", t))
+    # 结构分（最多 0.4）：每个结构元素贡献细粒度分
+    structure = min(0.4, (headers * 0.05 + bullets * 0.02 + numbered * 0.02 + code * 0.04))
+    # 长度分（最多 0.6）：目标长度 ~1200 字符时满分，过短惩罚，过长不再加分
+    length_score = min(0.6, len(t) / 2000.0)
+    return structure + length_score
 
 
 def _minimal_budget_abort_critic_merged() -> Dict[str, Any]:
@@ -186,6 +248,10 @@ async def _publish_critic_merge_metadata(ctx: DAGRuntimeContext, round_idx: int,
         ctrs = (merged.get("_structured") or {}).get("fact_risks") or []
         if isinstance(ctrs, list):
             st.contradictions.extend([str(x) for x in ctrs[:6]])
+    _issue_n = critic_issue_total(merged)
+    _ra = str(merged.get("recommended_action") or "accept").lower()
+    _needs_repair = _ra in ("repair", "search_more") or _issue_n > 0
+    _struct = merged.get("_structured") or {}
     await ctx.emit(
         {
             "event": "step",
@@ -194,10 +260,17 @@ async def _publish_critic_merge_metadata(ctx: DAGRuntimeContext, round_idx: int,
                 "status": "ok",
                 "meta": _pg(
                     {
-                        "issue_total": critic_issue_total(merged),
+                        "round": round_idx,
+                        "issue_total": _issue_n,
+                        "needs_repair": _needs_repair,
+                        "recommended_action": _ra,
                         "layered_critics": plan.layered_critics,
                         "paired_parallel": plan.parallel_critics and not plan.layered_critics,
                         "facets": ["coverage", "logic", "evidence", "hallucination", "policy"],
+                        "missing_points": (_struct.get("missing_points") or [])[:8],
+                        "logic_issues": (_struct.get("logic_issues") or [])[:6],
+                        "fact_risks": (_struct.get("fact_risks") or [])[:6],
+                        "unsupported_claims": (_struct.get("unsupported_claims") or [])[:6],
                         "scheduler_gather_nodes": True,
                     },
                     "evaluate",
@@ -224,52 +297,107 @@ async def node_parallel_search(ctx: DAGRuntimeContext) -> None:
 
     ctx.search_pairs = []
     if plan.parallel_searches > 0 and not ctx.blocked and need_search_allowed(opt):
-        queries = prepare_parallel_queries(
-            ctx.prompt,
-            ctx.analysis,
-            n=plan.parallel_searches,
-            entry_search_required=ctx.entry_search_required,
-            search_reason=ctx.search_reason or "",
-            seed_builder=build_search_queries,
-        )
+        dgc = hcfg.get("dag_runtime") if isinstance(hcfg.get("dag_runtime"), dict) else {}
+        use_llm_rewrite = bool(dgc.get("llm_query_rewrite", True))
+        if use_llm_rewrite:
+            queries = await prepare_parallel_queries_llm(
+                ctx.prompt,
+                ctx.analysis,
+                h,
+                opt,
+                hcfg,
+                n=plan.parallel_searches,
+                entry_search_required=ctx.entry_search_required,
+                search_reason=ctx.search_reason or "",
+                seed_builder=build_search_queries,
+            )
+        else:
+            queries = prepare_parallel_queries(
+                ctx.prompt,
+                ctx.analysis,
+                n=plan.parallel_searches,
+                entry_search_required=ctx.entry_search_required,
+                search_reason=ctx.search_reason or "",
+                seed_builder=build_search_queries,
+            )
         if queries:
             if st:
                 for q in queries:
                     if q and q not in st.search_history:
                         st.search_history.append(str(q)[:500])
-            emit_product_metric(hcfg, "dag_parallelism", trace_id=trace_id, phase="search", width=len(queries))
-            record_parallelism(opt, len(queries))
-            await ctx.emit(user_status("并行检索证据…", phase="search"))
-            await ctx.emit(
-                {
-                    "event": "step",
-                    "step": {
-                        "name": "dag_parallel_search",
-                        "status": "running",
-                        "meta": _pg({"queries": queries, "n": len(queries)}, "search", "DAG：并行 Search Nodes"),
-                    },
-                }
-            )
-            ctx.search_pairs = await parallel_web_search(h, queries, opt, overrides=ctx.overrides)
-            for _q, sr in ctx.search_pairs:
-                h._capture_search_evidence_for_runtime(opt, sr if isinstance(sr, dict) else {})
-            await ctx.emit(
-                {
-                    "event": "step",
-                    "step": {
-                        "name": "dag_parallel_search",
-                        "status": "ok",
-                        "meta": _pg({"completed": len(ctx.search_pairs)}, "search", "并行检索完成。"),
-                    },
-                }
-            )
 
-    ctx.evidence_objs = []
-    for _, sr in ctx.search_pairs:
-        if isinstance(sr, dict):
-            ctx.evidence_objs.extend(search_result_to_evidence(sr))
-    ctx.evidence_objs = rerank_search_evidence(ctx.evidence_objs, top_k=64)
-    ctx.ev_text = evidence_bundle_text(ctx.evidence_objs) if ctx.evidence_objs else ""
+            # EvidenceCache 读：相同查询集命中则跳过网络检索
+            ev_cache_key = "|".join(sorted(q[:200] for q in queries))
+            ev_cache_hit = ctx.caches.evidence.get(ev_cache_key) if ctx.caches else None
+            if ev_cache_hit and isinstance(ev_cache_hit, dict):
+                ctx.evidence_objs = ev_cache_hit.get("evidence_objs") or []
+                ctx.ev_text = ev_cache_hit.get("ev_text") or ""
+                ctx.search_pairs = ev_cache_hit.get("search_pairs") or []
+                if st:
+                    st.runtime_memory.append({"phase": "parallel_search", "evidence_cache_hit": True,
+                                              "evidence_nodes": len(ctx.evidence_objs)})
+                await ctx.emit({"event": "step", "step": {
+                    "name": "dag_parallel_search", "status": "ok",
+                    "meta": _pg({"evidence_cache_hit": True, "evidence_nodes": len(ctx.evidence_objs)},
+                                "search", "EvidenceCache 命中，跳过网络检索。"),
+                }})
+            else:
+                emit_product_metric(hcfg, "dag_parallelism", trace_id=trace_id, phase="search", width=len(queries))
+                record_parallelism(opt, len(queries))
+                await ctx.emit(user_status("并行检索证据…", phase="search"))
+                await ctx.emit(
+                    {
+                        "event": "step",
+                        "step": {
+                            "name": "dag_parallel_search",
+                            "status": "running",
+                            "meta": _pg({"queries": queries, "n": len(queries)}, "search", "DAG：并行 Search Nodes"),
+                        },
+                    }
+                )
+                ctx.search_pairs = await parallel_web_search(h, queries, opt, overrides=ctx.overrides)
+                for _q, sr in ctx.search_pairs:
+                    h._capture_search_evidence_for_runtime(opt, sr if isinstance(sr, dict) else {})
+                await ctx.emit(
+                    {
+                        "event": "step",
+                        "step": {
+                            "name": "dag_parallel_search",
+                            "status": "ok",
+                            "meta": _pg({"completed": len(ctx.search_pairs)}, "search", "并行检索完成。"),
+                        },
+                    }
+                )
+
+                # EvidenceCache 写（组装前先存 search_pairs）
+                _ev_objs_tmp = []
+                for _, sr in ctx.search_pairs:
+                    if isinstance(sr, dict):
+                        _ev_objs_tmp.extend(search_result_to_evidence(sr))
+                _ev_objs_tmp = rerank_search_evidence(_ev_objs_tmp, top_k=64)
+                _ev_text_tmp = evidence_bundle_text(_ev_objs_tmp) if _ev_objs_tmp else ""
+                if ctx.caches and _ev_objs_tmp:
+                    ctx.caches.evidence.put(ev_cache_key, {
+                        "evidence_objs": _ev_objs_tmp,
+                        "ev_text": _ev_text_tmp,
+                        "search_pairs": ctx.search_pairs,
+                    })
+                ctx.evidence_objs = _ev_objs_tmp
+                ctx.ev_text = _ev_text_tmp
+            _ev_assembled = True
+        else:
+            _ev_assembled = False
+    else:
+        _ev_assembled = False
+
+    if not _ev_assembled:
+        # 无 EvidenceCache 命中且无查询时：从 search_pairs 原始组装（或生成空集）
+        ctx.evidence_objs = []
+        for _, sr in ctx.search_pairs:
+            if isinstance(sr, dict):
+                ctx.evidence_objs.extend(search_result_to_evidence(sr))
+        ctx.evidence_objs = rerank_search_evidence(ctx.evidence_objs, top_k=64)
+        ctx.ev_text = evidence_bundle_text(ctx.evidence_objs) if ctx.evidence_objs else ""
 
     eg = EvidenceGraph.from_search_evidence(ctx.evidence_objs)
     eg.apply_freshness_heuristic_from_year_tokens()
@@ -418,16 +546,35 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
 
         alt_px = ctx.base_prompt + "\n\n【并行稿 B】请采用不同的章节结构与论证顺序，补充可比视角；避免与 A 稿句式雷同。"
         (da, ra), (db, rb) = await asyncio.gather(_pd(ctx.base_prompt), _pd(alt_px))
-        draft = da if len(da) >= len(db) else db
         emit_product_metric(hcfg, "dag_parallelism", trace_id=trace_id, phase="parallel_draft", width=2)
         record_parallelism(opt, 2)
-        ctx.budget.note_llm_cost(tokens_out=max(len(draft) // 4, 0))
+        _tokens_in = (getattr(ra, "tokens_in", 0) or 0) + (getattr(rb, "tokens_in", 0) or 0)
+        _tokens_out_ab = (getattr(ra, "tokens_out", 0) or 0) + (getattr(rb, "tokens_out", 0) or 0)
+        # max_quality_mode: 调 LLM 合并两稿; 否则质量评分选优
+        _dgci = hcfg.get("dag_runtime") if isinstance(hcfg.get("dag_runtime"), dict) else {}
+        do_synthesis = bool(_dgci.get("max_quality_mode")) and bool(da) and bool(db)
+        if do_synthesis:
+            draft = await _synthesize_drafts(h, ctx.prompt, da, db,
+                                             h._layer_opts(hcfg, "layer1", opt), ctx.draft_candidates)
+            ctx.budget.note_llm_cost(tokens_in=_tokens_in,
+                                     tokens_out=_tokens_out_ab + max(len(draft) // 4, 0))
+        else:
+            draft = da if _draft_quality_score(da) >= _draft_quality_score(db) else db
+            ctx.budget.note_llm_cost(tokens_in=_tokens_in,
+                                     tokens_out=_tokens_out_ab or max(len(draft) // 4, 0))
         async for s_event in h._emit_text_chunks(draft, opt, channel="draft"):
             await ctx.emit(s_event)
-        pick = ra if draft == da else rb
-        l1_stream_meta["model"] = getattr(pick, "model", None) if pick else "parallel_draft"
+        # synthesis produces new text ≠ da or db; don't use pick for synthesis path
+        pick = None if do_synthesis else (ra if draft == da else rb)
+        l1_stream_meta["model"] = ("synthesis" if do_synthesis
+                                   else (getattr(pick, "model", None) if pick else "parallel_draft"))
         l1_stream_meta["provider"] = getattr(pick, "provider", None) if pick else None
         l1_stream_meta["latency_ms"] = int(getattr(pick, "latency_ms", 0) or 0) if pick else 0
+        l1_stream_meta["tokens_in"] = _tokens_in
+        l1_stream_meta["tokens_out"] = _tokens_out_ab or max(len(draft) // 4, 0)
+        l1_stream_meta["parallel_mode"] = True
+        l1_stream_meta["synthesized"] = do_synthesis
+        l1_stream_meta["draft_quality_score"] = round(_draft_quality_score(draft), 4)
     elif plan.hedge_draft_delay_ms > 0:
         opts_hd = h._layer_opts(hcfg, "layer1", opt)
         route_a = h.resolve_model_route(ctx.prompt, ctx.analysis)
@@ -448,12 +595,20 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
 
         win = await race_tasks(_primary(), _backup(), delay_s=plan.hedge_draft_delay_ms / 1000.0)
         draft = (win.content or "").strip() if win and getattr(win, "success", False) else ""
-        ctx.budget.note_llm_cost(tokens_out=max(len(draft) // 4, 0))
+        # 真实 token 计数
+        _tok_in = getattr(win, "tokens_in", 0) or 0
+        _tok_out = getattr(win, "tokens_out", 0) or 0
+        ctx.budget.note_llm_cost(tokens_in=_tok_in, tokens_out=_tok_out or max(len(draft) // 4, 0))
         async for s_event in h._emit_text_chunks(draft, opt, channel="draft"):
             await ctx.emit(s_event)
         l1_stream_meta["model"] = getattr(win, "model", None) if win else None
         l1_stream_meta["provider"] = getattr(win, "provider", None) if win else None
         l1_stream_meta["latency_ms"] = int(getattr(win, "latency_ms", 0) or 0) if win else 0
+        l1_stream_meta["tokens_in"] = _tok_in
+        l1_stream_meta["tokens_out"] = _tok_out or max(len(draft) // 4, 0)
+        l1_stream_meta["parallel_mode"] = False
+        l1_stream_meta["synthesized"] = False
+        l1_stream_meta["draft_quality_score"] = round(_draft_quality_score(draft), 4)
     else:
         async for s_event in h._stream_with_fallback(
             ctx.draft_candidates,
@@ -485,7 +640,21 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
                 "provider": l1_stream_meta.get("provider"),
                 "model": l1_stream_meta.get("model"),
                 "latency_ms": int(l1_stream_meta.get("latency_ms") or 0),
-                "meta": _pg({"chars": len(draft)}, "draft", "起草完成。"),
+                "meta": _pg(
+                    {
+                        "chars": len(draft),
+                        "draft_len": len(draft),
+                        "model": l1_stream_meta.get("model"),
+                        "provider": l1_stream_meta.get("provider"),
+                        "tokens_in": l1_stream_meta.get("tokens_in"),
+                        "tokens_out": l1_stream_meta.get("tokens_out"),
+                        "draft_quality_score": l1_stream_meta.get("draft_quality_score"),
+                        "parallel_mode": l1_stream_meta.get("parallel_mode"),
+                        "synthesized": l1_stream_meta.get("synthesized"),
+                    },
+                    "draft",
+                    "起草完成。",
+                ),
                 "error": None if draft else "empty_draft",
             },
         }
@@ -574,9 +743,6 @@ async def node_quality_round(ctx: DAGRuntimeContext, round_idx: int) -> None:
 
     uc = await verify_node.execute_round(ctx, draft, ev_text, round_idx)
     await _apply_verify_round_outcome(ctx, round_idx, draft, uc)
-
-    ctx.evidence_objs = ctx.evidence_objs
-    ctx.ev_text = ctx.ev_text
 
 
 async def node_quality_prelude(ctx: DAGRuntimeContext, round_idx: int) -> None:
@@ -900,7 +1066,16 @@ async def node_finalize_output(ctx: DAGRuntimeContext) -> None:
             "step": {
                 "name": "dag_finalize",
                 "status": "ok",
-                "meta": _pg({"chars": len(final_text)}, "finalize", "Adaptive DAG Runtime 完成。"),
+                "meta": _pg(
+                    {
+                        "chars": len(final_text),
+                        "final_len": len(final_text),
+                        "total_repair_rounds": (st.repair_round if st else 0),
+                        "elapsed_s": round(elapsed, 2),
+                    },
+                    "finalize",
+                    "Adaptive DAG Runtime 完成。",
+                ),
             },
         }
     )

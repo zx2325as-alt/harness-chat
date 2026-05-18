@@ -24,6 +24,9 @@ harness:
     goal_subgraph_enabled: false
     tool_capability_gate_enabled: true
     semantic_cache_short_circuit: false
+    llm_query_rewrite: true
+    # 个人最优模式：开启后强制最大并行、synthesis合并草稿、3轮修复、放宽预算
+    max_quality_mode: false
 
   runtime_orchestrator:
     enabled: true
