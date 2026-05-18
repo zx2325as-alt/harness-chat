@@ -95,6 +95,37 @@ async def run_dag_runtime_stream(
             intent.quality_requirement = "high"
         except Exception:
             pass
+    # Tier2.1: 简单对话快速旁路——高置信 conversation 且无检索/文档需求时，
+    # 把 DAG 收敛为 draft→finalize 的单次强模型直答，跳过 critic/repair/polish。
+    options["_dag_fast_path"] = False
+    if not bool(_dgc_cfg.get("max_quality_mode")):
+        try:
+            _conf = float(analysis.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            _conf = 0.0
+        _si = str(analysis.get("search_intent") or "none").lower()
+        _docs = options.get("documents")
+        _has_docs = isinstance(_docs, list) and len(_docs) > 0
+        _fast_eligible = (
+            str(analysis.get("task_type") or "").lower() == "conversation"
+            and _conf >= 0.75
+            and not bool(prep.get("entry_search_required"))
+            and not bool(prep.get("search_mandatory"))
+            and _si in ("none", "")
+            and not bool(analysis.get("search_required"))
+            and not _has_docs
+        )
+        if _fast_eligible:
+            options["_dag_fast_path"] = True
+            plan.parallel_searches = 0
+            plan.repair_rounds_max = 0
+            plan.parallel_drafts = False
+            plan.hedge_draft_delay_ms = 0
+            plan.layered_critics = False
+            plan.parallel_critics = False
+            plan.use_goal_subgraph = False
+            plan.use_tool_gate = False
+
     intent_dict = intent.to_dict()
     options["_analysis_full"] = dict(analysis)
     analysis_projected = project_analysis_for_dag_runtime(analysis)

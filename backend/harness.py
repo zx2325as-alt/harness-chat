@@ -53,6 +53,15 @@ from runtime_executor import collect_sync_response_from_stream
 
 SSE_PROTOCOL_META: Dict[str, Any] = {"protocol_version": 1, "stream_schema": "harness-v1"}
 
+# Opt1: 零歧义的极短寒暄/致谢/确认类输入（标点已剥离、小写）——命中即跳过 LLM 预判。
+_TRIVIAL_INPUTS = frozenset({
+    "你好", "您好", "嗨", "哈喽", "hi", "hello", "hey", "在吗", "在不在", "在",
+    "谢谢", "多谢", "谢谢你", "感谢", "thanks", "thankyou", "thx", "ty",
+    "ok", "okay", "好的", "好", "行", "嗯", "哦", "收到", "明白", "懂了",
+    "早", "早安", "早上好", "中午好", "下午好", "晚上好", "晚安", "辛苦了",
+    "yes", "no", "yep", "nope", "cool", "nice", "great", "bye", "再见", "拜拜",
+})
+
 def _msg_content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -99,16 +108,19 @@ def _build_layer1_prompt(
     *,
     max_history_chars: int,
 ) -> str:
-    l1_prompt = f"{instruction.strip()}\n{entry_block}\n\n【原始问题】\n{prompt.strip()}\n"
+    # Tier1.5: 用户问题置顶，指令/检索/历史作为「参考材料」后置，避免问题被上下文稀释。
+    parts: List[str] = [f"【用户问题】\n{prompt.strip()}"]
+    if instruction.strip():
+        parts.append(instruction.strip())
     if entry_block.strip():
-        l1_prompt = (
-            "以下搜索摘要为本次信息来源，请优先使用其内容，引用时尽量标注来源序号；"
-            "不要超出摘要内容臆测。\n\n" + l1_prompt
+        parts.append(
+            "【检索摘要（本次信息源：优先采用，引用尽量标注来源序号，勿超出摘要臆测）】\n"
+            + entry_block.strip()
         )
     ht = _format_messages_snippet(messages, 4, max_chars=max_history_chars)
     if ht:
-        l1_prompt = f"【近期对话上下文参考】\n{ht}\n\n" + l1_prompt
-    return l1_prompt
+        parts.append(f"【近期对话上下文（次要参考）】\n{ht}")
+    return "\n\n".join(parts)
 
 
 def _build_layer2_prompt(
@@ -119,10 +131,11 @@ def _build_layer2_prompt(
     *,
     max_history_chars: int,
 ) -> str:
+    # Tier1.5: 用户问题置顶，再给初稿与审查指令，历史作为次要参考后置。
     l2_prompt = (
-        f"{instruction.strip()}\n\n"
-        f"【原始问题】\n{prompt.strip()}\n\n"
-        f"【初稿答案】\n{draft_answer.strip()}\n"
+        f"【用户问题】\n{prompt.strip()}\n\n"
+        f"【初稿答案】\n{draft_answer.strip()}\n\n"
+        f"{instruction.strip()}\n"
         "请先识别你自己对初稿仍不确定、需要补证据的地方，再输出修正版答案；"
         "修正版正文中不要保留“问题清单/修正后答案/仍不确定处”等元语言标题。\n"
         "（请勿在答案正文中间单独使用行首「仍不确定处：」作为小节标题，以免后处理误截断。）\n"
@@ -134,7 +147,7 @@ def _build_layer2_prompt(
     )
     ht = _format_messages_snippet(messages, 4, max_chars=max_history_chars)
     if ht:
-        l2_prompt = f"【近期对话上下文参考】\n{ht}\n\n" + l2_prompt
+        l2_prompt = l2_prompt + f"\n【近期对话上下文（次要参考）】\n{ht}\n"
     return l2_prompt
 
 
@@ -722,6 +735,33 @@ class RuntimeHarness:
         hcfg = (self.cfg.get("harness") or {}).get("complexity") or {}
         opts = dict(options or {})
         norm_prompt = self._norm_cache_prompt(prompt)
+
+        # Opt1: 极短寒暄/致谢类输入直接短路，跳过 LLM 预判（省一次 analyzer 往返），
+        # 高置信 conversation 让 Tier2.1 快速旁路立即生效。仅在零歧义时触发。
+        _raw = (prompt or "").strip()
+        _low = re.sub(r"[\s!,.。！，~、…？?]+", "", _raw.lower())
+        _has_docs = isinstance(opts.get("documents"), list) and bool(opts.get("documents"))
+        _sm = str(opts.get("search_mode") or opts.get("search") or "auto").strip().lower()
+        if (
+            len(_raw) <= 10
+            and _low in _TRIVIAL_INPUTS
+            and "?" not in _raw
+            and "？" not in _raw
+            and not _has_docs
+            and _sm not in ("on", "true", "1", "force", "always")
+        ):
+            return {
+                "reasons": ["trivial_input_short_circuit"],
+                "complexity": "low",
+                "type": "general",
+                "task_type": "conversation",
+                "search_required": False,
+                "search_query": "",
+                "search_queries": [],
+                "search_intent": "none",
+                "confidence": 0.92,
+                "analyzer_schema": "runtime_centric_v1",
+            }
 
         use_llm = bool(hcfg.get("use_llm_analyzer", False))
         if not use_llm:

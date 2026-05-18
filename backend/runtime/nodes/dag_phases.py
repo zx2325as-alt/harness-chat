@@ -279,6 +279,26 @@ async def _publish_critic_merge_metadata(ctx: DAGRuntimeContext, round_idx: int,
             },
         }
     )
+    # Tier2.2: 首轮批评即 accept 且零 issue → 跳过 repair/verify 及后续轮，直接 finalize。
+    if round_idx == 0 and _ra == "accept" and _issue_n == 0 and not _needs_repair:
+        ctx._quality_done = True
+        if st:
+            st.runtime_memory.append({"phase": "critic_early_accept", "round": round_idx})
+        emit_product_metric(hcfg, "critic_early_accept_rate", trace_id=trace_id, round=round_idx)
+        await ctx.emit(
+            {
+                "event": "step",
+                "step": {
+                    "name": "dag_quality_round",
+                    "status": "skipped",
+                    "meta": _pg(
+                        {"round": round_idx, "reason": "early_accept", "issue_total": 0},
+                        "evaluate",
+                        "首轮批评通过，跳过修复/验证，直接进入终稿。",
+                    ),
+                },
+            }
+        )
 
 
 def _critic_cache_key(ctx: DAGRuntimeContext, round_idx: int) -> str:
@@ -443,7 +463,15 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
     ctx.repair_pool = ctx.quality_models.get("draft") or ctx.review_cands
     ctx.history_chars = _int_budget(opt, "history_context_chars", 4000, minimum=800, maximum=12000)
 
-    ctx.use_quality_layers = ctx.chain_on and intent.quality_requirement == "high"
+    # Tier1.1: 质量管道触发不再依赖（长度近似的）analyzer 复杂度。
+    # 除「简单对话快速旁路」外，只要质量链开启就走 L1/critic/repair/polish。
+    fast_path = bool(opt.get("_dag_fast_path"))
+    ctx.use_quality_layers = (
+        ctx.chain_on and not fast_path and intent.quality_requirement in ("high", "medium")
+    )
+    # Opt3: 非快速旁路时初稿只是中间产物——走 internal 频道（前端丢弃），
+    # 避免「整段草稿渲染出来又被 content_reset 抹掉」的抖动；快速旁路下初稿即终稿，保持可见。
+    draft_channel = "draft" if fast_path else "internal"
     if ctx.use_quality_layers:
         l1 = ctx.quality_ctx["l1"]
         ctx.base_prompt = h._build_quality_layer1_prompt(
@@ -511,7 +539,7 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
                     },
                 }
             )
-            async for s_event in h._emit_text_chunks(draft, opt, channel="draft"):
+            async for s_event in h._emit_text_chunks(draft, opt, channel=draft_channel):
                 await ctx.emit(s_event)
             ctx.draft = draft
             if st:
@@ -523,14 +551,8 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
                 ctx.caches.draft.put(dk, draft)
             h0 = h.cfg.get("harness") or {}
             stune = h0.get("stream_tuning") or {}
-            snap = draft.strip()
-            if snap:
-                await ctx.emit(
-                    {
-                        "event": "chunk",
-                        "data": {"content": snap[:420] + ("…" if len(snap) > 420 else ""), "channel": "preliminary"},
-                    }
-                )
+            # Tier1.4: 不再发 content_reset 前的 preliminary 快照——它会被紧随的
+            # content_reset 立即清空，只造成「好文本闪一下又消失」的抖动。
             if bool(stune.get("emit_content_reset", True)):
                 await ctx.emit({"event": "content_reset", "reason": "dag_draft_to_critic", "draft_snapshot": draft[:200]})
             ctx.max_wave_parallel = max(1, len(ctx.search_pairs) if ctx.search_pairs else 1)
@@ -562,7 +584,7 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
             draft = da if _draft_quality_score(da) >= _draft_quality_score(db) else db
             ctx.budget.note_llm_cost(tokens_in=_tokens_in,
                                      tokens_out=_tokens_out_ab or max(len(draft) // 4, 0))
-        async for s_event in h._emit_text_chunks(draft, opt, channel="draft"):
+        async for s_event in h._emit_text_chunks(draft, opt, channel=draft_channel):
             await ctx.emit(s_event)
         # synthesis produces new text ≠ da or db; don't use pick for synthesis path
         pick = None if do_synthesis else (ra if draft == da else rb)
@@ -599,7 +621,7 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
         _tok_in = getattr(win, "tokens_in", 0) or 0
         _tok_out = getattr(win, "tokens_out", 0) or 0
         ctx.budget.note_llm_cost(tokens_in=_tok_in, tokens_out=_tok_out or max(len(draft) // 4, 0))
-        async for s_event in h._emit_text_chunks(draft, opt, channel="draft"):
+        async for s_event in h._emit_text_chunks(draft, opt, channel=draft_channel):
             await ctx.emit(s_event)
         l1_stream_meta["model"] = getattr(win, "model", None) if win else None
         l1_stream_meta["provider"] = getattr(win, "provider", None) if win else None
@@ -615,7 +637,7 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
             ctx.base_prompt,
             h._layer_opts(hcfg, "layer1", opt),
             messages=ctx.draft_messages,
-            chunk_channel="draft",
+            chunk_channel=draft_channel,
         ):
             await ctx.emit(s_event)
             if s_event.get("event") == "chunk":
@@ -681,14 +703,7 @@ async def node_parallel_draft(ctx: DAGRuntimeContext) -> None:
 
     h0 = h.cfg.get("harness") or {}
     stune = h0.get("stream_tuning") or {}
-    snap = draft.strip()
-    if snap:
-        await ctx.emit(
-            {
-                "event": "chunk",
-                "data": {"content": snap[:420] + ("…" if len(snap) > 420 else ""), "channel": "preliminary"},
-            }
-        )
+    # Tier1.4: 见上——移除会被 content_reset 立即清空的 preliminary 快照，消除抖动。
     if bool(stune.get("emit_content_reset", True)):
         await ctx.emit({"event": "content_reset", "reason": "dag_draft_to_critic", "draft_snapshot": draft[:200]})
 
@@ -1014,7 +1029,47 @@ async def node_finalize_output(ctx: DAGRuntimeContext) -> None:
     draft = ctx.draft
     intent_dict = ctx.intent_dict
 
-    final_text = format_finalize_markdown(draft)
+    # Tier1.2: 真实 Layer3 润色——非快速旁路且质量链开启时，用 polish 模型池做一次终稿精修。
+    polished = draft
+    polish_applied = False
+    fast_path = bool(opt.get("_dag_fast_path"))
+    if (not fast_path) and bool(ctx.chain_on) and len(str(draft).strip()) > 80:
+        l3 = (ctx.quality_ctx or {}).get("l3") or {}
+        polish_pool = [
+            str(m).strip()
+            for m in (ctx.quality_models.get("polish") or [ctx.default_model])
+            if str(m).strip()
+        ]
+        if polish_pool:
+            try:
+                l3_prompt = h._build_quality_layer3_prompt(
+                    ctx.prompt,
+                    l3.get("instruction", ""),
+                    draft,
+                    options=opt,
+                    messages=ctx.messages,
+                    max_history_chars=min(2000, ctx.history_chars),
+                )
+                opts_l3 = h._layer_opts(hcfg, "layer3", opt)
+                r3, _att3 = await h._ask_with_fallback(polish_pool, l3_prompt, opts_l3, messages=None)
+                if r3 and getattr(r3, "success", False):
+                    cand = (r3.content or "").strip()
+                    # 仅在精修稿足够完整时采用；过短视为退化，回退初稿。
+                    if len(cand) >= max(40, int(len(draft.strip()) * 0.5)):
+                        polished = cand
+                        polish_applied = True
+                        ctx.budget.note_llm_cost(
+                            tokens_in=getattr(r3, "tokens_in", 0) or 0,
+                            tokens_out=(getattr(r3, "tokens_out", 0) or 0) or max(len(cand) // 4, 0),
+                        )
+            except Exception:
+                polished = draft
+                polish_applied = False
+            emit_product_metric(
+                hcfg, "polish_apply_rate", trace_id=trace_id, applied=polish_applied
+            )
+
+    final_text = format_finalize_markdown(polished)
     if st:
         st.final_answer = final_text
         if st.verification_reports:
@@ -1054,7 +1109,11 @@ async def node_finalize_output(ctx: DAGRuntimeContext) -> None:
             "step": {
                 "name": "dag_finalize",
                 "status": "running",
-                "meta": _pg({"mode": "deterministic"}, "finalize", "确定性 Finalize（无模型）"),
+                "meta": _pg(
+                    {"mode": "polish+deterministic" if polish_applied else "deterministic", "polish_applied": polish_applied},
+                    "finalize",
+                    "Layer3 润色 + 确定性排版。" if polish_applied else "确定性 Finalize（无模型）",
+                ),
             },
         }
     )
@@ -1070,6 +1129,7 @@ async def node_finalize_output(ctx: DAGRuntimeContext) -> None:
                     {
                         "chars": len(final_text),
                         "final_len": len(final_text),
+                        "polish_applied": polish_applied,
                         "total_repair_rounds": (st.repair_round if st else 0),
                         "elapsed_s": round(elapsed, 2),
                     },

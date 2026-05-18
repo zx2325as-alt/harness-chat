@@ -83,6 +83,11 @@ async def targeted_repair(
     needs_q = [str(x).strip() for x in (crit.get("needs_search") or []) if str(x).strip()]
     if issue_n == 0 and not needs_q:
         return None, draft, False
+    # Tier1.3: 批评层自身判定为 accept 时不强制改写——尊重其结论，保留初稿，
+    # 避免「为改而改」让本就正确的答案变差。仅 repair/search_more/reject 才真正修订。
+    ra = str(crit.get("recommended_action") or "accept").lower()
+    if ra == "accept":
+        return None, draft, False
 
     plan = build_repair_plan_from_crit(crit)
 

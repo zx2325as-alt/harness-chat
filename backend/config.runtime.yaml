@@ -6,7 +6,7 @@ harness:
   dag_runtime:
     parallel_search_queries: 2
     parallel_critics: true
-    layered_critics: true
+    layered_critics: false
     parallel_drafts: true
     hedge_draft_delay_ms: 0
     max_repair_rounds: 2
@@ -17,7 +17,7 @@ harness:
     max_quality_mode: false
   runtime_orchestrator:
     enabled: true
-    search_budget_per_request: 24
+    search_budget_per_request: 8
     unified_critic:
       enabled: true
       model_key: ''
@@ -41,8 +41,8 @@ harness:
         max_results: 8
         search_depth: basic
       dag:
-        max_results: 12
-        search_depth: advanced
+        max_results: 6
+        search_depth: basic
     topic: general
     timeout_s: 15
     timeout_s_max: 28
@@ -50,14 +50,13 @@ harness:
     relevance_filter:
       enabled: true
       model: claude-sonnet-4-6
-      sync_default_mode: runtime_phases
+      sync_default_mode: always
     session_cache_ttl_s: 1800
     session_cache_ttl_freshness_s: 180
     session_cache_ttl_required_s: 900
     session_cache_ttl_explicit_s: 1800
     speculative_markers:
     - 联网
-    - 搜索
     - 查证
     - 最新
     - 今天
@@ -67,7 +66,6 @@ harness:
     - stock
     - 行情
     - 汇率
-    - 政策
     authority:
       enabled: true
       rank_blend: 0.42
@@ -118,7 +116,7 @@ harness:
       - gpt-5.5
       quality_models:
         draft:
-        - deepseek-v4-pro
+        - claude-sonnet-4-6
         - gpt-5.5
         review:
         - gpt-5.5
@@ -133,8 +131,8 @@ harness:
       - gpt-5.5
       quality_models:
         draft:
-        - deepseek-v4-flash
         - claude-sonnet-4-6
+        - deepseek-v4-flash
         review:
         - gpt-5.5
         - claude-sonnet-4-6-thinking
@@ -146,6 +144,13 @@ harness:
       fallback_models:
       - deepseek-v4-flash
       - grok-4.2
+      quality_models:
+        draft:
+        - claude-sonnet-4-6
+        review:
+        - gpt-5.5
+        polish:
+        - claude-opus-4-7
   complexity:
     analyzer_request_timeout_s: 18
     analyzer_max_retries: 2

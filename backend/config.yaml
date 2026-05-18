@@ -17,7 +17,9 @@ harness:
   dag_runtime:
     parallel_search_queries: 2
     parallel_critics: true
-    layered_critics: true
+    # 个人使用：paired（unified+structured，2 次/轮）替代 layered（6 次/轮），
+    # 配合 Tier2.2 早接受，质量损失极小而成本/延迟大幅下降。
+    layered_critics: false
     parallel_drafts: true
     hedge_draft_delay_ms: 0
     max_repair_rounds: 2
@@ -30,7 +32,7 @@ harness:
 
   runtime_orchestrator:
     enabled: true
-    search_budget_per_request: 24
+    search_budget_per_request: 8
     unified_critic:
       enabled: true
       model_key: ""
@@ -124,19 +126,23 @@ harness:
       selected_model: "claude-opus-4-7"
       fallback_models: ["deepseek-v4-pro", "gpt-5.5"]
       quality_models:
-        draft: ["deepseek-v4-pro", "gpt-5.5"]
+        draft: ["claude-sonnet-4-6", "gpt-5.5"]
         review: ["gpt-5.5", "claude-sonnet-4-6"]
         polish: ["claude-opus-4-7", "gpt-5.5"]
     code:
       selected_model: "claude-sonnet-4-6"
       fallback_models: ["deepseek-v4-flash", "gpt-5.5"]
       quality_models:
-        draft: ["deepseek-v4-flash", "claude-sonnet-4-6"]
+        draft: ["claude-sonnet-4-6", "deepseek-v4-flash"]
         review: ["gpt-5.5", "claude-sonnet-4-6-thinking"]
         polish: ["claude-opus-4-7", "gpt-5.5"]
     conversation:
       selected_model: "claude-sonnet-4-6"
       fallback_models: ["deepseek-v4-flash", "grok-4.2"]
+      quality_models:
+        draft: ["claude-sonnet-4-6"]
+        review: ["gpt-5.5"]
+        polish: ["claude-opus-4-7"]
 
   complexity:
     analyzer_request_timeout_s: 18

@@ -832,6 +832,71 @@ def _warn_analyzer_timeout_budget(cfg: Dict[str, Any]) -> None:
         )
 
 
+# Tier2.3: 模型档位排序（数值越大＝越适合做审查/润色的强模型）。
+# 自我修正的前提是 review/polish 不弱于 draft；否则多层只会叠加噪声。
+# 该表可按实际供应商能力调整；未知模型给中性档，不误伤。
+_MODEL_TIER: Dict[str, int] = {
+    "claude-opus-4-7": 5,
+    "claude-sonnet-4-6-thinking": 4,
+    "grok-4-20-reasoning": 4,
+    "claude-sonnet-4-6": 4,
+    "gpt-5.5": 4,
+    "gpt-5.4-high": 4,
+    "gemini-3.1-pro-preview": 3,
+    "deepseek-v4-pro": 3,
+    "grok-4.2": 3,
+    "deepseek-v4-flash": 2,
+}
+_MODEL_TIER_DEFAULT = 3
+
+
+def _model_tier(model_key: str) -> int:
+    return _MODEL_TIER.get(str(model_key or "").strip(), _MODEL_TIER_DEFAULT)
+
+
+def _warn_model_tier_inversion(cfg: Dict[str, Any]) -> None:
+    """draft 强于 review/polish ＝ 自我修正前提被破坏：温和警告；同时弱于二者则阻断启动。"""
+    h = cfg.get("harness") or {}
+    tpl = h.get("task_model_templates") or {}
+    hard_errors: List[str] = []
+    for tt, block in tpl.items():
+        if not isinstance(block, dict):
+            continue
+        qm = block.get("quality_models") or {}
+        if not isinstance(qm, dict):
+            continue
+
+        def _lead(pool_name: str) -> str:
+            pool = qm.get(pool_name) or []
+            return str(pool[0]).strip() if isinstance(pool, list) and pool else ""
+
+        d, r, p = _lead("draft"), _lead("review"), _lead("polish")
+        if not d:
+            continue
+        dt = _model_tier(d)
+        rt = _model_tier(r) if r else dt
+        pt = _model_tier(p) if p else dt
+        weaker_than_review = r and dt > rt
+        weaker_than_polish = p and dt > pt
+        if weaker_than_review and weaker_than_polish:
+            hard_errors.append(
+                f"harness.task_model_templates.{tt}: draft={d!r}(tier {dt}) "
+                f"强于 review={r!r}(tier {rt}) 且强于 polish={p!r}(tier {pt})"
+            )
+        elif weaker_than_review or weaker_than_polish:
+            print(
+                f"Warning: harness.task_model_templates.{tt} 模型档位疑似倒挂："
+                f"draft={d!r}(tier {dt}) vs review={r!r}(tier {rt}) / polish={p!r}(tier {pt})；"
+                "自我修正收益将受限，建议 review/polish 不低于 draft。"
+            )
+    if hard_errors:
+        joined = "\n- " + "\n- ".join(hard_errors[:40])
+        raise ValueError(
+            "模型档位严重倒挂（draft 同时强于 review 与 polish，自我修正失去意义，已阻断启动）："
+            + joined
+        )
+
+
 def create_app() -> FastAPI:
     global redis_client
     cfg = load_yaml(CONFIG_PATH)
@@ -839,6 +904,7 @@ def create_app() -> FastAPI:
     configure_document_limits((cfg.get("harness") or {}).get("documents"))
     _warn_analyzer_timeout_budget(cfg)
     _validate_harness_models(cfg)
+    _warn_model_tier_inversion(cfg)
     redis_client = _init_redis_client(cfg)
     app = FastAPI(title="Harness Chat Runtime", version="0.1.0")
     kernel_store = SQLiteKernelStore(resolve_kernel_sqlite_path(cfg.get("harness") or {}))
@@ -1022,6 +1088,7 @@ def create_app() -> FastAPI:
             configure_document_limits((cfg.get("harness") or {}).get("documents"))
             _warn_analyzer_timeout_budget(cfg)
             _validate_harness_models(cfg)
+            _warn_model_tier_inversion(cfg)
         except ValueError as e:
             cfg["harness"] = h0
             configure_document_limits((cfg.get("harness") or {}).get("documents"))
